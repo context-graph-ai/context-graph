@@ -1,9 +1,8 @@
 //! `PreparedEventSearchDocument`/`PreparedEventSearchQuery` carry a sealing embedder's private
 //! prepared model input (tokenizer ids). Nothing about that payload is meant to be visible outside
-//! the sealing embedder itself — but `#[derive(Debug)]` prints every field verbatim, so today
-//! `format!("{:?}", prepared)` leaks the exact token ids to anything that can print the value
-//! (logs, panic messages, test failure output). This proves the leak by construction: every
-//! distinctive id chosen for the payload must not appear anywhere in the Debug string.
+//! the sealing embedder itself. Debug output exposes only metadata, keeping token ids out of
+//! logs, panic messages, and test failures. Every distinctive payload id below must be absent
+//! from the Debug string.
 
 use context_graph::embedder::{
     Embedder, EventSearchCapability, EventSearchSeal, PreparedEventSearchDocument,

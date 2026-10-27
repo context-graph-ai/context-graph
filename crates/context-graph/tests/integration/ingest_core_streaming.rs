@@ -290,6 +290,7 @@ impl Embedder for CapturingSequenceEmbedder {
 
 #[test]
 fn long_session_rolling_condensation_covers_both_ends_no_overflow() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let (dir, store) = fresh_store();
     let db_path = dir.path().join("cg.db");
     let transcript = format!(
@@ -351,6 +352,7 @@ fn long_session_rolling_condensation_covers_both_ends_no_overflow() {
 
 #[test]
 fn streaming_small_context_fails_loud_not_degenerate() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let dir = tempfile::tempdir().expect("tempdir");
     let db_path = dir.path().join("cg.db");
     let store = Store::open(StoreConfig {
@@ -403,6 +405,7 @@ fn streaming_small_context_fails_loud_not_degenerate() {
 
 #[test]
 fn chunk_window_derives_from_connected_model_context_default_haiku_overridable() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let dir = tempfile::tempdir().expect("tempdir");
     let db_path = dir.path().join("cg.db");
     let store = Store::open(StoreConfig {
@@ -519,6 +522,7 @@ fn chunk_window_derives_from_connected_model_context_default_haiku_overridable()
 /// summary value.
 #[test]
 fn nomic_event_search_limit_cannot_truncate_digest_embedding_text() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let full = "incident review summary paragraph ".repeat(500);
     assert!(
         full.len() > 8_192,
@@ -553,6 +557,7 @@ fn nomic_event_search_limit_cannot_truncate_digest_embedding_text() {
 
 #[test]
 fn digest_summary_bounded_to_connected_embedder_max_sequence() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let full = "a".repeat(10_000);
     let wide_lengths = Arc::new(Mutex::new(Vec::new()));
     let narrow_lengths = Arc::new(Mutex::new(Vec::new()));
@@ -593,6 +598,7 @@ fn digest_summary_bounded_to_connected_embedder_max_sequence() {
 
 #[test]
 fn chunk_boundary_exact_window_is_single_pass() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let dir = tempfile::tempdir().expect("tempdir");
     let db_path = dir.path().join("cg.db");
     let store = Store::open(StoreConfig {
@@ -664,6 +670,7 @@ fn chunk_boundary_exact_window_is_single_pass() {
 
 #[test]
 fn import_empty_jsonl_yields_honest_zero_harvest() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let (_dir, store) = fresh_store();
     let report = record_conversation(
         &store,
@@ -682,6 +689,7 @@ fn import_empty_jsonl_yields_honest_zero_harvest() {
 
 #[test]
 fn record_tool_only_without_extractor_stores_verbatim() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let (_dir, store) = fresh_store();
     let report = record_conversation(
         &store,

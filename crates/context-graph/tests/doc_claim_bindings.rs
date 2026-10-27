@@ -771,7 +771,7 @@ fn context_graph_readme_carries_no_unbound_behavior_claim() {
 }
 
 /// A fixture-driven proof of the same rule
-/// [`documented_claim_requires_a_live_default_tier_test_function`] now enforces on the real repo:
+/// [`documented_claim_requires_a_live_default_tier_test_function`] enforces on the real repo:
 /// an ordinary `#[test]` function hidden by an enclosing `#[cfg(context_graph_internal_test_support)]
 /// mod` declaration in its harness's `main.rs` must not count as default-tier, while a sibling test
 /// reachable through an ungated `mod` declaration must. Built under a synthetic `crates/<name>/`
@@ -812,11 +812,9 @@ fn a_test_hidden_by_an_enclosing_module_cfg_is_not_counted_as_default_tier() {
         test_names.default_tier_function_names
     );
 
-    // RED: the Rust resolver never compiles a test inside a module declared under an enclosing
-    // `#[cfg(context_graph_internal_test_support)] mod` declaration, so it must never be counted
-    // as default-tier — but `extract_test_names` decides purely from the test function's own
-    // attributes today, and this function's own attributes carry no exclusion marker at all, so it
-    // is counted anyway.
+    // The Rust resolver excludes tests inside an enclosing
+    // `#[cfg(context_graph_internal_test_support)] mod` declaration. Test discovery must exclude them
+    // from the default tier even when the function's own attributes carry no exclusion marker.
     assert!(
         !test_names
             .default_tier_function_names
@@ -829,14 +827,11 @@ fn a_test_hidden_by_an_enclosing_module_cfg_is_not_counted_as_default_tier() {
     );
 }
 
-/// Both documentation checks are stated as "the gate fails on X" — a dead `enforced by` reference,
-/// and a behaviour paragraph in a touched doc with no test named. Nothing anywhere had ever fed
-/// either detector an X and watched it fail: both claims rested on the real tree happening to
-/// contain neither. A detector that silently reported nothing would satisfy every one of those
-/// runs, and the published promise that a stale documentation claim stops the change would be
-/// false with no test failing.
+/// Both documentation checks must detect defects: a dead `enforced by` reference and a behaviour
+/// paragraph in a touched doc with no test named. A detector returning nothing unconditionally
+/// would miss both.
 ///
-/// So this builds a repository that carries exactly one of each defect and requires both detectors
+/// This builds a repository that carries exactly one of each defect and requires both detectors
 /// to name them, then removes the defects and requires the same detectors to report nothing. The
 /// fixture is a synthetic `crates/<name>/` tree, so the detectors walk it the same way they walk
 /// the real repository.
@@ -942,7 +937,7 @@ fn crate_name_of_changed_path(path: &str) -> Option<&str> {
     path.strip_prefix("crates/")?.split('/').next()
 }
 
-/// Pure reimplementation of the rule `scripts/validate-doc-coverage.py` will enforce on a
+/// Pure reimplementation of the rule `scripts/validate-doc-coverage.py` enforces on a
 /// changed-file list: any crate whose `src/` a change touches must carry `crates/<crate>/AGENTS.md`.
 /// Returns the sorted set of crate names that are missing their guide. A crate named more than
 /// once in `changed_files` is reported once.

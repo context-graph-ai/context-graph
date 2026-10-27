@@ -313,6 +313,7 @@ fn close_enough(left: f32, right: f32) -> bool {
 #[test]
 fn composite_vector_search_with_two_clauses_same_space_returns_typed_error_or_uses_explicit_fusion_policy()
  {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let store = store();
     let result = composite_vector_search_with_policy(
         &store,
@@ -339,6 +340,7 @@ fn composite_vector_search_with_two_clauses_same_space_returns_typed_error_or_us
 
 #[test]
 fn composite_vector_search_with_single_clause_still_requires_explicit_fusion_policy() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let compile_cases = trybuild::TestCases::new();
     compile_cases.compile_fail("tests/ui/composite_query_single_clause_without_fusion_policy.rs");
 
@@ -370,6 +372,7 @@ fn composite_vector_search_with_single_clause_still_requires_explicit_fusion_pol
 
 #[test]
 fn composite_vector_search_fused_rank_order_matches_explicit_fusion_policy_math() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let store = store();
     let best_id = seed_dual_space_evidence(
         &store,
@@ -461,6 +464,7 @@ fn composite_vector_search_fused_rank_order_matches_explicit_fusion_policy_math(
 
 #[test]
 fn vector_search_with_empty_corpus_returns_empty_results_not_panic() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let store = store();
     let hits = vector_search(
         &store,
@@ -494,6 +498,7 @@ fn vector_search_with_empty_corpus_returns_empty_results_not_panic() {
 
 #[test]
 fn vector_search_with_empty_context_id_filter_returns_empty_not_unfiltered() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let store = store();
     let (context_id, evidence_id) =
         seed_evidence(&store, TEXT_SPACE, EvidenceKind::Text, axis(768, 0));
@@ -533,6 +538,7 @@ fn vector_search_with_empty_context_id_filter_returns_empty_not_unfiltered() {
 
 #[test]
 fn vector_search_top_k_ordering_matches_hnsw_documented_ranking() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let query_counter = Arc::new(QueryCountingPlugin::default());
     let store = store_with_query_counter(query_counter.clone());
     let (_, mid) = seed_evidence(

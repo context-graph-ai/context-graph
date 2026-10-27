@@ -1,4 +1,4 @@
-//! Fabric first-light — status honesty, touch-priority + budget drain, and remote receipts.
+//! Fabric  — status honesty, touch-priority + budget drain, and remote receipts.
 //!
 //! Status consults the injected clock (an expired lease is reclaimable, never running). A claim-race
 //! loser never reports success. A remote receipt is carried unmangled, originates on the executor,
@@ -18,12 +18,13 @@ const SESSION_C: &str =
     "User: Goal G3: watch the budget. Assistant: Decision D3: cap the nightly drain.";
 
 #[tokio::test]
-#[ignore = "hangs rather than fails: the test never returns, so the runner stops it at its terminate-after; quarantined under DL-CG-17"]
+#[ignore = "hangs rather than fails: the test never returns, so the runner stops it at its terminate-after; tracked in the project issue list"]
 async fn expired_lease_job_not_shown_as_running() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let fixture = fabric_fixture("expired_lease").await;
     fabric::capture(
         &fixture.edge1.store,
-        FabricCapture::new(tier0_request("daily-loop", "s1", SESSION)),
+        FabricCapture::new(tier0_request("capture", "s1", SESSION)),
     )
     .expect("capture");
     push_then_pull(&fixture.edge1_client, &fixture.edge2_client).await;
@@ -41,7 +42,7 @@ async fn expired_lease_job_not_shown_as_running() {
     push_then_pull(&fixture.edge2_client, &fixture.edge1_client).await;
 
     // Past the lease TTL with no result, status must show it reclaimable/pending, never running.
-    let ctx = context_id(&fixture.edge1.store, "daily-loop").expect("context");
+    let ctx = context_id(&fixture.edge1.store, "capture").expect("context");
     let past_ttl = 1_000 + config.lease_ms + 1;
     let statuses = fabric::job_statuses(&fixture.edge1.store, ctx, past_ttl).expect("statuses");
     assert!(
@@ -56,10 +57,11 @@ async fn expired_lease_job_not_shown_as_running() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn worker_that_lost_claim_race_does_not_report_success() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let fixture = fabric_fixture("lost_race_status").await;
     fabric::capture(
         &fixture.edge1.store,
-        FabricCapture::new(tier0_request("daily-loop", "s1", SESSION)),
+        FabricCapture::new(tier0_request("capture", "s1", SESSION)),
     )
     .expect("capture");
     push_then_pull(&fixture.edge1_client, &fixture.edge2_client).await;
@@ -97,12 +99,13 @@ async fn worker_that_lost_claim_race_does_not_report_success() {
 }
 
 #[tokio::test]
-#[ignore = "hangs rather than fails: the test never returns, so the runner stops it at its terminate-after; quarantined under DL-CG-17"]
+#[ignore = "hangs rather than fails: the test never returns, so the runner stops it at its terminate-after; tracked in the project issue list"]
 async fn status_shows_state_executing_node_and_receipt() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let fixture = fabric_fixture("status_executor").await;
     fabric::capture(
         &fixture.edge1.store,
-        FabricCapture::new(tier0_request("daily-loop", "s1", SESSION)),
+        FabricCapture::new(tier0_request("capture", "s1", SESSION)),
     )
     .expect("capture on submitter");
     push_then_pull(&fixture.edge1_client, &fixture.edge2_client).await;
@@ -117,7 +120,7 @@ async fn status_shows_state_executing_node_and_receipt() {
     );
     push_then_pull(&fixture.edge2_client, &fixture.edge1_client).await;
 
-    let ctx = context_id(&fixture.edge1.store, "daily-loop").expect("context");
+    let ctx = context_id(&fixture.edge1.store, "capture").expect("context");
     let statuses = fabric::job_statuses(&fixture.edge1.store, ctx, 5_000).expect("statuses");
     assert!(
         statuses.iter().any(|s| s.state == "done"),
@@ -139,12 +142,13 @@ async fn status_shows_state_executing_node_and_receipt() {
 }
 
 #[tokio::test]
-#[ignore = "hangs rather than fails: the test never returns, so the runner stops it at its terminate-after; quarantined under DL-CG-17"]
+#[ignore = "hangs rather than fails: the test never returns, so the runner stops it at its terminate-after; tracked in the project issue list"]
 async fn attempt_ceiling_reached_marks_terminal_failed_visible_in_status() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let fixture = fabric_fixture("attempt_ceiling").await;
     fabric::capture(
         &fixture.edge1.store,
-        FabricCapture::new(tier0_request("daily-loop", "s1", SESSION)),
+        FabricCapture::new(tier0_request("capture", "s1", SESSION)),
     )
     .expect("capture");
     push_then_pull(&fixture.edge1_client, &fixture.edge2_client).await;
@@ -164,7 +168,7 @@ async fn attempt_ceiling_reached_marks_terminal_failed_visible_in_status() {
         push_then_pull(&fixture.edge2_client, &fixture.edge1_client).await;
     }
 
-    let ctx = context_id(&fixture.edge1.store, "daily-loop").expect("context");
+    let ctx = context_id(&fixture.edge1.store, "capture").expect("context");
     let statuses = fabric::job_statuses(&fixture.edge1.store, ctx, 1_000_000).expect("statuses");
     assert!(
         statuses.iter().any(|s| s.state == "failed"),
@@ -173,12 +177,13 @@ async fn attempt_ceiling_reached_marks_terminal_failed_visible_in_status() {
 }
 
 #[tokio::test]
-#[ignore = "hangs rather than fails: the test never returns, so the runner stops it at its terminate-after; quarantined under DL-CG-17"]
+#[ignore = "hangs rather than fails: the test never returns, so the runner stops it at its terminate-after; tracked in the project issue list"]
 async fn remote_receipt_round_trips_unmangled() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let fixture = fabric_fixture("receipt_round_trip").await;
     fabric::capture(
         &fixture.edge1.store,
-        FabricCapture::new(tier0_request("daily-loop", "s1", SESSION)),
+        FabricCapture::new(tier0_request("capture", "s1", SESSION)),
     )
     .expect("capture on submitter");
     push_then_pull(&fixture.edge1_client, &fixture.edge2_client).await;
@@ -198,7 +203,7 @@ async fn remote_receipt_round_trips_unmangled() {
     );
     let produced = fabric::job_statuses(
         &fixture.edge2.store,
-        context_id(&fixture.edge2.store, "daily-loop").expect("edge2 context"),
+        context_id(&fixture.edge2.store, "capture").expect("edge2 context"),
         2_000,
     )
     .expect("edge2 statuses")
@@ -209,7 +214,7 @@ async fn remote_receipt_round_trips_unmangled() {
     push_then_pull(&fixture.edge2_client, &fixture.edge1_client).await;
     let applied = fabric::job_statuses(
         &fixture.edge1.store,
-        context_id(&fixture.edge1.store, "daily-loop").expect("edge1 context"),
+        context_id(&fixture.edge1.store, "capture").expect("edge1 context"),
         3_000,
     )
     .expect("edge1 statuses")
@@ -228,12 +233,13 @@ async fn remote_receipt_round_trips_unmangled() {
 }
 
 #[tokio::test]
-#[ignore = "hangs rather than fails: the test never returns, so the runner stops it at its terminate-after; quarantined under DL-CG-17"]
+#[ignore = "hangs rather than fails: the test never returns, so the runner stops it at its terminate-after; tracked in the project issue list"]
 async fn receipt_origin_is_executor_not_submitter() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let fixture = fabric_fixture("receipt_origin").await;
     fabric::capture(
         &fixture.edge1.store,
-        FabricCapture::new(tier0_request("daily-loop", "s1", SESSION)),
+        FabricCapture::new(tier0_request("capture", "s1", SESSION)),
     )
     .expect("capture on submitter");
     push_then_pull(&fixture.edge1_client, &fixture.edge2_client).await;
@@ -248,7 +254,7 @@ async fn receipt_origin_is_executor_not_submitter() {
     );
     push_then_pull(&fixture.edge2_client, &fixture.edge1_client).await;
 
-    let ctx = context_id(&fixture.edge1.store, "daily-loop").expect("context");
+    let ctx = context_id(&fixture.edge1.store, "capture").expect("context");
     let statuses = fabric::job_statuses(&fixture.edge1.store, ctx, 4_000).expect("statuses");
     assert!(
         statuses.iter().any(|s| s.state == "done"),
@@ -267,20 +273,21 @@ async fn receipt_origin_is_executor_not_submitter() {
 
 #[test]
 fn worker_drains_most_recently_touched_first() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let node = FabricNode::open("touch_priority");
     let low = fabric::capture(
         &node.store,
-        FabricCapture::new(tier0_request("daily-loop", "s-low", SESSION_B)),
+        FabricCapture::new(tier0_request("capture", "s-low", SESSION_B)),
     )
     .expect("capture low")
     .digest_ids;
     let high = fabric::capture(
         &node.store,
-        FabricCapture::new(tier0_request("daily-loop", "s-high", SESSION_C)),
+        FabricCapture::new(tier0_request("capture", "s-high", SESSION_C)),
     )
     .expect("capture high")
     .digest_ids;
-    let ctx = context_id(&node.store, "daily-loop").expect("context");
+    let ctx = context_id(&node.store, "capture").expect("context");
     let high_digest = *high.first().expect("high digest");
     // Make the high-priority digest the most touched.
     for _ in 0..3 {
@@ -303,15 +310,16 @@ fn worker_drains_most_recently_touched_first() {
 
 #[test]
 fn worker_budget_ceiling_stops_drain() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let node = FabricNode::open("budget_ceiling");
     for (session, text) in [("s1", SESSION), ("s2", SESSION_B), ("s3", SESSION_C)] {
         fabric::capture(
             &node.store,
-            FabricCapture::new(tier0_request("daily-loop", session, text)),
+            FabricCapture::new(tier0_request("capture", session, text)),
         )
         .expect("capture");
     }
-    let ctx = context_id(&node.store, "daily-loop").expect("context");
+    let ctx = context_id(&node.store, "capture").expect("context");
 
     let extractor = CountingExtractor::new();
     let drained =

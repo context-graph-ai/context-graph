@@ -1,4 +1,4 @@
-//! Fabric first-light — the `cg` surface speaks ticket/endpoint, and the sharing default is proven
+//! Fabric  — the `cg` surface speaks ticket/endpoint, and the sharing default is proven
 //! by behavior.
 
 mod support;
@@ -22,7 +22,7 @@ fn cg_sync_surface_uses_ticket_endpoint_idiom_without_removed_transport() {
     let text = combined(&output);
     assert!(
         !text.contains(&removed_transport_name()),
-        "cg sync/status help + output must not expose the removed transport: {text}"
+        "cg sync/status help + output must expose only the supported transport: {text}"
     );
     assert!(
         text.contains("ticket") || text.contains("endpoint"),

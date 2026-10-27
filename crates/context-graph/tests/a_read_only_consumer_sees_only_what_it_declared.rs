@@ -140,7 +140,7 @@ fn directory_image(directory: &Path) -> BTreeMap<String, EntryImage> {
 }
 
 /// A scratch directory named the way every open below resolves it, so a refusal that names a path
-/// can be compared against one written here.
+/// can be compared with one written here.
 fn scratch_root(directory: &tempfile::TempDir) -> PathBuf {
     std::fs::canonicalize(directory.path()).expect("resolve the scratch directory")
 }
@@ -208,7 +208,7 @@ fn vector_index_tables_in_the_whole_store(path: &Path) -> BTreeSet<String> {
         .sync_database()
         .execute("SHOW VECTOR_INDEXES", &no_params())
         .expect("an unrestricted handle is answered about every vector index in the store");
-    let tables = text_column(&answered.rows()).into_iter().collect();
+    let tables = text_column(answered.rows()).into_iter().collect();
     drop(store);
     tables
 }
@@ -444,7 +444,7 @@ fn a_declared_reader_journeys_from_open_through_sql_metadata_and_cursor_to_close
     assert_eq!(
         vec!["note-1".to_string()],
         text_column(
-            &cursor
+            cursor
                 .first_page()
                 .expect("the cursor was just opened")
                 .rows()
@@ -672,7 +672,7 @@ fn two_read_only_opens_of_the_same_stopped_store_both_answer() {
     second.close().expect("the second reader closes");
 }
 
-// The proof the superseded design could not make. Every one of these shapes re-widens a predicate
+// Every one of these query shapes re-widens a predicate
 // an analyzer believed it had narrowed — a disjunction, a negation, an IN-list naming both roles, a
 // LIKE that matches everything, a subquery over the same table. Each is ANSWERED rather than
 // refused, and each answer holds only what the reader's declared labels admit, because the engine
@@ -731,7 +731,7 @@ fn every_query_shape_that_re_widens_a_narrowed_predicate_answers_only_in_scope_r
     assert_eq!(
         only_the_edge_row,
         text_column(
-            &cursor
+            cursor
                 .first_page()
                 .expect("the cursor was just opened")
                 .rows()
@@ -812,7 +812,7 @@ fn a_store_level_show_with_no_table_of_its_own_answers_through_the_reader() {
     reader.close().expect("close the reader");
 }
 
-// The declaration-level refusals survive the move to engine-enforced scope. A table the consumer
+// Declaration-level refusals apply alongside engine-enforced scope. A table the consumer
 // did not declare is refused by name however the statement reaches it — through a join, through a
 // subquery, or bound behind a common table expression.
 #[test]
@@ -877,7 +877,7 @@ fn the_sync_conflict_policy_show_answers_only_about_declared_tables_and_the_stor
 // asking to be narrowed to a label over a write-scoping column is asking for something no layer can
 // enforce. It is refused at open, by type, naming the table — never opened and then served every
 // row as though the narrowing had been applied. A declaration that claims no narrowing over the
-// same table is served unnarrowed, exactly as it is today.
+// same table is served unnarrowed.
 #[test]
 fn a_read_narrowing_declaration_over_a_write_scoped_column_is_refused_at_open() {
     let directory = tempfile::tempdir().expect("scratch directory");
@@ -914,7 +914,7 @@ fn a_read_narrowing_declaration_over_a_write_scoped_column_is_refused_at_open() 
             scope_labels: BTreeSet::new(),
         },
     )
-    .expect("a declaration claiming no narrowing over the same table opens as it always has");
+    .expect("a declaration claiming no narrowing over the same table opens");
     let answered = reader
         .execute("SELECT id FROM vigil_signals ORDER BY id", &no_params())
         .expect("a consumer that asked for no narrowing reads its own table");

@@ -1,4 +1,4 @@
-//! `cg worker` surface — the fabric worker verb is present and documented, refuses loudly on a
+//! `cg worker` surface — the hidden fabric worker verb accepts its flags, refuses loudly on a
 //! missing fabric / missing model BEFORE touching the network, and never speaks a transport name.
 //!
 //! The live claim/execute/apply loop is proven by the owner's smoke against a real hub, not here:
@@ -25,22 +25,26 @@ fn write_fabric(harness: &CliHarness, body: &str) {
     fs::write(fabric_dir.join("fabric.toml"), body).expect("write fabric.toml");
 }
 
+/// The hidden worker accepts its flags and retains a transport-free startup refusal.
 #[test]
 fn help_documents_worker_verb_and_flags_without_transport_names() {
     let harness = CliHarness::new();
-    let output = harness.run(&["--help"]);
+    let root_help = harness.run(&["--help"]);
+    assert_eq!(root_help.code, 0);
+    assert!(
+        !root_help
+            .stdout
+            .lines()
+            .any(|line| line.trim_start().starts_with("worker"))
+    );
+    let root_text = combined(&root_help);
+    assert!(!root_text.contains(&removed_transport_name()) && !root_text.contains("iroh"));
+    let output = harness.run(&["worker", "--poll-interval", "100", "--budget", "1"]);
+    assert_eq!(output.code, 2);
     let text = combined(&output);
     assert!(
-        text.contains("worker"),
-        "cg help lists the worker verb: {text}"
-    );
-    assert!(
-        text.contains("--poll-interval"),
-        "cg help documents the worker poll interval flag: {text}"
-    );
-    assert!(
-        text.contains("--budget"),
-        "cg help documents the worker budget flag: {text}"
+        text.contains("worker") && text.contains("fabricconfigmissing"),
+        "hidden worker dispatch with its flags must retain the typed startup refusal: {text}"
     );
     assert!(
         !text.contains(&removed_transport_name()) && !text.contains("iroh"),
@@ -116,7 +120,7 @@ fn worker_refuses_without_a_model_with_actionable_connect_guidance() {
     );
     assert!(
         !text.contains("cg model use"),
-        "the refusal must not point at the removed local-model path: {text}"
+        "the refusal must point at the supported hosted-model path: {text}"
     );
     assert!(
         text.contains("notconnected"),

@@ -1,11 +1,11 @@
+#[path = "../common/action_test_extractors.rs"]
+mod action_test_extractors;
 #[path = "../common/fabric_common.rs"]
 mod fabric_common;
 #[path = "../common/fake_extractor.rs"]
 mod fake_extractor;
 #[path = "../common/invalidation_fixtures.rs"]
 mod invalidation_fixtures;
-#[path = "../common/refactor_extractor.rs"]
-mod refactor_extractor;
 
 mod fabric_apply_atomicity;
 mod fabric_apply_materializes;
@@ -61,6 +61,7 @@ mod reindex;
 #[cfg(context_graph_internal_test_support)]
 mod reindex_concurrency;
 mod reliability_wrappers;
+mod runs_alone;
 mod schema;
 mod staged_extraction;
 mod staged_merge_dedupe;

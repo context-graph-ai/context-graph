@@ -57,16 +57,16 @@ fn project_reader(reader: &ReaderBreadcrumb) -> ReaderIdentity {
 /// Turn what the engine refused a CONSUMER-DOOR open of the store at `store_path` into what a
 /// consumer decides on.
 ///
-/// The two doors R17 added — the read-only [`crate::ConsumerReader`] and
+/// The read-only [`crate::ConsumerReader`] and
 /// [`crate::Store::open_existing_for_change`] — promise a caller three answers it can act on
 /// differently: a store that is NOT THERE, one that is there and needs a WRITABLE open to settle
 /// its committed image before it can be read, and one that is there and cannot be read at all.
 /// The middle one is the only refusal here a consumer may answer by opening the store writable,
 /// which is exactly why it is not folded into either of the others. Nothing
 /// else on this surface makes that distinction, and it is deliberately not folded into
-/// [`map_open_err`]: every opener that came before creates an absent store rather than refusing
-/// one, so giving them this vocabulary would change what they say about stores they go on to
-/// create. Contention keeps its own answers — a writer holding the store and readers holding it
+/// [`map_open_err`]: create-capable openers create an absent store rather than refusing one,
+/// so they use the conversion appropriate for that behavior. Contention keeps its own answers —
+/// a writer holding the store and readers holding it
 /// off are momentary conditions, not damage — so those pass through the shared conversion.
 pub(crate) fn map_consumer_open_err(store_path: &Path, err: EngineError) -> CgError {
     match &err {

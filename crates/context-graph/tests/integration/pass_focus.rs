@@ -1,15 +1,12 @@
-//! RED contract tests for the pass-focus half of staged extraction: a focused
-//! extraction pass must render a FOCUSED contract — descriptor filtered to the pass's fields —
-//! not the full-ontology ask re-run. Found live: production's extract_pass fell through to the
-//! trait default, so "staged" measured self-consistency (full pass ×3, merged), not the probe-2
-//! focused-pass lever. Authored and committed BEFORE implementation; implementation commits may
-//! not touch this file.
+//! Focused extraction renders only the requested descriptor fields, while the full pass
+//! renders the full ontology.
 
 use context_graph::harness::CaptureHarnessConfig;
 use context_graph::ingest::ExtractionPass;
 
 #[test]
 fn pass_focus_filters_descriptor_fields() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let config = CaptureHarnessConfig::default();
 
     let full = config
@@ -36,7 +33,7 @@ fn pass_focus_filters_descriptor_fields() {
         .schema_descriptor_for_pass(ExtractionPass::DecisionsOnly)
         .expect("descriptor");
     assert!(decisions_only.fields.iter().any(|f| f.name == "decisions"));
-    // Decisions attach to goals (the trunk), so the decisions pass keeps goals available…
+    // Decisions attach to goals (the goal linkage), so the decisions pass keeps goals available…
     assert!(decisions_only.fields.iter().any(|f| f.name == "goals"));
     // …but not the rest of the ontology.
     assert!(!decisions_only.fields.iter().any(|f| f.name == "entities"));
@@ -50,6 +47,7 @@ fn pass_focus_filters_descriptor_fields() {
 
 #[test]
 fn focused_pass_prompt_differs_from_full() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let config = CaptureHarnessConfig::default();
     let inputs = context_graph::harness::ExtractionPromptInputs {
         context_label: "t",
@@ -65,10 +63,10 @@ fn focused_pass_prompt_differs_from_full() {
 }
 
 /// Source-scan guard (same class as the delegation guard): the production extractor must
-/// actually OVERRIDE extract_pass — the trait default silently re-runs the full pass, which is
-/// exactly the live gap this closes.
+/// override extract_pass with the focused contract; the trait default re-runs the full pass.
 #[test]
 fn production_extractor_overrides_extract_pass() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let main_rs = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../cg-cli/src/main.rs");
     let source = std::fs::read_to_string(&main_rs).expect("cg-cli main.rs readable");
     assert!(

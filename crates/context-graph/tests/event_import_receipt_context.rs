@@ -1,7 +1,6 @@
-//! RED contract for source context on import refusals.
+//! regression contract for source context on import refusals.
 //!
-//! Coverage receipt fields are deliberately absent here: the public serialized
-//! `ImportEventReceipt` has no adopted coverage-breakdown field names yet.
+//! These tests cover source context on refusals independently of coverage receipt fields.
 
 use std::io::{BufRead, Cursor};
 use std::num::NonZeroUsize;

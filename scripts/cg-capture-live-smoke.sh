@@ -1,18 +1,17 @@
 #!/usr/bin/env bash
 # cg capture live smoke test — OpenRouter BYOK driver
 # ---------------------------------------------------------------------------
-# Drives the compiled `cg` binary through the library-grade capture harness
+# Drives the compiled `cg` binary through the library-grade capture checks
 # against inputs that exist in NO test fixture and NO
 # fake-provider branch, so it can only pass if real extraction + the real
 # downstream logic work. OpenRouter is the model provider (BYOK, OpenAI-compatible).
 #
 # Two halves:
-#   CAPTURE HALF (live now): full-ontology extraction, the four-stage pipeline,
+#   CAPTURE HALF: full-ontology extraction, the four-stage pipeline,
 #     the cost/time receipt + zero-outbound --estimate, connected-by-default capture,
 #     the sync split (requires a ticketed Iroh hub for a release-ready verdict).
-#   CORRECTION/SKILL/HITL HALF: REAL assertions now that the CLI verbs
-#     fix/drop/group/undo/skills/review/why are wired. Item handles are `@n`
-#     ordinals over the captured units (digests) in a context, newest first.
+#   CORRECTION/SKILL/HITL HALF: assertions exercise the CLI verbs.
+#     Item ordinals select captured units (digests) in a context, newest first.
 #     Assertions check SHAPES and LOOP behavior, never exact model wording.
 #
 # WHAT THE CLI CANNOT DRIVE (recorded so a SKIP is read as a finding, not a pass):
@@ -40,14 +39,17 @@
 #                        ContextDB hub serving CG_SMOKE_TENANT; missing means NOT RELEASE-READY
 #   CG_SMOKE_TENANT      generated local tenant id; must be supplied with CG_SMOKE_HUB_TICKET
 #                        for the cross-machine sync gate
-#   CG_SMOKE_REAL_JSONL  largest real session JSONL to import in the real-import gate;
-#                        defaults to the largest *.jsonl under CG_SMOKE_REAL_JSONL_DIR
-#   CG_SMOKE_REAL_JSONL_DIR  $HOME/.claude/projects
+#   CG_SMOKE_REAL_JSONL  required explicit session JSONL input file
 #
 # Cost note: only capture (record/import) calls the model. query/status/review are
 # model-free. --estimate is zero-outbound by contract.
 # ---------------------------------------------------------------------------
 set -uo pipefail
+
+if [[ -z "${CG_SMOKE_REAL_JSONL:-}" || ! -f "$CG_SMOKE_REAL_JSONL" ]]; then
+  echo "CG_SMOKE_REAL_JSONL must name an explicit input file" >&2
+  exit 1
+fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKTREE="${CG_WORKTREE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
@@ -217,18 +219,6 @@ counts_nonzero() { local l; l="$(counts_line "$1")"; [[ -n "$l" && ! "$l" =~ goa
 counts_sum()     { local l; l="$(counts_line "$1")"; grep -oE '[0-9]+' <<<"$l" | paste -sd+ - | bc 2>/dev/null || echo 0; }
 is_ok_json()     { contains "$1" '"ok":true' || ! contains "$1" '"ok":false'; }
 ok_rc()          { [[ $LAST_RC -eq 0 ]] && is_ok_json "$LAST_OUT" && echo 0 || echo 1; }
-largest_real_jsonl() {
-  if [[ -n "${CG_SMOKE_REAL_JSONL:-}" ]]; then
-    printf '%s\n' "$CG_SMOKE_REAL_JSONL"
-    return 0
-  fi
-  local dir="${CG_SMOKE_REAL_JSONL_DIR:-$HOME/.claude/projects}"
-  [[ -d "$dir" ]] || return 1
-  find "$dir" -type f -name '*.jsonl' -printf '%s\t%p\n' 2>/dev/null \
-    | sort -nr \
-    | head -1 \
-    | cut -f2-
-}
 json_require_jq() {
   if [[ "$HAVE_JQ" != "1" ]]; then
     check "jq is available for hard JSON assertions" 1
@@ -413,10 +403,8 @@ assert_memory_evidence() {  # assert_memory_evidence <label>
     "$([[ "$MEMORY_INVALIDATIONS" == "[]" && "$MEMORY_SUPERSEDES" == "[]" ]] && echo 0 || echo 1)"
 }
 
-# A correction/skill/HITL verb is "available" once it is wired into the CLI dispatch. Until then
-# `cg <verb>` prints `unknown command `<verb>`` (usage_error) and the section SKIPs.
-# All seven verbs (fix/drop/group/undo/skills/review/why) are wired in this build;
-# the guard stays so the script degrades gracefully on an older binary.
+# The availability guard skips correction/skill/HITL checks when the supplied binary
+# answers `cg <verb>` with `unknown command `<verb>`` (usage_error).
 verb_available() {
   local out; out="$("$CG" "$1" 2>&1 || true)"
   ! grep -qiF "unknown command \`$1\`" <<<"$out"
@@ -545,9 +533,9 @@ fi
 
 # ---------------------------------------------------------------------------
 section "STEP 4B — real JSONL import with the default window"
-REAL_JSONL="$(largest_real_jsonl || true)"
+REAL_JSONL="$CG_SMOKE_REAL_JSONL"
 if [[ -z "$REAL_JSONL" || ! -f "$REAL_JSONL" ]]; then
-  check "real JSONL import requires CG_SMOKE_REAL_JSONL or a real *.jsonl under CG_SMOKE_REAL_JSONL_DIR" 1
+  check "real JSONL import requires CG_SMOKE_REAL_JSONL" 1
 else
   note "real JSONL: $REAL_JSONL"
   cg_run import --estimate "$REAL_JSONL" --context real-import
@@ -579,7 +567,7 @@ LAST_OUT="$( cd /tmp/cg-cwd-C && "$CG" status --tenant-id "$TENANT" 2>&1 )"; pri
 check "captures from two different working dirs both land under the tenant context" \
   "$(counts_nonzero "$LAST_OUT" && echo 0 || echo 1)"
 note "If cwd-hashing were still in play these would be in 3 different contexts and this status"
-note "(from a 3rd dir) would be empty. (pinned by refactored_capture_context_defaults_to_tenant.)"
+note "(from a 3rd dir) would be empty. (pinned by capture_context_defaults_to_tenant_not_working_directory.)"
 
 # ---------------------------------------------------------------------------
 section "STEP 6 — two-layer reversibility (cg fix / cg drop / cg group / cg undo)"
@@ -762,7 +750,7 @@ if verb_available review; then
   #   summary: uncertain=N groupings=N drift=N currency_flips=N
   # The three single-edge categories (uncertain/grouping/drift) plus the
   # present-but-empty currency category must ALL appear (currency stays structurally
-  # empty on a single edge — a future server-side runner owns reconciliation — but is never omitted).
+  # empty on a single edge but is never omitted).
   check "cg review shows the three single-edge categories + the present-but-empty currency category" \
     "$(grep -qiE 'uncertain' <<<"$LAST_OUT" && grep -qiE 'grouping' <<<"$LAST_OUT" \
        && grep -qiE 'drift' <<<"$LAST_OUT" && grep -qiE 'currenc' <<<"$LAST_OUT" && echo 0 || echo 1)"

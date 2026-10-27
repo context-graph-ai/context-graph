@@ -11,6 +11,7 @@ fn agent(name: &str) -> Principal {
 
 #[test]
 fn concurrent_acknowledge_first_wins_second_returns_typed_error() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let fixture = seed_pending_fixture();
     let store = Arc::new(reopen(&fixture.config));
     let barrier = Arc::new(Barrier::new(2));
@@ -64,6 +65,7 @@ fn concurrent_acknowledge_first_wins_second_returns_typed_error() {
 
 #[test]
 fn concurrent_resolve_and_dismiss_first_wins_second_typed_error() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let fixture = seed_acknowledged_fixture();
     let store = Arc::new(reopen(&fixture.config));
     let barrier = Arc::new(Barrier::new(2));
@@ -130,6 +132,7 @@ fn concurrent_resolve_and_dismiss_first_wins_second_typed_error() {
 
 #[test]
 fn concurrent_basis_still_valid_and_archive_never_resolves_after_archive_commit() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     for _ in 0..8 {
         let fixture = seed_acknowledged_fixture();
         let store = Arc::new(reopen(&fixture.config));

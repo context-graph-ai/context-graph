@@ -439,6 +439,10 @@ impl Store {
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "ContextDB keeps typed refusal details inline so error propagation needs no allocation."
+)]
 fn append_event_attempt(
     store: &Store,
     tx: crate::TxId,
@@ -644,6 +648,10 @@ fn append_event_attempt(
 /// transaction. [`add_event_context_counts_in_tx`] guards the one Context-wide count row later in
 /// this same append transaction, so concurrent appends cannot commit overlapping summary updates:
 /// the loser retries the whole append from the current session row.
+#[expect(
+    clippy::result_large_err,
+    reason = "ContextDB keeps typed refusal details inline so error propagation needs no allocation."
+)]
 fn update_event_context_sessions_in_tx(
     store: &Store,
     tx: crate::TxId,
@@ -799,6 +807,10 @@ fn append_contention(input: &AppendEventBatch) -> CgError {
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "ContextDB keeps typed refusal details inline so error propagation needs no allocation."
+)]
 fn bump_event_context_revision_in_tx(
     store: &Store,
     tx: crate::TxId,
@@ -844,6 +856,10 @@ fn bump_event_context_revision_in_tx(
 /// first row fails on the primary key, also retryable. A Context without a row (never captured, or
 /// a forget interrupted before it rewrote the row) starts from a recount of its committed events,
 /// which does not yet include this transaction's inserts.
+#[expect(
+    clippy::result_large_err,
+    reason = "ContextDB keeps typed refusal details inline so error propagation needs no allocation."
+)]
 fn add_event_context_counts_in_tx(
     store: &Store,
     tx: crate::TxId,
@@ -862,6 +878,10 @@ fn add_event_context_counts_in_tx(
 }
 
 /// Record that the Context's count row must still hold `current` when `tx` commits.
+#[expect(
+    clippy::result_large_err,
+    reason = "ContextDB keeps typed refusal details inline so error propagation needs no allocation."
+)]
 fn guard_event_context_counts_in_tx(
     store: &Store,
     tx: crate::TxId,
@@ -892,6 +912,10 @@ fn guard_event_context_counts_in_tx(
     Ok(())
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "ContextDB keeps typed refusal details inline so error propagation needs no allocation."
+)]
 fn write_event_context_counts_in_tx(
     store: &Store,
     tx: crate::TxId,
@@ -947,6 +971,10 @@ fn write_event_context_counts_in_tx(
 /// The row (normally absent: the forget retired it before its erasure) is read and guarded before
 /// the recount, so an append that commits in between fails this transaction and the rewrite runs
 /// again over the newer events rather than overwriting that append's increment.
+#[expect(
+    clippy::result_large_err,
+    reason = "ContextDB keeps typed refusal details inline so error propagation needs no allocation."
+)]
 pub(crate) fn rewrite_event_context_counts(store: &Store, context_id: ContextId) -> Result<()> {
     for attempt in 1..=MAX_APPEND_ATTEMPTS {
         let tx = store.begin_tx()?;
@@ -2135,6 +2163,10 @@ fn ensure_context_exists(store: &Store, context_id: ContextId) -> Result<()> {
     Ok(())
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "ContextDB keeps typed refusal details inline so error propagation needs no allocation."
+)]
 fn stream_append_state_in_tx(
     store: &Store,
     tx: crate::TxId,
@@ -2177,6 +2209,10 @@ fn stream_append_state_in_tx(
     Ok((next_seq, Some(watermark), order_persisted))
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "ContextDB keeps typed refusal details inline so error propagation needs no allocation."
+)]
 fn source_position_order_persisted_in_tx(
     store: &Store,
     tx: crate::TxId,
@@ -2213,6 +2249,10 @@ fn source_position_order_persisted_in_tx(
     Ok(false)
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "ContextDB keeps typed refusal details inline so error propagation needs no allocation."
+)]
 fn insert_source_position_order_in_tx(
     store: &Store,
     tx: crate::TxId,
@@ -2286,6 +2326,10 @@ fn source_stream_params(input: &AppendEventBatch) -> HashMap<String, Value> {
     ])
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "ContextDB keeps typed refusal details inline so error propagation needs no allocation."
+)]
 fn event_by_natural_key_in_tx(
     store: &Store,
     tx: crate::TxId,
@@ -2327,6 +2371,10 @@ fn event_by_natural_key_in_tx(
         .transpose()?)
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "ContextDB keeps typed refusal details inline so error propagation needs no allocation."
+)]
 fn insert_event_in_tx(
     store: &Store,
     tx: crate::TxId,
@@ -2413,6 +2461,10 @@ fn insert_event_in_tx(
     Ok(())
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "ContextDB keeps typed refusal details inline so error propagation needs no allocation."
+)]
 fn insert_anchor_in_tx(
     store: &Store,
     tx: crate::TxId,
@@ -2483,6 +2535,10 @@ fn insert_anchor_in_tx(
     Ok(())
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "ContextDB keeps typed refusal details inline so error propagation needs no allocation."
+)]
 fn insert_local_commit_in_tx(
     store: &Store,
     tx: crate::TxId,
@@ -2503,6 +2559,10 @@ fn insert_local_commit_in_tx(
     Ok(())
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "ContextDB keeps typed refusal details inline so error propagation needs no allocation."
+)]
 fn persist_source_progress_in_tx(
     store: &Store,
     tx: crate::TxId,
@@ -2989,6 +3049,10 @@ fn get_optional_source_time(row: &[Value], columns: &[String]) -> Result<Option<
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "ContextDB keeps typed refusal details inline so error propagation needs no allocation."
+)]
 fn expected_policy() -> Result<ApplicationTablePolicyExpectation> {
     ApplicationTablePolicyExpectation::new()
         .expect_table("events", EVENT_POLICY)

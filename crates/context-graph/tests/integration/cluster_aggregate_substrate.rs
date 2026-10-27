@@ -406,6 +406,7 @@ fn hidden_member_vector_payloads_reachable_from_signatures(
 /// @invariant 23
 #[test]
 fn cluster_aggregate_carries_embedding_space_id_and_producer_metadata() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let store = store(vec![face_space()]);
     let db_path = store.db_path().to_path_buf();
     let original = aggregate("signature-centroid-v1", FACE_SPACE);
@@ -439,6 +440,7 @@ fn cluster_aggregate_carries_embedding_space_id_and_producer_metadata() {
 /// @invariant 23
 #[test]
 fn cluster_aggregate_does_not_expose_member_vectors_through_engine_internal_query() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let store = store(vec![face_space()]);
     let db_path = store.db_path().to_path_buf();
     let original = aggregate("signature-private-members", FACE_SPACE);
@@ -491,6 +493,7 @@ fn cluster_aggregate_does_not_expose_member_vectors_through_engine_internal_quer
 #[test]
 fn new_edge_can_verify_inherited_signature_space_compatibility_at_boot_via_locally_declared_spaces()
 {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let inherited = aggregate("signature-inherited-face", FACE_SPACE);
     let missing_store = store(Vec::new());
     let missing =

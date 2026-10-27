@@ -28,7 +28,7 @@
 //! It reads source text, not a compiled binary, so it is a declaration check rather than a
 //! link-time proof. It ignores whole-line comments (which is how the inventory prose itself is
 //! skipped) and would miss an environment read assembled from a runtime-built name — a thing this
-//! codebase does not do, and which the reviewer of any such change would have to argue for.
+//! codebase does not do, and which the reader of any such change would have to argue for.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};

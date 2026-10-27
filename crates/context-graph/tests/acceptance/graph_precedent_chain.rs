@@ -90,7 +90,7 @@ fn create_decision_input(
     }
 }
 
-// Use case: A payment-platform reviewer at client-acme sees Decision D_b — "switch the payment provider to Stripe" — and asks what earlier Decision it cites as precedent. The engine follows the CITES edge and returns `[D_b, D_a]` after reopen.
+// Use case: A payment-platform reader at client-acme sees Decision D_b — "switch the payment provider to Stripe" — and asks what earlier Decision it cites as precedent. The engine follows the CITES edge and returns `[D_b, D_a]` after reopen.
 #[test]
 fn precedent_chain_walks_cites() {
     let (_tempdir, db_path, store) = fixture();

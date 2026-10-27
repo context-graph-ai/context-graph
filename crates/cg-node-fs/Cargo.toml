@@ -1,4 +1,6 @@
 [package]
+keywords.workspace = true
+categories.workspace = true
 name = "cg-node-fs"
 version.workspace = true
 authors.workspace = true
@@ -6,6 +8,12 @@ license.workspace = true
 repository.workspace = true
 description = "Node-deployment filesystem primitives for cg (config file read, per-data-root worker lock)"
 edition = "2024"
+
+[features]
+test-support = []
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(context_graph_internal_test_support)'] }
 
 [lib]
 name = "cg_node_fs"

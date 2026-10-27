@@ -1,3 +1,5 @@
+#[path = "../common/action_test_extractors.rs"]
+mod action_test_extractors;
 mod capture_cost_estimate;
 mod capture_cost_visibility;
 mod capture_progress;
@@ -14,6 +16,7 @@ mod digest_capture;
 mod discovery;
 mod edge_sync_convergence;
 mod edge_sync_offline_and_merge;
+mod entity_alert_render;
 mod entity_reference_match;
 mod evidence;
 mod fabric_frozen_rules;
@@ -45,10 +48,7 @@ mod model_connection;
 mod nomic_loads;
 mod pre_extraction_steering;
 mod producer_lineage_audit_render;
-#[path = "../common/refactor_extractor.rs"]
-mod refactor_extractor;
 mod relevance_retrieval;
-mod school_gate_entity_alert_render;
 #[cfg(context_graph_internal_test_support)]
 mod screenshot_memory_distinguishability;
 #[cfg(context_graph_internal_test_support)]

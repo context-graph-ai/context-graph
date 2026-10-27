@@ -145,8 +145,8 @@ fn isolated_offline_nomic_embedder() -> (Arc<NomicTextEmbedder>, tempfile::TempD
 /// (c) on `Arc<dyn Embedder>`.
 ///
 /// A `compile_fail` doctest cannot express that the extension trait is sealed (integration tests
-/// don't support `compile_fail`), so sealing is instead pinned by the public-surface guard added
-/// in the paired commit (`tests/acceptance/nomic_loads.rs`): it asserts `embedder.rs` declares
+/// don't support `compile_fail`), so the public-surface guard in
+/// `tests/acceptance/nomic_loads.rs` asserts `embedder.rs` declares
 /// `pub trait EventSearchEmbedder` with a private `Sealed` supertrait and exactly one blanket
 /// impl, which is the shape that makes an outside implementation of `EventSearchEmbedder`
 /// impossible.
@@ -154,8 +154,7 @@ fn isolated_offline_nomic_embedder() -> (Arc<NomicTextEmbedder>, tempfile::TempD
 fn the_four_role_methods_give_byte_identical_results_across_every_embedder_handle_route() {
     let (nomic, _tmp, _guard) = isolated_offline_nomic_embedder();
 
-    // (a) directly on the concrete handle — this is the call the ruling requires and the one
-    // that cannot compile until `EventSearchEmbedder` exists.
+    // (a) The concrete handle exposes the checked methods through `EventSearchEmbedder`.
     let doc_a = nomic
         .prepare_document("the incident review closed today")
         .expect("route (a) prepare_document must succeed");

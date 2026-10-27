@@ -42,6 +42,10 @@ pub(super) fn register_precedent_match_trigger(db: &Database) -> Result<()> {
     Ok(())
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "ContextDB keeps typed refusal details inline so error propagation needs no allocation."
+)]
 fn run_precedent_match(db: &Database, ctx: &TriggerContext) -> contextdb_core::Result<()> {
     let decision_id = required_uuid(&ctx.row_values, "id")?;
     let context_id = required_uuid(&ctx.row_values, "context_id")?;
@@ -63,6 +67,10 @@ fn run_precedent_match(db: &Database, ctx: &TriggerContext) -> contextdb_core::R
     Ok(())
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "ContextDB keeps typed refusal details inline so error propagation needs no allocation."
+)]
 fn cites_chain(
     db: &Database,
     tx: TxId,
@@ -112,6 +120,10 @@ fn cites_chain(
     Ok(out)
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "ContextDB keeps typed refusal details inline so error propagation needs no allocation."
+)]
 fn decision_created_at(
     db: &Database,
     tx: TxId,
@@ -134,6 +146,10 @@ fn decision_created_at(
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "ContextDB keeps typed refusal details inline so error propagation needs no allocation."
+)]
 fn insert_precedent_match(
     db: &Database,
     tx: TxId,
@@ -175,6 +191,10 @@ fn insert_precedent_match(
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "ContextDB keeps typed refusal details inline so error propagation needs no allocation."
+)]
 fn outcome_success(
     db: &Database,
     tx: TxId,
@@ -196,6 +216,10 @@ fn outcome_success(
         .transpose()
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "ContextDB keeps typed refusal details inline so error propagation needs no allocation."
+)]
 fn served_intentions(
     db: &Database,
     tx: TxId,
@@ -218,6 +242,10 @@ fn served_intentions(
         .collect()
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "ContextDB keeps typed refusal details inline so error propagation needs no allocation."
+)]
 fn required_uuid(values: &HashMap<String, Value>, column: &str) -> contextdb_core::Result<Uuid> {
     match values.get(column) {
         Some(Value::Uuid(value)) => Ok(*value),
@@ -227,6 +255,10 @@ fn required_uuid(values: &HashMap<String, Value>, column: &str) -> contextdb_cor
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "ContextDB keeps typed refusal details inline so error propagation needs no allocation."
+)]
 fn column_index(columns: &[String], column: &str) -> contextdb_core::Result<usize> {
     columns
         .iter()
@@ -234,6 +266,10 @@ fn column_index(columns: &[String], column: &str) -> contextdb_core::Result<usiz
         .ok_or_else(|| EngineError::Other(format!("missing column {column}").into()))
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "ContextDB keeps typed refusal details inline so error propagation needs no allocation."
+)]
 fn row_uuid(row: &[Value], columns: &[String], column: &str) -> contextdb_core::Result<Uuid> {
     match row.get(column_index(columns, column)?) {
         Some(Value::Uuid(value)) => Ok(*value),
@@ -243,6 +279,10 @@ fn row_uuid(row: &[Value], columns: &[String], column: &str) -> contextdb_core::
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "ContextDB keeps typed refusal details inline so error propagation needs no allocation."
+)]
 fn row_bool(row: &[Value], columns: &[String], column: &str) -> contextdb_core::Result<bool> {
     match row.get(column_index(columns, column)?) {
         Some(Value::Bool(value)) => Ok(*value),
@@ -252,6 +292,10 @@ fn row_bool(row: &[Value], columns: &[String], column: &str) -> contextdb_core::
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "ContextDB keeps typed refusal details inline so error propagation needs no allocation."
+)]
 fn row_txid(row: &[Value], columns: &[String], column: &str) -> contextdb_core::Result<TxId> {
     match row.get(column_index(columns, column)?) {
         Some(Value::TxId(value)) => Ok(*value),

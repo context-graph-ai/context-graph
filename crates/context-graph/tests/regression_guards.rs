@@ -1,12 +1,10 @@
-//! Shipped capture behaviors the client refactor must not break.
+//! Library capture preserves atomicity, source coverage, isolation, and receipt accounting.
 //!
-//! These guards exercise the shipped library entry points end to end and assert the
-//! behavior that already ships: one-transaction atomic capture, rolling condensation
-//! covering both ends, store-boundary context isolation, the determinism trybuild
-//! barrier, sync transport-and-restore round-trips, and the cost/time receipt with a
-//! zero-outbound estimate. They are expected to pass before and after the refactor.
+//! These guards exercise one-transaction capture, rolling condensation covering both ends,
+//! store-boundary context isolation, the determinism compile-fail barrier, sync restore,
+//! and cost/time receipts with zero-outbound estimates.
 
-// These shared test-support modules expose a broad helper surface used across the
+// These shaBehavior tests-support modules expose a broad helper surface used across the
 // whole acceptance suite; this binary uses only the subset it needs.
 #[allow(dead_code)]
 #[path = "common/capture_sync_common.rs"]

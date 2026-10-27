@@ -63,7 +63,7 @@ fn record_independent_history(
     } = input;
     let observation_id = ObservationId::new_v7();
     let evidence_id = EvidenceId::new_v7();
-    let evidence_source = format!("vigil-edge:session/{author}");
+    let evidence_source = format!("s3:session/{author}");
     let observed = store
         .record_observation(RecordObservation {
             id: observation_id,

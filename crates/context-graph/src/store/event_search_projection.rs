@@ -342,6 +342,7 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
     static AFTER_MEMBERSHIP_READ_PAGE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
+    static PROJECTION_READ_CLOCK: std::cell::RefCell<Option<std::sync::Arc<dyn contextdb_core::read_contract::DeadlineClock>>> = const { std::cell::RefCell::new(None) };
     static PROJECTION_READ_ACTIVE_MS: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
     static BEFORE_FAILURE_RECORD: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
@@ -405,6 +406,15 @@ pub fn after_next_event_search_membership_read_page_for_test(hook: impl FnOnce()
 #[doc(hidden)]
 pub fn set_event_search_projection_read_deadline_ms_for_test(active_ms: Option<u64>) {
     PROJECTION_READ_ACTIVE_MS.with(|slot| slot.set(active_ms));
+}
+
+/// Consume the substrate's existing deadline clock seam for projection reads on this thread.
+#[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
+#[doc(hidden)]
+pub fn set_event_search_projection_read_clock_for_test(
+    clock: Option<std::sync::Arc<dyn contextdb_core::read_contract::DeadlineClock>>,
+) {
+    PROJECTION_READ_CLOCK.with(|slot| *slot.borrow_mut() = clock);
 }
 
 /// Return and reset this thread's source-membership preparation count.
@@ -4963,10 +4973,7 @@ fn claimed_members_from_rows(
     rows: &[Vec<Value>],
     first_ordinal: u64,
 ) -> Result<Vec<ClaimedEvent>> {
-    let session = store
-        .internal_db()
-        .read_session(read_limits(store, bounds))
-        .map_err(map_engine_err)?;
+    let session = projection_read_session(store, bounds)?;
     let mut members = Vec::with_capacity(rows.len());
     let mut ordinal = first_ordinal;
     for row in rows {
@@ -7772,10 +7779,7 @@ fn load_claimed_member(
     row: &[Value],
     bounds: Bounds,
 ) -> Result<ClaimedEvent> {
-    let session = store
-        .internal_db()
-        .read_session(read_limits(store, bounds))
-        .map_err(map_engine_err)?;
+    let session = projection_read_session(store, bounds)?;
     let membership_id = get_uuid(row, columns, "membership_id")?;
     let ordinal = get_u64(row, columns, "ordinal")?;
     let event_id = crate::EventId::from(get_uuid(row, columns, "event_id")?);
@@ -9071,7 +9075,7 @@ fn run_batched_wave(
 
         let mut received = false;
         while !received {
-            match completions.recv_timeout(lease_poll_interval(bounds)) {
+            match receive_embedding_completion(&completions, bounds) {
                 Ok(result) => {
                     received = true;
                     match result {
@@ -9247,7 +9251,7 @@ fn run_embedding_wave(
 
         let mut received = 0_usize;
         while received < handles.len() {
-            match completions.recv_timeout(lease_poll_interval(bounds)) {
+            match receive_embedding_completion(&completions, bounds) {
                 Ok((index, result)) => {
                     received += 1;
                     match result {
@@ -9301,6 +9305,13 @@ fn run_embedding_wave(
         std::panic::resume_unwind(payload);
     }
     first_worker_error.or(first_lease_error).map_or(Ok(()), Err)
+}
+
+fn receive_embedding_completion<T>(
+    completions: &std::sync::mpsc::Receiver<T>,
+    bounds: Bounds,
+) -> std::result::Result<T, RecvTimeoutError> {
+    completions.recv_timeout(lease_poll_interval(bounds))
 }
 
 fn lease_poll_interval(bounds: Bounds) -> Duration {
@@ -10289,6 +10300,10 @@ fn finish_or_continue(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::result_large_err,
+    reason = "ContextDB keeps typed refusal details inline so error propagation needs no allocation."
+)]
 fn finish_stable(
     store: &Store,
     generation: &Generation,
@@ -11413,10 +11428,7 @@ fn stream_rows(
     params: &HashMap<String, Value>,
     mut consume: impl FnMut(&[String], &[Value]) -> Result<()>,
 ) -> Result<()> {
-    let session = store
-        .internal_db()
-        .read_session(read_limits(store, bounds))
-        .map_err(map_engine_err)?;
+    let session = projection_read_session(store, bounds)?;
     let mut cursor = session.open_cursor(sql, params).map_err(map_engine_err)?;
     let read = (|| -> Result<()> {
         let first = cursor.first_page();
@@ -11447,10 +11459,7 @@ fn query_rows(
     sql: &str,
     params: &HashMap<String, Value>,
 ) -> Result<crate::consumer_read::ConsumerQueryResult> {
-    let session = store
-        .internal_db()
-        .read_session(read_limits(store, bounds))
-        .map_err(map_engine_err)?;
+    let session = projection_read_session(store, bounds)?;
     let answer = session.execute(sql, params).map_err(map_engine_err)?;
     let answer = crate::consumer_read::ConsumerQueryResult::copy_from(&answer);
     super::event_search_read::record_executed_statement(sql, &answer.trace);
@@ -11459,6 +11468,10 @@ fn query_rows(
 }
 
 /// Every statement the projection executes directly, charged to a test recording when one is open.
+#[expect(
+    clippy::result_large_err,
+    reason = "ContextDB keeps typed refusal details inline so error propagation needs no allocation."
+)]
 fn execute_counted(
     store: &Store,
     sql: &str,
@@ -11472,6 +11485,10 @@ fn execute_counted(
 
 /// Every statement the projection executes inside a transaction, charged to a test recording
 /// when one is open.
+#[expect(
+    clippy::result_large_err,
+    reason = "ContextDB keeps typed refusal details inline so error propagation needs no allocation."
+)]
 fn execute_in_tx_counted(
     store: &Store,
     tx: TxId,
@@ -11486,6 +11503,10 @@ fn execute_in_tx_counted(
 
 /// One statement of a unit's commit transaction, its examined entries charged to the unit's receipt
 /// like the unit's reads: the fences' generation, manifest and fold reads and the member writes.
+#[expect(
+    clippy::result_large_err,
+    reason = "ContextDB keeps typed refusal details inline so error propagation needs no allocation."
+)]
 fn execute_in_tx_tallied(
     store: &Store,
     tx: TxId,
@@ -11537,6 +11558,20 @@ fn first_page_within_bytes(
     tally_examined(answer.trace.rows_examined);
     cursor.close().map_err(map_engine_err)?;
     Ok((answer, more))
+}
+
+fn projection_read_session(store: &Store, bounds: Bounds) -> Result<ReadSession> {
+    #[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
+    if let Some(clock) = PROJECTION_READ_CLOCK.with(|slot| slot.borrow().clone()) {
+        return store
+            .internal_db()
+            .read_session_with_clock_for_test(read_limits(store, bounds), clock)
+            .map_err(map_engine_err);
+    }
+    store
+        .internal_db()
+        .read_session(read_limits(store, bounds))
+        .map_err(map_engine_err)
 }
 
 fn read_limits(store: &Store, bounds: Bounds) -> ReadLimits {

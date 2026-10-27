@@ -150,8 +150,7 @@ pub trait InstalledInterpretationContract: Send + Sync {
 
 /// A candidate admitted by core validation and the independently installed contract.
 ///
-/// It has no public fields or constructor. [`admit_interpretation`] is the sole construction path,
-/// and the future commit seam accepts this type rather than raw effective fields.
+/// It has no public fields or constructor. [`admit_interpretation`] is the sole construction path.
 #[allow(dead_code)]
 pub struct AdmittedEffectiveEvent {
     pub(crate) fields: EffectiveEventFields,

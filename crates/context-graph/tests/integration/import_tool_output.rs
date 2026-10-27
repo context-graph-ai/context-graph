@@ -1,10 +1,5 @@
-//! RED contract tests for tool-output preservation: `cg import` must stop deleting
-//! decision-bearing tool output at jsonl parse. Authored and committed BEFORE implementation;
-//! implementation commits may not touch this file.
-//!
-//! Adversarial construction (the rename-fixture lesson): the decisive detail exists ONLY in the
-//! tool_result block; the following assistant dialogue references the mechanism by name but never
-//! restates the detail — so these tests cannot pass unless tool content actually survives.
+//! Import preserves decision-bearing tool output during JSONL parsing. The decisive detail
+//! exists only in the tool result, while assistant dialogue names the mechanism without the detail.
 
 use context_graph::ingest::{
     ClaudeJsonlParser, ImportParser, ToolEvent, TranscriptItem, render_import_transcript,
@@ -48,9 +43,7 @@ fn user_tool_result_line(id: &str, content: &str) -> String {
     .to_string()
 }
 
-/// A session where the relay-mode placement decision's rationale lives in a plan-file read —
-/// the real capture-loss class this test closes (the relay-hub session is the live-smoke
-/// counterpart, assertion S2).
+/// A session where the relay-mode placement decision's rationale lives in a plan-file read.
 fn decision_bearing_session() -> String {
     [
         assistant_text_line(
@@ -98,6 +91,7 @@ fn undiscussed_noise_session() -> (String, usize) {
 
 #[test]
 fn import_preserves_decision_bearing_tool_output_as_prose() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let parser = ClaudeJsonlParser;
     let transcript = parser
         .parse(decision_bearing_session().as_bytes())
@@ -115,14 +109,15 @@ fn import_preserves_decision_bearing_tool_output_as_prose() {
 
 #[test]
 fn import_renders_kept_tool_content_without_tool_tags() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let parser = ClaudeJsonlParser;
     let transcript = parser
         .parse(decision_bearing_session().as_bytes())
         .expect("session parses");
-    // Content must be present (otherwise this test would pass vacuously pre-fix)...
+    // Content must be present so the rendering check cannot pass vacuously...
     assert!(transcript.contains(DECISIVE_DETAIL));
     // ...and rendered as plain prose: tag-wrapped content would be invisible to retrieval
-    // (tier-0's salience pass strips tool tags from the digest the embedding is built from).
+    // (model-free's salience pass strips tool tags from the digest the embedding is built from).
     for tag in ["<tool_use", "<tool_result", "tool_use_id"] {
         assert!(
             !transcript.contains(tag),
@@ -133,6 +128,7 @@ fn import_renders_kept_tool_content_without_tool_tags() {
 
 #[test]
 fn import_selection_is_deterministic_and_bounded() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let parser = ClaudeJsonlParser;
     let (raw, raw_len) = undiscussed_noise_session();
     let first = parser.parse(raw.as_bytes()).expect("session parses");
@@ -155,9 +151,9 @@ fn import_selection_is_deterministic_and_bounded() {
 
 #[test]
 fn import_selection_policy_is_shared_not_vendor_specific() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     // The selection + rendering policy is ONE deterministic library rule over vendor-neutral
-    // items — callable with no vendor parser at all, so future connectors (Codex/Gemini,
-    // Plan-22 formats) reuse it instead of re-inventing it.
+    // items, callable with no vendor parser.
     let items = vec![
         TranscriptItem::Dialogue {
             role: "assistant".to_string(),

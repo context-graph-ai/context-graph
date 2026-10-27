@@ -1,9 +1,9 @@
+use crate::common::{Collector, wait_for_len};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
-use std::time::{Duration, Instant};
 
 use cg_catalog::{CG_CATALOG_CONTEXT_ID, CgCatalogError, UpdateCheckObservation, UpdatePolicy};
 use context_graph::{
@@ -72,7 +72,7 @@ fn setup_revision_decision(
     EntityId,
     DecisionId,
     IntentionId,
-    Arc<Mutex<Vec<InvalidationDetectedPayload>>>,
+    Arc<Collector<InvalidationDetectedPayload>>,
 ) {
     ensure_catalog_context(store);
     let context_id = *CG_CATALOG_CONTEXT_ID;
@@ -110,7 +110,7 @@ fn setup_revision_decision(
             ..Default::default()
         })
         .expect("decision");
-    let payloads = Arc::new(Mutex::new(Vec::new()));
+    let payloads = Arc::new(Collector::new());
     let seen = Arc::clone(&payloads);
     store
         .with_system_principal()
@@ -130,6 +130,7 @@ fn stub_base_url(server: &tiny_http::Server) -> String {
 }
 
 struct UpdateFixtureServer {
+    server: Arc<tiny_http::Server>,
     shutdown: Arc<AtomicBool>,
     server_thread: Option<std::thread::JoinHandle<()>>,
 }
@@ -137,6 +138,7 @@ struct UpdateFixtureServer {
 impl UpdateFixtureServer {
     fn stop_and_join(&mut self) -> std::thread::Result<()> {
         self.shutdown.store(true, Ordering::SeqCst);
+        self.server.unblock();
         match self.server_thread.take() {
             Some(server_thread) => server_thread.join(),
             None => Ok(()),
@@ -161,10 +163,12 @@ fn serve_nomic_fixture_until_idle_counted(
 ) -> UpdateFixtureServer {
     let shutdown = Arc::new(AtomicBool::new(false));
     let server_shutdown = Arc::clone(&shutdown);
+    let server = Arc::new(server);
+    let worker_server = Arc::clone(&server);
     let server_thread = std::thread::spawn(move || {
         while !server_shutdown.load(Ordering::SeqCst) {
-            match server.recv_timeout(std::time::Duration::from_millis(50)) {
-                Ok(Some(request)) => {
+            match worker_server.recv() {
+                Ok(request) => {
                     request_count.fetch_add(1, Ordering::SeqCst);
                     let url = request.url().to_string();
                     let fixture = fixture_dir("nomic");
@@ -180,12 +184,12 @@ fn serve_nomic_fixture_until_idle_counted(
                     let response = tiny_http::Response::from_data(bytes);
                     let _ = request.respond(response);
                 }
-                Ok(None) => {}
                 Err(_) => break,
             }
         }
     });
     UpdateFixtureServer {
+        server,
         shutdown,
         server_thread: Some(server_thread),
     }
@@ -207,10 +211,12 @@ fn serve_revision_source_until_idle_counted(
 ) -> UpdateFixtureServer {
     let shutdown = Arc::new(AtomicBool::new(false));
     let server_shutdown = Arc::clone(&shutdown);
+    let server = Arc::new(server);
+    let worker_server = Arc::clone(&server);
     let server_thread = std::thread::spawn(move || {
         while !server_shutdown.load(Ordering::SeqCst) {
-            match server.recv_timeout(std::time::Duration::from_millis(50)) {
-                Ok(Some(request)) => {
+            match worker_server.recv() {
+                Ok(request) => {
                     request_count.fetch_add(1, Ordering::SeqCst);
                     let url = request.url().to_string();
                     request_urls
@@ -224,12 +230,12 @@ fn serve_revision_source_until_idle_counted(
                     };
                     let _ = request.respond(tiny_http::Response::from_data(bytes));
                 }
-                Ok(None) => {}
                 Err(_) => break,
             }
         }
     });
     UpdateFixtureServer {
+        server,
         shutdown,
         server_thread: Some(server_thread),
     }
@@ -268,10 +274,12 @@ fn start_empty_revision_source(
     let paths = Arc::clone(&request_paths);
     let shutdown = Arc::new(AtomicBool::new(false));
     let server_shutdown = Arc::clone(&shutdown);
+    let server = Arc::new(server);
+    let worker_server = Arc::clone(&server);
     let server_thread = std::thread::spawn(move || {
         while !server_shutdown.load(Ordering::SeqCst) {
-            match server.recv_timeout(std::time::Duration::from_millis(50)) {
-                Ok(Some(request)) => {
+            match worker_server.recv() {
+                Ok(request) => {
                     counter.fetch_add(1, Ordering::SeqCst);
                     let url = request.url().to_string();
                     paths.lock().expect("request paths").push(url.clone());
@@ -283,7 +291,6 @@ fn start_empty_revision_source(
                     };
                     let _ = request.respond(response);
                 }
-                Ok(None) => {}
                 Err(_) => break,
             }
         }
@@ -292,20 +299,15 @@ fn start_empty_revision_source(
         request_count,
         request_paths,
         UpdateFixtureServer {
+            server,
             shutdown,
             server_thread: Some(server_thread),
         },
     )
 }
 
-fn wait_for_payload(payloads: &Arc<Mutex<Vec<InvalidationDetectedPayload>>>) {
-    let start = Instant::now();
-    while start.elapsed() < Duration::from_millis(500) {
-        if !payloads.lock().expect("payload collector").is_empty() {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
+fn wait_for_payload(payloads: &Arc<Collector<InvalidationDetectedPayload>>) {
+    wait_for_len(payloads, 1);
 }
 
 #[test]

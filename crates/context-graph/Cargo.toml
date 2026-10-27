@@ -1,4 +1,9 @@
 [package]
+# This internal example shares private source available only in the Git workspace.
+exclude = ["examples/ci_model_seed.rs"]
+publish = false
+keywords.workspace = true
+categories.workspace = true
 name = "context-graph"
 version.workspace = true
 authors.workspace = true
@@ -14,7 +19,7 @@ path = "src/lib.rs"
 [features]
 default = ["nomic-embedder"]
 # Private controls: activated by this crate's dev dependency, never by release defaults.
-test-support = []
+test-support = ["cg-node-fs/test-support", "contextdb-engine/test-seams"]
 nomic-embedder = [
     "dep:candle-core",
     "dep:candle-nn",
@@ -39,7 +44,7 @@ chrono = { workspace = true, features = ["serde"] }
 contextdb-core.workspace = true
 contextdb-engine.workspace = true
 contextdb-parser.workspace = true
-contextdb-server = { git = "https://github.com/context-graph-ai/contextdb", rev = "6a0d4b42222f3f3063e74d16d780a3e94a87163e", features = ["iroh"], optional = true }
+contextdb-server = { git = "https://github.com/context-graph-ai/contextdb", rev = "56dccfdc905653370a7a6775d0998b1053e5926a", features = ["iroh"], optional = true }
 fs4.workspace = true
 pollster.workspace = true
 rayon.workspace = true
@@ -54,6 +59,9 @@ ureq = { workspace = true, optional = true }
 uuid = { workspace = true, features = ["serde", "v4", "v7"] }
 
 [dev-dependencies]
+zip = { version = "=9.0.4", default-features = false }
+proc-macro2 = { version = "1", features = ["span-locations"] }
+syn = { version = "2", features = ["full", "visit"] }
 # Enable the fabric-sync worker seam for THIS crate's own integration tests (the frozen fabric
 # tests call `fabric::run_worker_once`). This is a test/example/bench-only activation: it does NOT
 # pull contextdb-server/tokio into the default `--edges normal,build` tree the purity guards check.
@@ -63,7 +71,7 @@ candle-nn.workspace = true
 candle-transformers.workspace = true
 cg-catalog = { path = "../cg-catalog", features = ["embeddinggemma-test-support"] }
 cg-connector-claude-code.workspace = true
-contextdb-server = { git = "https://github.com/context-graph-ai/contextdb", rev = "6a0d4b42222f3f3063e74d16d780a3e94a87163e", features = ["iroh", "test-seams"] }
+contextdb-server = { git = "https://github.com/context-graph-ai/contextdb", rev = "56dccfdc905653370a7a6775d0998b1053e5926a", features = ["iroh", "test-seams"] }
 contextdb-engine = { workspace = true, features = ["test-seams"] }
 contextdb-tx.workspace = true
 contextdb-vector = { workspace = true, features = ["test-seams"] }

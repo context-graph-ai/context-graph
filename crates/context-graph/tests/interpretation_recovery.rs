@@ -1,4 +1,4 @@
-//! RED contracts for recovering event interpretation claims.
+//! regression contracts for recovering event interpretation claims.
 //!
 //! Each control changes a row that the real public runner has already created. The mapper is the
 //! only interruption point: it runs after the runner has released every Store handle and before

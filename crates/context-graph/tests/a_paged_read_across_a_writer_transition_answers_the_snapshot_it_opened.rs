@@ -341,7 +341,7 @@ fn a_cursor_opened_before_the_handover_finishes_the_read_it_opened() {
     );
     let mut seen = Vec::new();
     for row in first.rows() {
-        seen.push(seq_of(row, &first.columns()));
+        seen.push(seq_of(row, first.columns()));
     }
 
     // The writer that was holding the store goes, and a different process opens and commits rows
@@ -363,7 +363,7 @@ fn a_cursor_opened_before_the_handover_finishes_the_read_it_opened() {
             Ok(page) => {
                 has_more = page.has_more();
                 for row in page.rows() {
-                    seen.push(seq_of(row, &page.columns()));
+                    seen.push(seq_of(row, page.columns()));
                 }
                 fetches.push(Ok(page.rows().len()));
             }

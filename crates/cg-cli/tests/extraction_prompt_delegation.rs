@@ -1,8 +1,7 @@
-//! RED contract test for library-owned prompt framing: the production extraction
+//! regression contract test for library-owned prompt framing: the production extraction
 //! prompt framing lives in the LIBRARY (the flows-doc "no surface without a library API beneath
 //! it" rule), so the bench and production render from the same source and cannot drift. The CLI
-//! may only delegate. Authored and committed BEFORE implementation; implementation commits may
-//! not touch this file.
+//! may only delegate.
 //!
 //! Source-scan guard, same class as the sanctioned cg-core purity guards: it reads the CLI
 //! source and asserts the framing is not defined there.

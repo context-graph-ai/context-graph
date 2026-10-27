@@ -334,8 +334,9 @@ fn producer() -> EvidenceProducer {
 
 #[test]
 fn entity_reference_embedding_query_for_unknown_entity_returns_empty_vec_not_error() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let fixture = fixture("entity-reference-known-unknown");
-    let known = seed_entity(&fixture.store, "Kumar");
+    let known = seed_entity(&fixture.store, "Alex");
     let enrolled = fixture.store.enroll_entity_reference(
         known.id,
         FACE_REFERENCE_SPACE,
@@ -363,8 +364,9 @@ fn entity_reference_embedding_query_for_unknown_entity_returns_empty_vec_not_err
 
 #[test]
 fn entity_reference_enrollment_dimension_validated_against_space_at_write_time() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let fixture = store();
-    let entity = seed_entity(&fixture.store, "Kumar");
+    let entity = seed_entity(&fixture.store, "Alex");
     let result = fixture.store.enroll_entity_reference(
         entity.id,
         FACE_REFERENCE_SPACE,
@@ -387,6 +389,7 @@ fn entity_reference_enrollment_dimension_validated_against_space_at_write_time()
 
 #[test]
 fn entity_reference_enrollment_for_unknown_entity_id_rejected_with_typed_fk_error() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     #[cfg(context_graph_internal_test_support)]
     {
         assert_unknown_entity_reference_enrollment_reaches_engine_fk();
@@ -476,9 +479,10 @@ fn assert_unknown_entity_reference_enrollment_reaches_engine_fk() {
 
 #[test]
 fn entity_reference_embedding_parent_entity_archive_does_not_orphan_child_rows() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let fixture = fixture("entity-reference-archive");
     let db_path = fixture.db_path.clone();
-    let entity = seed_entity(&fixture.store, "Kumar");
+    let entity = seed_entity(&fixture.store, "Alex");
     let first_vector = axis_vector(512, 0);
     let second_vector = axis_vector(512, 1);
     let third_vector = axis_vector(512, 2);

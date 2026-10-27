@@ -1,6 +1,6 @@
-//! Tier-0 deterministic capture: the default `cg record` / `cg import` front door.
+//! model-free deterministic capture: the default `cg record` / `cg import` front door.
 //!
-//! Tier-0 capture writes a verbatim digest, its local embedding, the kept raw source chunk, and a
+//! model-free capture writes a verbatim digest, its local embedding, the kept raw source chunk, and a
 //! durable understanding job on the shipped work ledger (`work_jobs` + its copied `work_inputs`) —
 //! all in ONE atomic transaction, with ZERO model calls. The model never runs on this path;
 //! understanding (structuring a chunk into the ontology) is deferred to a later worker that drains the
@@ -34,21 +34,21 @@ use crate::{
 
 pub use crate::status_reads::{ReadObservation, StatusReadObserver, UnobservedReads};
 
-/// The `kind` tier-0 capture stamps on every digest it writes, in the same transaction as that
+/// The `kind` model-free capture stamps on every digest it writes, in the same transaction as that
 /// digest's understanding job. It is what makes "the digests this context queued for understanding"
 /// answerable as one aggregate.
 pub(crate) const VERBATIM_KIND: &str = "verbatim";
 
-/// The work-ledger class every tier-0 understanding job is submitted under. A worker advertises this
+/// The work-ledger class every model-free understanding job is submitted under. A worker advertises this
 /// as a requirement tag to become eligible.
 pub(crate) const UNDERSTANDING_WORK_CLASS: &str = "cg.understanding";
 /// The requirement tag a capable understanding worker must advertise to claim an understanding job.
 pub(crate) const UNDERSTANDING_REQUIREMENT_TAG: &str = "class:cg.understanding";
 /// The stable local submitter/executor node id for a single-node install (submitter, worker, and
-/// digest owner are the same machine). Multi-machine ids arrive with enrollment (a later slice).
+/// digest owner are the same machine).
 pub(crate) const LOCAL_NODE_ID: &str = "cg-local";
 
-/// Default byte window a tier-0 capture splits a transcript into when the caller does not resolve
+/// Default byte window a model-free capture splits a transcript into when the caller does not resolve
 /// one. Each window becomes one verbatim digest (the retrieval granularity).
 pub const TIER0_DEFAULT_CHUNK_WINDOW: usize = 16_000;
 
@@ -81,7 +81,7 @@ impl Tier0CaptureRequest {
 }
 
 /// The deterministic-capture receipt. Understanding is deferred, so there are no harvest counts
-/// here — only the tier-0 truth: digests written, raw kept, what was skipped, and the always-zero
+/// here — only the model-free truth: digests written, raw kept, what was skipped, and the always-zero
 /// model cost.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Tier0CaptureReport {
@@ -97,7 +97,7 @@ pub struct Tier0CaptureReport {
     pub raw_bytes: usize,
     /// Pending understanding jobs in the capture context after this capture (ledger job state).
     pub pending_after: usize,
-    /// Always zero — tier-0 never calls a model.
+    /// Always zero — model-free never calls a model.
     pub model_calls: usize,
     /// The session handle these digests were grouped under.
     pub session_ref: String,
@@ -177,7 +177,7 @@ pub fn capture_tier0(store: &Store, request: Tier0CaptureRequest) -> Result<Tier
     capture_tier0_inner(store, request, false, None)
 }
 
-/// The fabric-aware tier-0 capture entry point. `source_opt_out` keeps this source's understanding
+/// The fabric-aware model-free capture entry point. `source_opt_out` keeps this source's understanding
 /// input local (submitted as an `InputRef::local_path` with no copied `work_inputs` row); `fault` is a
 /// test-only seam that aborts the capture transaction after the digest write to prove all-or-nothing
 /// rollback. Production callers pass `false` / `None`.
@@ -418,7 +418,7 @@ fn write_source_chunk(
     Ok(())
 }
 
-/// The deterministic 1:1 ledger job id for a tier-0 digest. Re-importing identical content yields the
+/// The deterministic 1:1 ledger job id for a model-free digest. Re-importing identical content yields the
 /// same digest and thus the same job id, so `work_jobs`' insert-if-not-exists dedups the resubmit.
 pub(crate) fn understanding_job_id(digest_id: DigestId) -> String {
     format!("cg.understanding.{}", digest_id.as_uuid())
@@ -428,8 +428,7 @@ pub(crate) fn understanding_job_id(digest_id: DigestId) -> String {
 /// the job (and its ephemeral input copy) commits atomically with the verbatim digest — one $0
 /// model-free transaction, no second commit. The requirement tags carry the worker capability
 /// contract; priority is the digest's local, never-synced retrieval-touch count. The job's
-/// `output_schema` is left unset here — wiring the typed understanding schema onto the job is deferred
-/// with the `llm.rs` output-contract sentinel retirement (the worker/model slice).
+/// `output_schema` is unset.
 ///
 /// Per-source opt-out is a ref-kind swap, not a policy language: an opted-out source submits its input
 /// as `InputRef::local_path` (no copied `work_inputs` row), which the shipped movement policy refuses
@@ -521,7 +520,7 @@ pub fn queue_counts_observed(
     queued_params.insert("kind".to_string(), DbValue::Text(VERBATIM_KIND.to_string()));
 
     let mut counts = QueueCounts::default();
-    // Every digest tier-0 capture wrote in this context, in bounded pages. `kind` is what capture
+    // Every digest model-free capture wrote in this context, in bounded pages. `kind` is what capture
     // stamps on the digest it writes in the same transaction as the job, so this is the queue's
     // candidate universe, and it is already scoped to the context — no job identity from another
     // context is ever read, whatever else the machine has queued.
@@ -621,8 +620,7 @@ fn keys_present(
 }
 
 /// The advisory wall-clock the local single-node claim model reads. Local claims take an unexpiring
-/// lease (`i64::MAX`), so any finite clock keeps them live; the fabric worker (a later slice) injects a
-/// real clock for lease-expiry honesty.
+/// lease (`i64::MAX`), so any finite clock keeps them live.
 pub(crate) fn ledger_clock_ms() -> i64 {
     0
 }
@@ -669,7 +667,7 @@ pub(crate) fn completion_exists_local(store: &Store, digest_text: &str) -> Resul
 }
 
 /// Bump the retrieval-touch counter for one digest: increment `touch_count` and stamp
-/// `last_touched_at`, inserting the row at count 1 on first touch. This is the daily-loop signal
+/// `last_touched_at`, inserting the row at count 1 on first touch. This is the capture signal
 /// that a captured memory actually answered a query — the priority hint the understanding worker
 /// reads to structure the memories a developer keeps reaching for first. Machine-local (the
 /// `cg_retrieval_touches` table never syncs — per-device firing stays local), and committed in its
@@ -753,7 +751,7 @@ fn retrieval_touch_count_in(store: &Store, digest_id: DigestId) -> Result<u64> {
     Ok(count.unwrap_or(0))
 }
 
-/// The `kind` marker on a digest (e.g. "verbatim" for a tier-0 digest), or `None` if absent.
+/// The `kind` marker on a digest (e.g. "verbatim" for a model-free digest), or `None` if absent.
 pub fn digest_kind(store: &Store, digest_id: DigestId) -> Result<Option<String>> {
     let result = store.read_query(
         "SELECT kind FROM digests WHERE id = $id",
@@ -823,8 +821,8 @@ pub fn forget_raw(
             .map_err(map_engine)?;
             report.chunks_purged += 1;
             report.bytes_purged += target.byte_len;
-            // Purging the raw makes an un-understood job un-runnable, so cancel it on the ledger —
-            // the cancellation is the retired queue's `skipped` state. Only a still-pending job is
+            // Purging the raw makes an un-understood job un-runnable, so cancel it on the ledger.
+            // Only a still-pending job is
             // cancelled (a completed job keeps its result); a re-purge is a no-op.
             let Some(digest_id) = parse_digest_uuid(&target.digest_id) else {
                 continue;
@@ -1153,7 +1151,7 @@ pub(crate) fn map_engine(err: contextdb_core::Error) -> CgError {
 // --- salience-clean text helpers --------------------------------------------------------------
 
 /// Strip `<prefix ...>...</close>` blocks (the open tag may carry attributes). Mirrors the import
-/// parser's noise stripping so tier-0 cleaning recognizes the same harness markers.
+/// parser's noise stripping so model-free cleaning recognizes the same harness markers.
 fn strip_prefixed_tag_blocks(text: &str, open_prefix: &str, close: &str) -> String {
     let mut out = String::new();
     let mut rest = text;

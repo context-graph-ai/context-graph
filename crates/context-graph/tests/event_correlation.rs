@@ -1,4 +1,4 @@
-//! RED coverage for the scope-bound event-correlation resolver.
+//! regression coverage for the scope-bound event-correlation resolver.
 //!
 //! The resolver must combine the borrowed in-flight batch with committed anchor
 //! rows before it decides whether a projected value is unique. These cases use

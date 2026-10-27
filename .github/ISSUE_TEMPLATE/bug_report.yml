@@ -1,0 +1,19 @@
+name: Bug report
+description: Report a reproducible problem.
+title: "bug: "
+body:
+  - type: markdown
+    attributes:
+      value: "For vulnerabilities, use private reporting in SECURITY.md. Remove credentials and conversation text."
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: Revision, OS, command or library call, expected and actual result.
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Sanitized evidence
+      description: Minimal synthetic input and output, without secrets or private history.

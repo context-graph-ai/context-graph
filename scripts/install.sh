@@ -104,34 +104,7 @@ if [ ! -x "$compiled_cg" ]; then
 fi
 install -m 755 "$compiled_cg" "$cg_bin"
 
-python3 - "$HOME" <<'PY'
-import json, pathlib, sys
-
-home = pathlib.Path(sys.argv[1])
-path = home / "agent-config/claude-code/settings.json"
-if not path.exists():
-    sys.exit(0)
-
-data = json.loads(path.read_text())
-hooks = data.get("hooks")
-if not isinstance(hooks, list) or not hooks:
-    sys.exit(0)
-
-has_marker = any(isinstance(hook, str) and hook.startswith("# BEGIN cg-injected-hook-") for hook in hooks)
-cleaned = [
-    hook
-    for hook in hooks
-    if hook != "cg observe --agent claude-code"
-]
-if has_marker:
-    if cleaned == hooks:
-        sys.exit(0)
-else:
-    cleaned.append("# BEGIN cg-injected-hook-claude-code-0")
-    cleaned.append("# END cg-injected-hook-claude-code-0")
-data["hooks"] = cleaned
-path.write_text(json.dumps(data, indent=2) + "\n")
-PY
+"$cg_bin" connect claude-code
 
 cat >"$prefix/cg-uninstall.sh" <<UNINSTALL
 #!/usr/bin/env bash
@@ -146,13 +119,33 @@ clean_all_hooks() {
 import json, pathlib, sys
 home = pathlib.Path(sys.argv[1])
 agents = ["claude-code", "cursor", "gemini-cli"]
-paths = list(home.glob("**/agent-config/claude-code/settings.json"))
+paths = [home / ".claude/settings.json"]
 paths += [home / ".cursor/hooks.json", home / ".gemini/settings.json"]
 for path in paths:
     if not path.exists():
         continue
     data = json.loads(path.read_text())
     hooks = data.get("hooks", [])
+    if path == home / ".claude/settings.json":
+        if isinstance(hooks, dict):
+            for event, groups in hooks.items():
+                if not isinstance(groups, list):
+                    continue
+                cleaned = []
+                for group in groups:
+                    if not isinstance(group, dict) or not isinstance(group.get("hooks"), list):
+                        cleaned.append(group)
+                        continue
+                    kept = [hook for hook in group["hooks"]
+                            if not (isinstance(hook, dict) and isinstance(hook.get("command"), str)
+                                    and hook["command"].startswith("cg hook claude-code "))]
+                    if kept == group["hooks"]:
+                        cleaned.append(group)
+                    elif kept:
+                        cleaned.append(dict(group, hooks=kept))
+                hooks[event] = cleaned
+            path.write_text(json.dumps(data, indent=2) + "\\n")
+        continue
     out = []
     skipping = None
     for hook in hooks:

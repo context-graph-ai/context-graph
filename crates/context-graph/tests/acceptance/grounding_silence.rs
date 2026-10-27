@@ -7,12 +7,12 @@ use std::collections::BTreeMap;
 use context_graph::ingest::CaptureRequest;
 use context_graph::{CreateEntity, EntityType, Store, StoreConfig};
 
-use super::fake_extractor::open_store_with_lexical_embedder;
-use super::refactor_extractor::{
+use super::action_test_extractors::{
     AmbiguousDecisionTypeExtractor, AmbiguousSpanExtractor, FiveFabricatedValuesExtractor,
     MislabeledDecisionTypeExtractor, MislabeledSpanExtractor, OutOfVocabDecisionTypeExtractor,
     OutOfVocabExtractor, SpanFaithfulExtractor,
 };
+use super::fake_extractor::open_store_with_lexical_embedder;
 
 fn fresh_store() -> (tempfile::TempDir, Store) {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -42,10 +42,6 @@ fn capture_with<E: context_graph::ingest::ConversationExtractor>(
     .expect("capture succeeded")
 }
 
-// A fully span-faithful capture produces an empty flagged-items list.
-// Silence holds for BOTH high- and low-confidence values (span presence decides, not confidence).
-// The placeholder full_grounding_check flags on low confidence, so low-confidence span-faithful
-// values incorrectly appear in flagged_items.
 #[test]
 fn every_extracted_value_with_a_supporting_span_present_and_aligned_is_not_flagged() {
     let (_dir, store) = fresh_store();
@@ -62,7 +58,6 @@ fn every_extracted_value_with_a_supporting_span_present_and_aligned_is_not_flagg
         &SpanFaithfulExtractor,
     );
 
-    // Placeholder: flags on model_confidence <= 0.5, so low-confidence span-faithful values get flagged.
     assert!(
         report.flagged_items.is_empty(),
         "flagged_items must be empty for a fully span-faithful capture, got: {:?}",
@@ -95,15 +90,8 @@ fn every_extracted_value_with_a_supporting_span_present_and_aligned_is_not_flagg
     );
 }
 
-// A value whose supporting span is absent from the chunk is flagged — across EVERY extracted
-// value class (entity, decision_type, agent_id, observation value, outcome value), not entities
-// only. Today grounding is entity-only (`grounding_check_entities` iterates harvest.entities and
-// nothing else), so a grounding check that inspects only entity spans flags the entity but lets
-// the decision_type / agent_id / observation / outcome through.
-//
-// The double emits, in ONE harvest, five fabricated values — one per class — none of which appear
-// in the transcript. The strengthened contract: ALL FIVE must be flagged. The current entity-only
-// grounding flags only the entity → the four non-entity assertions fail (RED on assertion).
+// Unsupported spans are flagged across entities, decision types, agent ids, observation values
+// and outcome values. The double emits one fabricated value per class, absent from the transcript.
 #[test]
 fn value_with_missing_span_is_flagged() {
     let (_dir, store) = fresh_store();
@@ -118,8 +106,7 @@ fn value_with_missing_span_is_flagged() {
         &FiveFabricatedValuesExtractor,
     );
 
-    // Each of the five fabricated values must appear in the unsure (flagged) block, identified by
-    // its own value text. The entity arm passes on the current impl; the other four are RED.
+    // Each fabricated value appears in the flagged block under its own value text.
     let flagged = |needle: &str| {
         report
             .flagged_items
@@ -173,9 +160,6 @@ fn value_with_missing_span_is_flagged() {
     );
 }
 
-// A model-confident, in-vocab value whose span is fabricated (not in chunk) is still flagged.
-// The placeholder flags on low confidence: this high-confidence input incorrectly passes through.
-// Second arm: same real span, low confidence — must NOT be flagged.
 #[test]
 fn confident_value_with_fabricated_span_is_still_flagged() {
     // Arm 1: high confidence + span NOT in chunk → must be flagged.
@@ -193,8 +177,6 @@ fn confident_value_with_fabricated_span_is_still_flagged() {
         "high-confidence value with span absent from chunk must be flagged"
     );
 
-    // Arm 2: low confidence + span IS in chunk → must NOT be flagged.
-    // The placeholder would flag this (because confidence <= 0.5 triggers flag).
     let real_span_low_confidence = GroundingInput {
         value: "container runtime".to_string(),
         cited_span: Some("container runtime".to_string()), // span is in chunk
@@ -210,8 +192,6 @@ fn confident_value_with_fabricated_span_is_still_flagged() {
     );
 }
 
-// A span present in the chunk but not supporting the chosen label is flagged.
-// The placeholder uses confidence, not label-support — passes mislabeled spans through.
 #[test]
 fn span_present_but_not_supporting_chosen_label_is_flagged() {
     // "the context-graph repo" is a Repository span, but chosen type is File.
@@ -248,9 +228,9 @@ fn span_present_but_not_supporting_chosen_label_is_flagged() {
         "mislabeled entity span must appear in flagged_items"
     );
 
-    // CAPTURE-PATH arm (RED): grounding must reach the closed-vocab DECISION_TYPE, not entities
+    // CAPTURE-PATH arm : grounding must reach the closed-vocab DECISION_TYPE, not entities
     // only. A decision whose decision_type span is present but does not support the chosen label
-    // must be flagged with the SPECIFIC SpanDoesNotSupportLabel reason. HEAD's capture grounding is
+    // must be flagged with the SPECIFIC SpanDoesNotSupportLabel reason. an incorrect implementation's capture grounding is
     // entity-only, so the decision_type flag is absent → this fails.
     let (_dir2, store2) = fresh_store();
     let report2 = capture_with(
@@ -266,18 +246,11 @@ fn span_present_but_not_supporting_chosen_label_is_flagged() {
                     || f.reason.contains("authentication module"))
         }),
         "the mislabeled DECISION_TYPE must be flagged with the SpanDoesNotSupportLabel reason via \
-         capture; HEAD's entity-only grounding lets it through. flagged_items: {:?}",
+         capture; an incorrect implementation's entity-only grounding lets it through. flagged_items: {:?}",
         report2.flagged_items
     );
 }
 
-// An out-of-vocab entity_type ("unknown" or non-vocab string) is flagged, not silently stored.
-// The placeholder flags on confidence, so an out-of-vocab high-confidence value passes through.
-// The capture-path arm is omitted: OutOfVocabExtractor's entity_type deserializes to the
-// in-vocab File default (the closed enum cannot carry an out-of-vocab token), so asserting
-// that a capture with it is flagged would force flagging a valid entity — the opposite of
-// the contract. The direct-predicate arm is load-bearing: it drives the real out-of-vocab
-// raw string through the grounding predicate and asserts it is flagged.
 #[test]
 fn out_of_vocab_or_unknown_closed_field_is_flagged() {
     // Direct predicate check: out-of-vocab value with span present → still flagged.
@@ -299,8 +272,8 @@ fn out_of_vocab_or_unknown_closed_field_is_flagged() {
          confidence; got {verdict:?}"
     );
 
-    // CAPTURE-PATH arm (RED): an out-of-vocab closed-vocab DECISION_TYPE with a present span must be
-    // flagged with the SPECIFIC OutOfVocab reason via capture. HEAD's entity-only grounding lets the
+    // CAPTURE-PATH arm : an out-of-vocab closed-vocab DECISION_TYPE with a present span must be
+    // flagged with the SPECIFIC OutOfVocab reason via capture. an incorrect implementation's entity-only grounding lets the
     // decision_type through → this fails.
     let (_dir, store) = fresh_store();
     let report = capture_with(
@@ -315,13 +288,11 @@ fn out_of_vocab_or_unknown_closed_field_is_flagged() {
                 && (f.reason.contains("wibblefangle") || f.reason.contains("storage engine"))
         }),
         "the out-of-vocab DECISION_TYPE must be flagged with the OutOfVocab reason via capture; \
-         HEAD's entity-only grounding lets it through. flagged_items: {:?}",
+         an incorrect implementation's entity-only grounding lets it through. flagged_items: {:?}",
         report.flagged_items
     );
 }
 
-// A span supporting two closed-vocab labels equally is flagged, not silently resolved to one.
-// The placeholder never flags ambiguous spans (is_ambiguous_span always returns false).
 #[test]
 fn ambiguous_span_supporting_two_labels_equally_is_flagged() {
     // "auth component" supports both Service and Module equally with no tie-breaker.
@@ -356,8 +327,8 @@ fn ambiguous_span_supporting_two_labels_equally_is_flagged() {
         "ambiguous entity span must appear in flagged_items"
     );
 
-    // CAPTURE-PATH arm (RED): an ambiguous closed-vocab DECISION_TYPE (span supports two labels
-    // equally) must be flagged with the SPECIFIC AmbiguousSpan reason via capture. HEAD's entity-only
+    // CAPTURE-PATH arm : an ambiguous closed-vocab DECISION_TYPE (span supports two labels
+    // equally) must be flagged with the SPECIFIC AmbiguousSpan reason via capture. an incorrect implementation's entity-only
     // grounding lets the decision_type through → this fails.
     let (_dir2, store2) = fresh_store();
     let report2 = capture_with(
@@ -372,7 +343,7 @@ fn ambiguous_span_supporting_two_labels_equally_is_flagged() {
                 && (f.reason.contains("policy") || f.reason.contains("adjust the policy"))
         }),
         "the ambiguous DECISION_TYPE must be flagged with the AmbiguousSpan reason via capture; \
-         HEAD's entity-only grounding lets it through. flagged_items: {:?}",
+         an incorrect implementation's entity-only grounding lets it through. flagged_items: {:?}",
         report2.flagged_items
     );
 }
@@ -383,8 +354,6 @@ fn ambiguous_span_supporting_two_labels_equally_is_flagged() {
 // load-bearing arm: `cg why` on a NON-flagged / fully-grounded item must NOT return a closed-vocab
 // legal list, so a stub that always returns the constant list fails.
 //
-// SCAFFOLD STUB the test fails on: legal_types_for_flagged_item ignores the item and returns the
-// constant list for ANY id (even a non-flagged one), so the non-flagged arm (expecting None) fails.
 #[test]
 fn flagged_closed_vocab_item_exposes_legal_type_list_via_cg_why() {
     // Capture so a real out-of-vocab entity_type is FLAGGED in the store (a real unsure item).
@@ -423,11 +392,7 @@ fn flagged_closed_vocab_item_exposes_legal_type_list_via_cg_why() {
         );
     }
 
-    // BY-ID, NOT TOKEN-OVERLAP. Seed a stored entity whose NAME shares a ≥3-char token with a
-    // NON-flagged probe id: a stored entity named "store" shares the "store" token with the probe id
-    // "no-such-item-in-store". A correct lookup resolves the item BY ID (the probe id is not a real
-    // flagged closed-vocab item) and returns None; a token-overlap heuristic resolves it because the
-    // stored entity name shares a token and wrongly returns the legal list → RED today.
+    // An unknown id sharing a token with a stored entity name still resolves to None.
     let why_ctx = store
         .list_contexts()
         .expect("list contexts")
@@ -464,12 +429,9 @@ fn flagged_closed_vocab_item_exposes_legal_type_list_via_cg_why() {
     // The single vocabulary source must itself enumerate the full canonical
     // vocabulary (kept as a sanity check on the source).
     assert_eq!(legal_entity_type_names().len(), EntityType::ALL.len());
-    let _ = why_flagged_closed_vocab; // retained import; the item-keyed path is the contract now
+    let _ = why_flagged_closed_vocab; // Check the canonical vocabulary as well as the item-keyed lookup.
 }
 
-// When Stage-3 resolution has an empty candidate set for a value that needed one, it is flagged
-// with the SPECIFIC empty-candidate reason — distinct from a span/vocab failure. The placeholder
-// check_candidate_grounding returns Grounded even on empty candidates.
 #[test]
 fn empty_candidate_set_at_resolution_is_flagged() {
     // The empty-candidate path specifically: an empty candidate set must flag as EmptyCandidateSet,
@@ -493,9 +455,9 @@ fn empty_candidate_set_at_resolution_is_flagged() {
          got {non_empty_verdict:?}"
     );
 
-    // CAPTURE-PATH arm (RED): the LIVE capture path must drive Stage-3 resolution for a value that
+    // CAPTURE-PATH arm : the LIVE capture path must drive Stage-3 resolution for a value that
     // needs a candidate and, finding ZERO in the store, flag it with the empty-candidate reason —
-    // never silently mint-as-resolved. HEAD's Stage-3 silently treats a zero-candidate decision as a
+    // never silently mint-as-resolved. an incorrect implementation's Stage-3 silently treats a zero-candidate decision as a
     // new insertion and flags nothing → this fails.
     let (_dir, store) = fresh_store();
     let report = capture_with(
@@ -510,15 +472,14 @@ fn empty_candidate_set_at_resolution_is_flagged() {
             .iter()
             .any(|f| f.reason.contains("EmptyCandidateSet")),
         "a Stage-3 resolution with ZERO candidates must land in report.flagged_items with the \
-         EmptyCandidateSet reason; HEAD silently mints-as-resolved and flags nothing. flagged_items: {:?}",
+         EmptyCandidateSet reason; an implementation that silently mints-as-resolved and flags nothing. flagged_items: {:?}",
         report.flagged_items
     );
 }
 
 // The flag predicate is a pure function of (span, chunk, value, vocab, candidates).
 // It must ignore model_confidence entirely.
-// The placeholder should_flag uses a confidence threshold — identical inputs with different
-// confidence produce different results. The correct implementation produces the same result.
+// Identical inputs produce identical flags regardless of model confidence.
 // This is a unit test — no store.
 #[test]
 fn flag_signal_is_deterministic_independent_of_model_confidence_score() {
@@ -537,8 +498,6 @@ fn flag_signal_is_deterministic_independent_of_model_confidence_score() {
         ..grounded_high_conf.clone()
     };
 
-    // Both must produce the same verdict (both not-flagged when span is present and supported).
-    // The placeholder produces different results: 0.99 not-flagged, 0.01 flagged.
     assert_eq!(
         should_flag(&grounded_high_conf),
         should_flag(&grounded_low_conf),

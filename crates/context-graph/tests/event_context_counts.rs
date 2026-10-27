@@ -707,8 +707,8 @@ fn show_reads_its_source_links_once_through_the_passage_first_index() {
 #[derive(Default)]
 struct InterleaveOnPurge {
     armed: AtomicBool,
-    /// Also release at the DELETE that retired the count row outside the purge, for the race that
-    /// only exists while such a DELETE is issued at all.
+    /// Also release at a standalone count-row DELETE, so moving retirement outside the purge
+    /// cannot evade the interleaving.
     release_at_count_row_delete: AtomicBool,
     release: Mutex<Option<Sender<()>>>,
     committed: Mutex<Option<Receiver<()>>>,
@@ -719,8 +719,7 @@ struct InterleaveOnPurge {
 
 impl DatabasePlugin for InterleaveOnPurge {
     fn on_query(&self, sql: &str) -> contextdb_core::Result<()> {
-        // Whichever the forget reaches first: its purge, or — while the count row was still
-        // retired outside the purge — the DELETE that retired it, right after it was read.
+        // Whichever the forget reaches first: its purge or a standalone count-row DELETE.
         let at_release_point = sql.trim_start().starts_with("PURGE FROM")
             || (self.release_at_count_row_delete.load(Ordering::SeqCst)
                 && sql.contains("DELETE FROM")
@@ -740,7 +739,7 @@ impl DatabasePlugin for InterleaveOnPurge {
                 .take()
                 .expect("armed once");
             committed
-                .recv_timeout(Duration::from_secs(60))
+                .recv()
                 .expect("the concurrent append commits before the purge runs");
         }
         Ok(())
@@ -765,9 +764,7 @@ impl DatabasePlugin for InterleaveOnPurge {
                 .expect("observed lock")
                 .take()
                 .expect("armed once");
-            observed
-                .recv_timeout(Duration::from_secs(60))
-                .expect("the observer read the count row");
+            observed.recv().expect("the observer read the count row");
         }
     }
 }
@@ -797,9 +794,7 @@ fn append_on_release(
     committed: Sender<()>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
-        release
-            .recv_timeout(Duration::from_secs(60))
-            .expect("the forget reached its purge");
+        release.recv().expect("the forget reached its purge");
         capture(
             &store,
             context_id,
@@ -855,9 +850,7 @@ fn an_append_committing_before_a_session_forgets_purge_leaves_no_stale_total() {
         let store = store.clone();
         let between = Arc::clone(&between);
         std::thread::spawn(move || {
-            observe_rx
-                .recv_timeout(Duration::from_secs(60))
-                .expect("the purge committed");
+            observe_rx.recv().expect("the purge committed");
             *between.lock().expect("observation lock") = Some(count_row(&store, context_id));
             observed.send(()).expect("report the observation");
         })

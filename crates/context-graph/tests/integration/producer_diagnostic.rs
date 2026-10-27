@@ -1011,6 +1011,7 @@ fn auto_path_row(
 
 #[test]
 fn producer_metadata_query_distinguishes_model_version_within_same_embedding_space_id() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let fixture = fixture("producer-version");
     let (_, first_embedding) = record(&fixture, "v1", 0);
     let (_, second_embedding) = record(&fixture, "v2", 1);
@@ -1048,6 +1049,7 @@ fn producer_metadata_query_distinguishes_model_version_within_same_embedding_spa
 
 #[test]
 fn producer_metadata_query_explain_uses_indexed_projection_on_system_field() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let fixture = fixture("producer-system-projection");
     let (_, embedding_id) = record(&fixture, "v1", 0);
     let db = raw_db(&fixture.db_path, fixture.store);
@@ -1093,6 +1095,7 @@ fn producer_metadata_query_explain_uses_indexed_projection_on_system_field() {
 #[test]
 fn producer_metadata_display_format_uniform_across_cg_bundled_consumer_trait_and_precomputed_paths()
 {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let one_tensor_dir = tempfile::tempdir().expect("one tensor dir");
     let one_tensor_model = stage_one_tensor_embeddinggemma_cache(one_tensor_dir.path());
     let one_tensor_config = StoreConfig {
@@ -1256,6 +1259,7 @@ fn producer_metadata_display_format_uniform_across_cg_bundled_consumer_trait_and
 #[test]
 fn decision_reasoning_chain_producer_system_predicate_query_returns_complete_answer_in_one_round_trip()
  {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let fixture = fixture("decision-reasoning-producer");
     let (evidence_id, embedding_id) = record(&fixture, "reasoning-v1", 0);
     let db = raw_db(&fixture.db_path, fixture.store);
@@ -1296,6 +1300,7 @@ fn decision_reasoning_chain_producer_system_predicate_query_returns_complete_ans
 #[cfg(context_graph_internal_test_support)]
 fn signature_match_full_chain_query_returns_centroid_producer_and_all_contributing_observation_producers_in_one_round_trip()
  {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let dir = tempfile::tempdir().expect("tempdir");
     let db_path = dir.path().join("signature-producers.db");
     let query_counter = Arc::new(QueryCountingPlugin::default());

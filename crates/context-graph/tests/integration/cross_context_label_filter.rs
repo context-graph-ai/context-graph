@@ -201,6 +201,7 @@ fn raw_count(db: &Database, sql: &str, params: HashMap<String, Value>) -> usize 
 
 #[test]
 fn vector_search_supports_cross_context_label_filter_via_candidate_set_restriction() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let fixture = fixture();
     let allowed_context = fixture
         .store
@@ -553,6 +554,7 @@ fn skip_source_item(lines: &[&str], mut idx: usize) -> usize {
 
 #[test]
 fn vector_search_cross_context_results_carry_per_row_context_label_for_caller_disambiguation() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let fixture = fixture();
     let (first_context, first_digest) = seed_digest(&fixture.store, "first", vec!["org:acme"], 0);
     let (second_context, second_digest) =

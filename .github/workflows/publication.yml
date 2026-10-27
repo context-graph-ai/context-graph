@@ -1,0 +1,161 @@
+name: publication preparation
+on:
+  workflow_dispatch:
+    inputs:
+      cg_sha:
+        description: Exact Context Graph commit SHA
+        required: true
+        type: string
+      contextdb_sha:
+        description: Exact ContextDB commit SHA
+        required: true
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.run_id }}
+  cancel-in-progress: false
+env:
+  CARGO_INCREMENTAL: '0'
+defaults:
+  run:
+    shell: bash
+    working-directory: workspace/context-graph
+jobs:
+  verify-tuple:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Validate exact ContextDB SHA
+        if: github.event_name == 'workflow_dispatch'
+        working-directory: .
+        env:
+          CONTEXTDB_SHA: ${{ inputs.contextdb_sha }}
+        run: |
+          if [[ ! "$CONTEXTDB_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "contextdb_sha must be an exact 40-character lowercase hexadecimal commit SHA" >&2
+            exit 1
+          fi
+      - name: Check out Context Graph
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          path: workspace/context-graph
+          ref: ${{ inputs.cg_sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Print and verify checked revisions
+        env:
+          TESTED_SHA: ${{ inputs.cg_sha || github.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ inputs.cg_sha || github.sha }}
+          EVENT_SHA: ${{ github.sha }}
+          REQUESTED_CONTEXTDB_SHA: ${{ inputs.contextdb_sha }}
+        run: |
+          context_graph_sha="$(git rev-parse HEAD)"
+          contextdb_sha="$(grep -o -m 1 -E 'contextdb[?]rev=[0-9a-f]{40}' Cargo.lock)"
+          contextdb_sha="${contextdb_sha##*=}"
+          if [[ ! "$context_graph_sha" =~ ^[0-9a-f]{40}$ ]] || [[ ! "$contextdb_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Context Graph checkout and locked ContextDB revision must be immutable 40-character commit SHAs" >&2
+            exit 1
+          fi
+          if [[ "$context_graph_sha" != "$TESTED_SHA" ]]; then
+            echo "checked-out Context Graph SHA does not match selected tested SHA" >&2
+            exit 1
+          fi
+          if [[ -n "$REQUESTED_CONTEXTDB_SHA" ]] && [[ "$contextdb_sha" != "$REQUESTED_CONTEXTDB_SHA" ]]; then
+            echo "locked ContextDB SHA does not match contextdb_sha" >&2
+            exit 1
+          fi
+          printf 'Context Graph SHA: %s\n' "$context_graph_sha"
+          printf 'ContextDB SHA: %s\n' "$contextdb_sha"
+          printf 'Base SHA: %s\nHead SHA: %s\nEvent SHA: %s\n' "$BASE_SHA" "$HEAD_SHA" "$EVENT_SHA"
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          toolchain: 1.94.1
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          cache-bin: false
+          workspaces: workspace/context-graph -> target
+      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2
+        with:
+          tool: cargo-deny@0.20.2,cargo-expand@1.0.124,cargo-nextest@0.9.140
+      - run: bash scripts/gate.sh source
+  package:
+    needs: [verify-tuple]
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Validate exact ContextDB SHA
+        if: github.event_name == 'workflow_dispatch'
+        working-directory: .
+        env:
+          CONTEXTDB_SHA: ${{ inputs.contextdb_sha }}
+        run: |
+          if [[ ! "$CONTEXTDB_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "contextdb_sha must be an exact 40-character lowercase hexadecimal commit SHA" >&2
+            exit 1
+          fi
+      - name: Check out Context Graph
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          path: workspace/context-graph
+          ref: ${{ inputs.cg_sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Print and verify checked revisions
+        env:
+          TESTED_SHA: ${{ inputs.cg_sha || github.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ inputs.cg_sha || github.sha }}
+          EVENT_SHA: ${{ github.sha }}
+          REQUESTED_CONTEXTDB_SHA: ${{ inputs.contextdb_sha }}
+        run: |
+          context_graph_sha="$(git rev-parse HEAD)"
+          contextdb_sha="$(grep -o -m 1 -E 'contextdb[?]rev=[0-9a-f]{40}' Cargo.lock)"
+          contextdb_sha="${contextdb_sha##*=}"
+          if [[ ! "$context_graph_sha" =~ ^[0-9a-f]{40}$ ]] || [[ ! "$contextdb_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Context Graph checkout and locked ContextDB revision must be immutable 40-character commit SHAs" >&2
+            exit 1
+          fi
+          if [[ "$context_graph_sha" != "$TESTED_SHA" ]]; then
+            echo "checked-out Context Graph SHA does not match selected tested SHA" >&2
+            exit 1
+          fi
+          if [[ -n "$REQUESTED_CONTEXTDB_SHA" ]] && [[ "$contextdb_sha" != "$REQUESTED_CONTEXTDB_SHA" ]]; then
+            echo "locked ContextDB SHA does not match contextdb_sha" >&2
+            exit 1
+          fi
+          printf 'Context Graph SHA: %s\n' "$context_graph_sha"
+          printf 'ContextDB SHA: %s\n' "$contextdb_sha"
+          printf 'Base SHA: %s\nHead SHA: %s\nEvent SHA: %s\n' "$BASE_SHA" "$HEAD_SHA" "$EVENT_SHA"
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          toolchain: 1.94.1
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          cache-bin: false
+          workspaces: workspace/context-graph -> target
+      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2
+        with:
+          tool: cargo-deny@0.20.2,cargo-expand@1.0.124,cargo-nextest@0.9.140
+      - run: bash scripts/gate.sh publication-check
+  publication-receipt:
+    name: publication-receipt
+    if: always()
+    needs: [verify-tuple, package]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require the exact successful job inventory
+        working-directory: .
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PY_CHECK'
+          import json, os
+          expected = {'verify-tuple', 'package'}
+          needs = json.loads(os.environ['NEEDS_JSON'])
+          if set(needs) != expected or any(row.get('result') != 'success' for row in needs.values()):
+              raise SystemExit('required job inventory failed: ' + json.dumps(needs, sort_keys=True))
+          print('all required jobs succeeded')
+          PY_CHECK

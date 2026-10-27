@@ -35,7 +35,7 @@ impl Store {
             });
         }
         let space = self
-            .embedding_space_for_id(&input.embedding.embedding_space_id)
+            .embedding_space_for_write(&input.embedding.embedding_space_id)
             .map_err(|_| CgError::UnknownEmbeddingSpace {
                 id: input.embedding.embedding_space_id.clone(),
             })?;
@@ -155,8 +155,7 @@ impl Store {
             let _ = self.db.rollback(tx);
             return Err(map_engine_err(e));
         }
-        // Digests use a dedicated audit target kind downstream. For now context_id
-        // scoping covers provenance; no audit_log row is needed here.
+        // context_id scoping covers provenance; no audit_log row is written here.
         self.db.commit(tx).map_err(map_engine_err)?;
 
         Ok(Digest {

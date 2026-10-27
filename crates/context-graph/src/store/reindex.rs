@@ -52,7 +52,7 @@ struct ReindexCommit<'a> {
 impl Store {
     pub fn reindex_space(&self, embedding_space_id: &str, options: ReindexOptions) -> Result<()> {
         let space = self
-            .embedding_space_for_id(embedding_space_id)
+            .embedding_space_for_write(embedding_space_id)
             .map_err(|_| CgError::UnknownEmbeddingSpace {
                 id: embedding_space_id.to_string(),
             })?;
@@ -340,6 +340,10 @@ impl Store {
         Ok(())
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "ContextDB keeps typed refusal details inline so error propagation needs no allocation."
+    )]
     fn commit_reindexed_candidate(&self, commit: ReindexCommit<'_>) -> Result<()> {
         let tx = self.db.begin().map_err(map_engine_err)?;
         let handle_id = EmbeddingId::new_v7();
@@ -485,7 +489,7 @@ impl Store {
         embedding_space_id: &str,
         started_at: TxId,
     ) -> Result<Vec<ReindexCandidate>> {
-        let space = self.embedding_space_for_id(embedding_space_id)?;
+        let space = self.embedding_space_for_write(embedding_space_id)?;
         let bindings = space
             .bindings
             .iter()

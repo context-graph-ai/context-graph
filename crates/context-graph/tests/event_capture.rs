@@ -998,12 +998,14 @@ async fn authenticated_custody_counts_equivalent_full_units_and_refuses_changed_
         .sync_database()
         .execute("SELECT * FROM events", &HashMap::new())
         .expect("read first shared row")
-        .rows().to_vec();
+        .rows()
+        .to_vec();
     let second_event_rows = second
         .sync_database()
         .execute("SELECT * FROM events", &HashMap::new())
         .expect("read second shared row")
-        .rows().to_vec();
+        .rows()
+        .to_vec();
     assert_eq!(
         first_event_rows, second_event_rows,
         "identical accepted events retain byte-for-byte equal shared rows"
@@ -1012,12 +1014,14 @@ async fn authenticated_custody_counts_equivalent_full_units_and_refuses_changed_
         .sync_database()
         .execute("SELECT * FROM event_anchors", &HashMap::new())
         .expect("read first complete anchor rows")
-        .rows().to_vec();
+        .rows()
+        .to_vec();
     let second_anchor_rows = second
         .sync_database()
         .execute("SELECT * FROM event_anchors", &HashMap::new())
         .expect("read second complete anchor rows")
-        .rows().to_vec();
+        .rows()
+        .to_vec();
     assert_eq!(
         first_anchor_rows.len(),
         1,

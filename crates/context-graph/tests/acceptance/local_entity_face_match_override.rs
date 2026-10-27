@@ -84,7 +84,7 @@ fn scenario(name: &str) -> Scenario {
     let intention = store
         .create_intention(CreateIntention {
             id: None,
-            description: "trust Kumar at 8 AM".to_string(),
+            description: "trust Alex at 8 AM".to_string(),
             status: IntentionStatus::Active,
             origin: IntentionOrigin::Human,
             context_id: context.id,
@@ -96,7 +96,7 @@ fn scenario(name: &str) -> Scenario {
     let entity = store
         .create_entity(CreateEntity {
             entity_type: EntityType::Person,
-            name: "Kumar".to_string(),
+            name: "Alex".to_string(),
             properties: BTreeMap::from([("role".to_string(), serde_json::json!("guardian"))]),
             tags: vec!["student-gate".to_string()],
             context_id: context.id,
@@ -105,16 +105,16 @@ fn scenario(name: &str) -> Scenario {
     let detected_entity = store
         .create_entity(CreateEntity {
             entity_type: EntityType::Person,
-            name: "unidentified person at school gate".to_string(),
+            name: "unidentified person at entry".to_string(),
             properties: BTreeMap::from([("track".to_string(), serde_json::json!("gate-42"))]),
-            tags: vec!["school-gate-live-detection".to_string()],
+            tags: vec!["entry-live-detection".to_string()],
             context_id: context.id,
         })
         .expect("detected person track");
     let decision = store
         .create_decision(CreateDecision {
             decision_type: "access-control".to_string(),
-            description: "trust Kumar at 8 AM".to_string(),
+            description: "trust Alex at 8 AM".to_string(),
             confidence: Some(0.91),
             intention_ids: vec![intention.id],
             based_on_entity_ids: vec![entity.id],
@@ -137,13 +137,13 @@ fn live_face_observation(scenario: &Scenario, axis: usize) -> RecordObservation 
         id: context_graph::ObservationId::new_v7(),
         entity_id: scenario.detected_entity_id,
         context_id: scenario.context_id,
-        observation_type: "school-gate-camera".to_string(),
+        observation_type: "entry-camera".to_string(),
         source: "gate-camera".to_string(),
         observed_at: Utc::now(),
         evidence: vec![EvidenceRef {
             id: evidence_id,
             kind: EvidenceKind::ImageFrame,
-            source_ref: "vigil-edge://camera/gate/frame/42".to_string(),
+            source_ref: "s3://camera/gate/frame/42".to_string(),
             mime_type: Some("image/jpeg".to_string()),
             retention_status: RetentionStatus::RetainedExternal,
             producer: face_producer("detector-v1"),
@@ -181,7 +181,7 @@ fn invalidation_carries_entity_aware_no_match_payload(
         .iter()
         .flat_map(|divergence| &divergence.value_diffs)
     {
-        if diff.field == "entity_name" && diff.current_value == Some(serde_json::json!("Kumar")) {
+        if diff.field == "entity_name" && diff.current_value == Some(serde_json::json!("Alex")) {
             entity_name = true;
         }
         if diff.field == "entity_id"
@@ -254,7 +254,7 @@ fn local_entity_face_embedding_no_match_invalidates_active_decision_and_emits_cr
                 && rows[0].severity == InvalidationSeverity::Critical
                 && rows[0].intention_now_un_served
                 && invalidation_carries_entity_aware_no_match_payload(&rows[0], &scenario)),
-        "nonmatching face must emit one critical invalidation tied to Kumar's decision with persisted entity-aware override payload, enrollment={enrollment:?}, observation={observation:?}, invalidations={invalidations:?}"
+        "nonmatching face must emit one critical invalidation tied to Alex's decision with persisted entity-aware override payload, enrollment={enrollment:?}, observation={observation:?}, invalidations={invalidations:?}"
     );
 }
 

@@ -1,9 +1,4 @@
-//! RED contract tests for staged extraction and cross-pass consistency: staged extraction passes as
-//! config-selectable PRODUCTION behavior, deterministic cross-pass consistency (a focused pass
-//! returning empty never erases what the full pass found), and session-level goal reconciliation
-//! (per-chunk duplicate goals merge additively into one canonical intention; unattached decisions
-//! are linked or flagged, never silently unattached). Authored and committed BEFORE
-//! implementation; implementation commits may not touch this file.
+//! Focused passes preserve full-pass findings and session goals reconcile additively.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -53,10 +48,8 @@ fn entity(key: &str, name: &str) -> EntitySeed {
     }
 }
 
-/// Deterministic staged double: realistic per-pass harvests (the focused entity pass finds
-/// entities the full pass missed — the probe-2 observed shape), plus a call log the tests
-/// assert against. Never a rigged shape: every returned item is faithful to the transcript
-/// the test feeds in.
+/// Deterministic extractor with per-pass harvests and a call log. The focused entity pass
+/// includes entities absent from the full pass; every returned item matches the input transcript.
 struct StagedSpyExtractor {
     calls: RefCell<Vec<ExtractionPass>>,
     /// Per-pass harvest builders keyed by pass; None = return empty harvest for that pass.
@@ -159,6 +152,7 @@ fn decisions_pass_harvest() -> StructuredHarvest {
 
 #[test]
 fn staged_passes_execute_on_capture_when_config_enabled() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let (_dir, store) = fresh_store();
     let harvests = BTreeMap::from([
         ("full", full_harvest()),
@@ -210,6 +204,7 @@ fn staged_passes_execute_on_capture_when_config_enabled() {
 
 #[test]
 fn default_config_runs_single_full_pass_only() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let (_dir, store) = fresh_store();
     let spy = StagedSpyExtractor::new(BTreeMap::from([("full", full_harvest())]));
     let config = CaptureHarnessConfig::default();
@@ -234,9 +229,8 @@ fn default_config_runs_single_full_pass_only() {
 
 #[test]
 fn staged_zero_with_full_nonzero_keeps_full_result() {
-    // Cross-pass consistency: the probe-2 observed failure was the lazy-empty RELOCATING —
-    // the decisions-only pass returned zero on a chunk where the full pass found decisions.
-    // The deterministic rule: a focused pass returning empty never erases the full pass's items.
+    let _alongside = crate::runs_alone::alongside_siblings();
+    // An empty focused pass never erases items found by the full pass.
     let (_dir, store) = fresh_store();
     let harvests = BTreeMap::from([
         ("full", full_harvest()),
@@ -314,6 +308,7 @@ impl ConversationExtractor for SameGoalJudge {
 
 #[test]
 fn session_goal_reconciliation_merges_duplicate_goals_across_digests() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let (_dir, store) = fresh_store();
     let config = CaptureHarnessConfig::default();
 
@@ -375,6 +370,7 @@ fn session_goal_reconciliation_merges_duplicate_goals_across_digests() {
 
 #[test]
 fn unattached_decision_is_linked_or_flagged_by_reconciliation() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let (_dir, store) = fresh_store();
     let config = CaptureHarnessConfig::default();
 

@@ -27,6 +27,7 @@ fn stub_base_url(server: &tiny_http::Server) -> String {
 }
 
 struct CorruptFixtureServer {
+    server: Arc<tiny_http::Server>,
     shutdown: Arc<AtomicBool>,
     server_thread: Option<std::thread::JoinHandle<()>>,
 }
@@ -34,6 +35,7 @@ struct CorruptFixtureServer {
 impl CorruptFixtureServer {
     fn stop_and_join(&mut self) -> std::thread::Result<()> {
         self.shutdown.store(true, Ordering::SeqCst);
+        self.server.unblock();
         match self.server_thread.take() {
             Some(server_thread) => server_thread.join(),
             None => Ok(()),
@@ -78,7 +80,7 @@ fn spawn_eviction_fetch_child(test_name: &str, cache_root: &std::path::Path) -> 
         .expect("eviction fetch child spawns")
 }
 
-fn first_stderr_line_within(child: &mut Child, timeout: std::time::Duration) -> Option<String> {
+fn first_stderr_line_within(child: &mut Child, _timeout: std::time::Duration) -> Option<String> {
     let stderr = child.stderr.take().expect("stderr piped");
     let (sender, receiver) = mpsc::channel();
     std::thread::spawn(move || {
@@ -86,10 +88,7 @@ fn first_stderr_line_within(child: &mut Child, timeout: std::time::Duration) -> 
         let result = BufReader::new(stderr).read_line(&mut line).map(|_| line);
         let _ = sender.send(result);
     });
-    let line = receiver
-        .recv_timeout(timeout)
-        .ok()
-        .and_then(std::result::Result::ok);
+    let line = receiver.recv().ok().and_then(std::result::Result::ok);
     if line.is_none() {
         let _ = child.kill();
     }
@@ -442,12 +441,13 @@ fn air_gap_pre_populated_cache_reads_with_zero_outbound_network_on_first_load() 
     write_source_override(temp.path(), NOMIC_ID, &base_url, NOMIC_REVISION);
     let outbound_request_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let counter = std::sync::Arc::clone(&outbound_request_count);
-    let server_thread = std::thread::spawn(move || {
-        if let Ok(Some(request)) = server.recv_timeout(std::time::Duration::from_millis(150)) {
-            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let _ = request.respond(tiny_http::Response::from_string("unexpected"));
-        }
-    });
+    let server_thread =
+        crate::common::FixtureServer::from_server(Arc::new(server), move |server| {
+            while let Ok(request) = server.recv() {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let _ = request.respond(tiny_http::Response::from_string("unexpected"));
+            }
+        });
     let result = catalog_at(temp.path(), "host-A")
         .fetch(None, NOMIC_ID, OutputMode::Interactive)
         .expect("fetch returns");
@@ -589,12 +589,13 @@ fn air_gap_with_partial_cache_and_no_network_returns_typed_artifact_missing_erro
     write_source_override(temp.path(), NOMIC_ID, &base_url, NOMIC_REVISION);
     let outbound_request_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let counter = std::sync::Arc::clone(&outbound_request_count);
-    let server_thread = std::thread::spawn(move || {
-        if let Ok(Some(request)) = server.recv_timeout(std::time::Duration::from_millis(150)) {
-            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let _ = request.respond(tiny_http::Response::from_string("unexpected"));
-        }
-    });
+    let server_thread =
+        crate::common::FixtureServer::from_server(Arc::new(server), move |server| {
+            while let Ok(request) = server.recv() {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let _ = request.respond(tiny_http::Response::from_string("unexpected"));
+            }
+        });
     let result = catalog_at(temp.path(), "host-A").fetch(None, NOMIC_ID, OutputMode::Interactive);
     assert!(matches!(
         result,
@@ -625,12 +626,13 @@ fn air_gap_with_artifact_only_partial_cache_fails_before_source_fetch_even_witho
     write_source_override(temp.path(), NOMIC_ID, &base_url, NOMIC_REVISION);
     let outbound_request_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let counter = std::sync::Arc::clone(&outbound_request_count);
-    let server_thread = std::thread::spawn(move || {
-        if let Ok(Some(request)) = server.recv_timeout(std::time::Duration::from_millis(150)) {
-            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let _ = request.respond(tiny_http::Response::from_string("unexpected"));
-        }
-    });
+    let server_thread =
+        crate::common::FixtureServer::from_server(Arc::new(server), move |server| {
+            while let Ok(request) = server.recv() {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let _ = request.respond(tiny_http::Response::from_string("unexpected"));
+            }
+        });
     let result = catalog_at(temp.path(), "host-A").fetch(None, NOMIC_ID, OutputMode::Interactive);
     assert!(
         matches!(result, Err(CgCatalogError::CacheIncomplete { .. })),
@@ -764,10 +766,12 @@ fn hf_endpoint_returns_200_with_corrupted_bytes_sha_check_catches_it_catalog_ref
     let counter = std::sync::Arc::clone(&request_count);
     let shutdown = Arc::new(AtomicBool::new(false));
     let server_shutdown = Arc::clone(&shutdown);
+    let server = Arc::new(server);
+    let worker_server = Arc::clone(&server);
     let server_thread = std::thread::spawn(move || {
         while !server_shutdown.load(Ordering::SeqCst) {
-            match server.recv_timeout(std::time::Duration::from_millis(50)) {
-                Ok(Some(request)) => {
+            match worker_server.recv() {
+                Ok(request) => {
                     counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     let corrupt =
                         b"corrupted model.safetensors bytes with matching HTTP success".to_vec();
@@ -780,12 +784,12 @@ fn hf_endpoint_returns_200_with_corrupted_bytes_sha_check_catches_it_catalog_ref
                     );
                     let _ = request.respond(response);
                 }
-                Ok(None) => {}
                 Err(_) => break,
             }
         }
     });
     let server_thread = CorruptFixtureServer {
+        server,
         shutdown,
         server_thread: Some(server_thread),
     };

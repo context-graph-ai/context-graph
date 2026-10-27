@@ -29,7 +29,7 @@ pub(crate) fn execute_with_live_txid(
             ok
         }
         Err(_) => {
-            // Fallback: best-effort, preserves original error-swallow contract.
+            // Fallback: best-effort, swallowing errors as the caller requires.
             db.execute(sql, &params).is_ok()
         }
     }
@@ -46,8 +46,7 @@ pub enum SkillProvenance {
 
 /// The value-level effect a learned post-generation-repair skill applies to a harvest. Serde-tagged
 /// so each kind has a distinct stored representation. Each
-/// kind is a deterministic repair a learned correction encodes; matching is literal-text keyed
-/// (identity-based matching is a named deferred item, not claimed here).
+/// kind is a deterministic repair a learned correction encodes; matching is literal-text keyed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SkillEffectEnvelope {
@@ -59,18 +58,18 @@ pub enum SkillEffectEnvelope {
     },
     /// Recategorize a decision's `decision_type` from a learned source category to a target category
     /// when the decision matches. Applied post-harvest at drain time. Authored via `cg skills add`;
-    /// AUTO-PROMOTION from corrections is deferred (only `RetypeEntity` auto-promotes today).
+    /// Only `RetypeEntity` auto-promotes from corrections.
     RecategorizeDecision {
         decision_matcher: String,
         from_category: String,
         to_category: String,
     },
     /// Drop a harvested item (goal / entity / decision / observation) whose text matches — the
-    /// "this shouldn't have been captured" repair. Authored via `cg skills add`; auto-promotion
-    /// deferred. (Distinct from `cg drop`, which is an overlay read-view exclusion, not this effect.)
+    /// "this shouldn't have been captured" repair. Authored via `cg skills add`, without auto-promotion.
+    /// Distinct from `cg drop`, which is an overlay read-view exclusion, not this effect.
     DropItem { item_matcher: String },
     /// Add a tag to a harvested decision whose text matches. Authored via `cg skills add`;
-    /// auto-promotion deferred. (There is no `cg fix --tag` flag; a tag rule is hand-authored.)
+    /// without auto-promotion. There is no `cg fix --tag` flag; a tag rule is hand-authored.
     AddTag { item_matcher: String, tag: String },
 }
 
@@ -1382,7 +1381,7 @@ pub const MAX_STEERING_ITEMS: usize = 5;
 /// Which apply layer a teaching event is acted on by. The deterministic router sends structural /
 /// type corrections to the post-generation repair layer (layer 1) and omission / judgment-class
 /// events to the generation-time steering layer (layer 2, few-shot example retrieval). Pure over the
-/// event kind — finer identity-based matching is a named deferred item, not claimed here.
+/// event kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApplyLayer {
     /// Deterministic post-generation repair (the learned-skill retype/recategorize seam).
@@ -1414,7 +1413,7 @@ pub fn route_teaching_event(kind: &TeachingEventKind) -> ApplyLayer {
 /// skills master switch is off or nothing relevant matches, so the caller appends nothing.
 ///
 /// This is prompt-assembly the drain call site appends to the extraction prompt; it is pure library
-/// logic (no model, no engine mutation) and never runs on the tier-0 default path.
+/// logic (no model, no engine mutation) and never runs on the model-free default path.
 pub fn assemble_pre_extraction_steering(
     store: &Store,
     chunk: &str,
@@ -2063,7 +2062,7 @@ fn traces_record_gone_bad(traces: &[FiringTrace]) -> bool {
 // ─── Pure-logic functions (store-free) ────────────────────────────────────────
 
 /// Extract the predicted classification value from a rule string so a candidate
-/// can be scored against held-out teaching events.
+/// can be scored with held-out teaching events.
 ///
 /// Returns `None` for rules whose format cannot be parsed (e.g. the fallback
 /// `"correction-derived rule"` string produced when no training corrections exist).

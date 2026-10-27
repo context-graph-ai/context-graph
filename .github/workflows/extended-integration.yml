@@ -1,0 +1,910 @@
+name: extended integration
+on:
+  workflow_call:
+    inputs:
+      cg_sha:
+        description: Exact Context Graph commit SHA
+        required: true
+        type: string
+      contextdb_sha:
+        description: Exact ContextDB commit SHA
+        required: true
+        type: string
+  schedule:
+    - cron: '23 3 * * 1'
+  workflow_dispatch:
+    inputs:
+      cg_sha:
+        description: Exact Context Graph commit SHA
+        required: true
+        type: string
+      contextdb_sha:
+        description: Exact ContextDB commit SHA
+        required: true
+        type: string
+      trusted:
+        description: Run protected trusted qualification on this dispatch revision
+        required: true
+        default: false
+        type: boolean
+permissions:
+  contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.run_id }}
+  cancel-in-progress: false
+env:
+  CARGO_INCREMENTAL: '0'
+defaults:
+  run:
+    shell: bash
+    working-directory: workspace/context-graph
+jobs:
+  public-model:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    steps:
+      - name: Validate exact ContextDB SHA
+        if: github.event_name == 'workflow_dispatch'
+        working-directory: .
+        env:
+          CG_MODEL_CACHE_ROOT: ${{ runner.temp }}/cg-model-cache
+          CONTEXTDB_SHA: ${{ inputs.contextdb_sha }}
+        run: |
+          if [[ ! "$CONTEXTDB_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "contextdb_sha must be an exact 40-character lowercase hexadecimal commit SHA" >&2
+            exit 1
+          fi
+      - name: Check out Context Graph
+        env:
+          CG_MODEL_CACHE_ROOT: ${{ runner.temp }}/cg-model-cache
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          path: workspace/context-graph
+          ref: ${{ inputs.cg_sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Print and verify checked revisions
+        env:
+          CG_MODEL_CACHE_ROOT: ${{ runner.temp }}/cg-model-cache
+          TESTED_SHA: ${{ inputs.cg_sha || github.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ inputs.cg_sha || github.sha }}
+          EVENT_SHA: ${{ github.sha }}
+          REQUESTED_CONTEXTDB_SHA: ${{ inputs.contextdb_sha }}
+        run: |
+          context_graph_sha="$(git rev-parse HEAD)"
+          contextdb_sha="$(grep -o -m 1 -E 'contextdb[?]rev=[0-9a-f]{40}' Cargo.lock)"
+          contextdb_sha="${contextdb_sha##*=}"
+          if [[ ! "$context_graph_sha" =~ ^[0-9a-f]{40}$ ]] || [[ ! "$contextdb_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Context Graph checkout and locked ContextDB revision must be immutable 40-character commit SHAs" >&2
+            exit 1
+          fi
+          if [[ "$context_graph_sha" != "$TESTED_SHA" ]]; then
+            echo "checked-out Context Graph SHA does not match selected tested SHA" >&2
+            exit 1
+          fi
+          if [[ -n "$REQUESTED_CONTEXTDB_SHA" ]] && [[ "$contextdb_sha" != "$REQUESTED_CONTEXTDB_SHA" ]]; then
+            echo "locked ContextDB SHA does not match contextdb_sha" >&2
+            exit 1
+          fi
+          printf 'Context Graph SHA: %s\n' "$context_graph_sha"
+          printf 'ContextDB SHA: %s\n' "$contextdb_sha"
+          printf 'Base SHA: %s\nHead SHA: %s\nEvent SHA: %s\n' "$BASE_SHA" "$HEAD_SHA" "$EVENT_SHA"
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        env:
+          CG_MODEL_CACHE_ROOT: ${{ runner.temp }}/cg-model-cache
+        with:
+          toolchain: 1.94.1
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        env:
+          CG_MODEL_CACHE_ROOT: ${{ runner.temp }}/cg-model-cache
+        with:
+          cache-bin: false
+          workspaces: workspace/context-graph -> target
+      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2
+        env:
+          CG_MODEL_CACHE_ROOT: ${{ runner.temp }}/cg-model-cache
+        with:
+          tool: cargo-deny@0.20.2,cargo-expand@1.0.124,cargo-nextest@0.9.140
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        env:
+          CG_MODEL_CACHE_ROOT: ${{ runner.temp }}/cg-model-cache
+        id: nomic-model-cache
+        with:
+          path: ${{ env.CG_MODEL_CACHE_ROOT }}
+          key: cg-nomic-${{ runner.os }}-${{ hashFiles('workspace/context-graph/crates/context-graph/src/embedder/nomic.rs') }}
+      - name: Seed Nomic model cache on cold miss
+        env:
+          CG_MODEL_CACHE_ROOT: ${{ runner.temp }}/cg-model-cache
+        if: steps.nomic-model-cache.outputs.cache-hit != 'true'
+        run: bash scripts/gate.sh model-seed
+      - env:
+          CG_MODEL_CACHE_ROOT: ${{ runner.temp }}/cg-model-cache
+          MODEL_CACHE_HIT: 'true'
+        run: bash scripts/gate.sh public-model
+  event-search:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    steps:
+      - name: Validate exact ContextDB SHA
+        if: github.event_name == 'workflow_dispatch'
+        working-directory: .
+        env:
+          CG_MODEL_CACHE_ROOT: ${{ runner.temp }}/cg-model-cache
+          CONTEXTDB_SHA: ${{ inputs.contextdb_sha }}
+        run: |
+          if [[ ! "$CONTEXTDB_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "contextdb_sha must be an exact 40-character lowercase hexadecimal commit SHA" >&2
+            exit 1
+          fi
+      - name: Check out Context Graph
+        env:
+          CG_MODEL_CACHE_ROOT: ${{ runner.temp }}/cg-model-cache
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          path: workspace/context-graph
+          ref: ${{ inputs.cg_sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Print and verify checked revisions
+        env:
+          CG_MODEL_CACHE_ROOT: ${{ runner.temp }}/cg-model-cache
+          TESTED_SHA: ${{ inputs.cg_sha || github.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ inputs.cg_sha || github.sha }}
+          EVENT_SHA: ${{ github.sha }}
+          REQUESTED_CONTEXTDB_SHA: ${{ inputs.contextdb_sha }}
+        run: |
+          context_graph_sha="$(git rev-parse HEAD)"
+          contextdb_sha="$(grep -o -m 1 -E 'contextdb[?]rev=[0-9a-f]{40}' Cargo.lock)"
+          contextdb_sha="${contextdb_sha##*=}"
+          if [[ ! "$context_graph_sha" =~ ^[0-9a-f]{40}$ ]] || [[ ! "$contextdb_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Context Graph checkout and locked ContextDB revision must be immutable 40-character commit SHAs" >&2
+            exit 1
+          fi
+          if [[ "$context_graph_sha" != "$TESTED_SHA" ]]; then
+            echo "checked-out Context Graph SHA does not match selected tested SHA" >&2
+            exit 1
+          fi
+          if [[ -n "$REQUESTED_CONTEXTDB_SHA" ]] && [[ "$contextdb_sha" != "$REQUESTED_CONTEXTDB_SHA" ]]; then
+            echo "locked ContextDB SHA does not match contextdb_sha" >&2
+            exit 1
+          fi
+          printf 'Context Graph SHA: %s\n' "$context_graph_sha"
+          printf 'ContextDB SHA: %s\n' "$contextdb_sha"
+          printf 'Base SHA: %s\nHead SHA: %s\nEvent SHA: %s\n' "$BASE_SHA" "$HEAD_SHA" "$EVENT_SHA"
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        env:
+          CG_MODEL_CACHE_ROOT: ${{ runner.temp }}/cg-model-cache
+        with:
+          toolchain: 1.94.1
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        env:
+          CG_MODEL_CACHE_ROOT: ${{ runner.temp }}/cg-model-cache
+        with:
+          cache-bin: false
+          workspaces: workspace/context-graph -> target
+      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2
+        env:
+          CG_MODEL_CACHE_ROOT: ${{ runner.temp }}/cg-model-cache
+        with:
+          tool: cargo-deny@0.20.2,cargo-expand@1.0.124,cargo-nextest@0.9.140
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        env:
+          CG_MODEL_CACHE_ROOT: ${{ runner.temp }}/cg-model-cache
+        id: nomic-model-cache
+        with:
+          path: ${{ env.CG_MODEL_CACHE_ROOT }}
+          key: cg-nomic-${{ runner.os }}-${{ hashFiles('workspace/context-graph/crates/context-graph/src/embedder/nomic.rs') }}
+      - name: Seed Nomic model cache on cold miss
+        env:
+          CG_MODEL_CACHE_ROOT: ${{ runner.temp }}/cg-model-cache
+        if: steps.nomic-model-cache.outputs.cache-hit != 'true'
+        run: bash scripts/gate.sh model-seed
+      - env:
+          CG_MODEL_CACHE_ROOT: ${{ runner.temp }}/cg-model-cache
+          MODEL_CACHE_HIT: 'true'
+        run: bash scripts/gate.sh features
+  extended-required:
+    name: extended-required
+    if: always()
+    needs: [public-model, event-search]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require the exact successful job inventory
+        working-directory: .
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PY_CHECK'
+          import json, os
+          expected = {'event-search', 'public-model'}
+          needs = json.loads(os.environ['NEEDS_JSON'])
+          if set(needs) != expected or any(row.get('result') != 'success' for row in needs.values()):
+              raise SystemExit('required job inventory failed: ' + json.dumps(needs, sort_keys=True))
+          print('all required jobs succeeded')
+          PY_CHECK
+  trusted-inputs:
+    if: github.event_name == 'workflow_dispatch' && inputs.trusted
+    environment: trusted-integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      REQUESTED_CONTEXTDB_SHA: ${{ inputs.contextdb_sha }}
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+      APPROVED_SESSION_LIST: ${{ vars.APPROVED_SESSION_LIST }}
+      APPROVED_GOLD_DIR: ${{ vars.APPROVED_GOLD_DIR }}
+      VARIANT_LABEL: candidate
+      CONFIGURED_MODEL_ID: ${{ vars.CONFIGURED_MODEL_ID }}
+      QUALITY_INPUT_RECEIPT: ${{ vars.QUALITY_INPUT_RECEIPT }}
+      QUALITY_ACCEPTANCE_RECEIPT: ${{ vars.QUALITY_ACCEPTANCE_RECEIPT }}
+      CG_SMOKE_REAL_JSONL: ${{ vars.CG_SMOKE_REAL_JSONL }}
+      CG_SMOKE_HUB_TICKET: ${{ secrets.CG_SMOKE_HUB_TICKET }}
+      CG_SMOKE_TENANT: ${{ vars.CG_SMOKE_TENANT }}
+      CG_SMOKE_SKIP_BUILD: '1'
+      CONTEXTDB: ${{ vars.CONTEXTDB_SMOKE_BINARY }}
+      CONTEXTDB_BUILD_RECEIPT: ${{ vars.CONTEXTDB_BUILD_RECEIPT }}
+      CG_LLM_SMOKE_HOSTED_ENDPOINT: ${{ vars.CG_LLM_SMOKE_HOSTED_ENDPOINT }}
+      CG_LLM_SMOKE_HOSTED_MODEL: ${{ vars.CG_LLM_SMOKE_HOSTED_MODEL }}
+      CG_LLM_SMOKE_HOSTED_API_KEY_ENV: OPENROUTER_API_KEY
+      CG_LLM_SMOKE_LOCAL_ENDPOINT: ${{ vars.CG_LLM_SMOKE_LOCAL_ENDPOINT }}
+      CG_LLM_SMOKE_LOCAL_MODEL: ${{ vars.CG_LLM_SMOKE_LOCAL_MODEL }}
+    steps:
+      - name: Require the approved workflow revision
+        working-directory: .
+        env:
+          DISPOSABLE_WORK_ROOT: ${{ runner.temp }}/quality-work
+          REPORT_PATH: ${{ runner.temp }}/quality-report.json
+          GRAY_PATH: ${{ runner.temp }}/quality-gray.json
+          ADJUDICATED_PATH: ${{ runner.temp }}/quality-adjudicated.json
+          APPROVED_SHA: ${{ inputs.cg_sha }}
+        run: |
+          [[ "$APPROVED_SHA" == "$GITHUB_SHA" ]] || { echo 'PENDING: trusted source must equal approved dispatch revision'; exit 2; }
+      - name: Validate exact ContextDB SHA
+        if: github.event_name == 'workflow_dispatch'
+        working-directory: .
+        env:
+          DISPOSABLE_WORK_ROOT: ${{ runner.temp }}/quality-work
+          REPORT_PATH: ${{ runner.temp }}/quality-report.json
+          GRAY_PATH: ${{ runner.temp }}/quality-gray.json
+          ADJUDICATED_PATH: ${{ runner.temp }}/quality-adjudicated.json
+          CONTEXTDB_SHA: ${{ inputs.contextdb_sha }}
+        run: |
+          if [[ ! "$CONTEXTDB_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "contextdb_sha must be an exact 40-character lowercase hexadecimal commit SHA" >&2
+            exit 1
+          fi
+      - name: Check out Context Graph
+        env:
+          DISPOSABLE_WORK_ROOT: ${{ runner.temp }}/quality-work
+          REPORT_PATH: ${{ runner.temp }}/quality-report.json
+          GRAY_PATH: ${{ runner.temp }}/quality-gray.json
+          ADJUDICATED_PATH: ${{ runner.temp }}/quality-adjudicated.json
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          path: workspace/context-graph
+          ref: ${{ inputs.cg_sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Print and verify checked revisions
+        env:
+          DISPOSABLE_WORK_ROOT: ${{ runner.temp }}/quality-work
+          REPORT_PATH: ${{ runner.temp }}/quality-report.json
+          GRAY_PATH: ${{ runner.temp }}/quality-gray.json
+          ADJUDICATED_PATH: ${{ runner.temp }}/quality-adjudicated.json
+          TESTED_SHA: ${{ inputs.cg_sha || github.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ inputs.cg_sha || github.sha }}
+          EVENT_SHA: ${{ github.sha }}
+          REQUESTED_CONTEXTDB_SHA: ${{ inputs.contextdb_sha }}
+        run: |
+          context_graph_sha="$(git rev-parse HEAD)"
+          contextdb_sha="$(grep -o -m 1 -E 'contextdb[?]rev=[0-9a-f]{40}' Cargo.lock)"
+          contextdb_sha="${contextdb_sha##*=}"
+          if [[ ! "$context_graph_sha" =~ ^[0-9a-f]{40}$ ]] || [[ ! "$contextdb_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Context Graph checkout and locked ContextDB revision must be immutable 40-character commit SHAs" >&2
+            exit 1
+          fi
+          if [[ "$context_graph_sha" != "$TESTED_SHA" ]]; then
+            echo "checked-out Context Graph SHA does not match selected tested SHA" >&2
+            exit 1
+          fi
+          if [[ -n "$REQUESTED_CONTEXTDB_SHA" ]] && [[ "$contextdb_sha" != "$REQUESTED_CONTEXTDB_SHA" ]]; then
+            echo "locked ContextDB SHA does not match contextdb_sha" >&2
+            exit 1
+          fi
+          printf 'Context Graph SHA: %s\n' "$context_graph_sha"
+          printf 'ContextDB SHA: %s\n' "$contextdb_sha"
+          printf 'Base SHA: %s\nHead SHA: %s\nEvent SHA: %s\n' "$BASE_SHA" "$HEAD_SHA" "$EVENT_SHA"
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        env:
+          DISPOSABLE_WORK_ROOT: ${{ runner.temp }}/quality-work
+          REPORT_PATH: ${{ runner.temp }}/quality-report.json
+          GRAY_PATH: ${{ runner.temp }}/quality-gray.json
+          ADJUDICATED_PATH: ${{ runner.temp }}/quality-adjudicated.json
+        with:
+          toolchain: 1.94.1
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        env:
+          DISPOSABLE_WORK_ROOT: ${{ runner.temp }}/quality-work
+          REPORT_PATH: ${{ runner.temp }}/quality-report.json
+          GRAY_PATH: ${{ runner.temp }}/quality-gray.json
+          ADJUDICATED_PATH: ${{ runner.temp }}/quality-adjudicated.json
+        with:
+          cache-bin: false
+          workspaces: workspace/context-graph -> target
+      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2
+        env:
+          DISPOSABLE_WORK_ROOT: ${{ runner.temp }}/quality-work
+          REPORT_PATH: ${{ runner.temp }}/quality-report.json
+          GRAY_PATH: ${{ runner.temp }}/quality-gray.json
+          ADJUDICATED_PATH: ${{ runner.temp }}/quality-adjudicated.json
+        with:
+          tool: cargo-deny@0.20.2,cargo-expand@1.0.124,cargo-nextest@0.9.140
+      - run: bash scripts/gate.sh trusted-inputs
+        env:
+          DISPOSABLE_WORK_ROOT: ${{ runner.temp }}/quality-work
+          REPORT_PATH: ${{ runner.temp }}/quality-report.json
+          GRAY_PATH: ${{ runner.temp }}/quality-gray.json
+          ADJUDICATED_PATH: ${{ runner.temp }}/quality-adjudicated.json
+  answer-quality:
+    if: github.event_name == 'workflow_dispatch' && inputs.trusted
+    environment: trusted-integration
+    needs: [trusted-inputs]
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      REQUESTED_CONTEXTDB_SHA: ${{ inputs.contextdb_sha }}
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+      APPROVED_SESSION_LIST: ${{ vars.APPROVED_SESSION_LIST }}
+      APPROVED_GOLD_DIR: ${{ vars.APPROVED_GOLD_DIR }}
+      VARIANT_LABEL: candidate
+      CONFIGURED_MODEL_ID: ${{ vars.CONFIGURED_MODEL_ID }}
+      QUALITY_INPUT_RECEIPT: ${{ vars.QUALITY_INPUT_RECEIPT }}
+      QUALITY_ACCEPTANCE_RECEIPT: ${{ vars.QUALITY_ACCEPTANCE_RECEIPT }}
+      CG_SMOKE_REAL_JSONL: ${{ vars.CG_SMOKE_REAL_JSONL }}
+      CG_SMOKE_HUB_TICKET: ${{ secrets.CG_SMOKE_HUB_TICKET }}
+      CG_SMOKE_TENANT: ${{ vars.CG_SMOKE_TENANT }}
+      CG_SMOKE_SKIP_BUILD: '1'
+      CONTEXTDB: ${{ vars.CONTEXTDB_SMOKE_BINARY }}
+      CONTEXTDB_BUILD_RECEIPT: ${{ vars.CONTEXTDB_BUILD_RECEIPT }}
+      CG_LLM_SMOKE_HOSTED_ENDPOINT: ${{ vars.CG_LLM_SMOKE_HOSTED_ENDPOINT }}
+      CG_LLM_SMOKE_HOSTED_MODEL: ${{ vars.CG_LLM_SMOKE_HOSTED_MODEL }}
+      CG_LLM_SMOKE_HOSTED_API_KEY_ENV: OPENROUTER_API_KEY
+      CG_LLM_SMOKE_LOCAL_ENDPOINT: ${{ vars.CG_LLM_SMOKE_LOCAL_ENDPOINT }}
+      CG_LLM_SMOKE_LOCAL_MODEL: ${{ vars.CG_LLM_SMOKE_LOCAL_MODEL }}
+    steps:
+      - name: Require the approved workflow revision
+        working-directory: .
+        env:
+          DISPOSABLE_WORK_ROOT: ${{ runner.temp }}/quality-work
+          REPORT_PATH: ${{ runner.temp }}/quality-report.json
+          GRAY_PATH: ${{ runner.temp }}/quality-gray.json
+          ADJUDICATED_PATH: ${{ runner.temp }}/quality-adjudicated.json
+          APPROVED_SHA: ${{ inputs.cg_sha }}
+        run: |
+          [[ "$APPROVED_SHA" == "$GITHUB_SHA" ]] || { echo 'PENDING: trusted source must equal approved dispatch revision'; exit 2; }
+      - name: Validate exact ContextDB SHA
+        if: github.event_name == 'workflow_dispatch'
+        working-directory: .
+        env:
+          DISPOSABLE_WORK_ROOT: ${{ runner.temp }}/quality-work
+          REPORT_PATH: ${{ runner.temp }}/quality-report.json
+          GRAY_PATH: ${{ runner.temp }}/quality-gray.json
+          ADJUDICATED_PATH: ${{ runner.temp }}/quality-adjudicated.json
+          CONTEXTDB_SHA: ${{ inputs.contextdb_sha }}
+        run: |
+          if [[ ! "$CONTEXTDB_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "contextdb_sha must be an exact 40-character lowercase hexadecimal commit SHA" >&2
+            exit 1
+          fi
+      - name: Check out Context Graph
+        env:
+          DISPOSABLE_WORK_ROOT: ${{ runner.temp }}/quality-work
+          REPORT_PATH: ${{ runner.temp }}/quality-report.json
+          GRAY_PATH: ${{ runner.temp }}/quality-gray.json
+          ADJUDICATED_PATH: ${{ runner.temp }}/quality-adjudicated.json
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          path: workspace/context-graph
+          ref: ${{ inputs.cg_sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Print and verify checked revisions
+        env:
+          DISPOSABLE_WORK_ROOT: ${{ runner.temp }}/quality-work
+          REPORT_PATH: ${{ runner.temp }}/quality-report.json
+          GRAY_PATH: ${{ runner.temp }}/quality-gray.json
+          ADJUDICATED_PATH: ${{ runner.temp }}/quality-adjudicated.json
+          TESTED_SHA: ${{ inputs.cg_sha || github.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ inputs.cg_sha || github.sha }}
+          EVENT_SHA: ${{ github.sha }}
+          REQUESTED_CONTEXTDB_SHA: ${{ inputs.contextdb_sha }}
+        run: |
+          context_graph_sha="$(git rev-parse HEAD)"
+          contextdb_sha="$(grep -o -m 1 -E 'contextdb[?]rev=[0-9a-f]{40}' Cargo.lock)"
+          contextdb_sha="${contextdb_sha##*=}"
+          if [[ ! "$context_graph_sha" =~ ^[0-9a-f]{40}$ ]] || [[ ! "$contextdb_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Context Graph checkout and locked ContextDB revision must be immutable 40-character commit SHAs" >&2
+            exit 1
+          fi
+          if [[ "$context_graph_sha" != "$TESTED_SHA" ]]; then
+            echo "checked-out Context Graph SHA does not match selected tested SHA" >&2
+            exit 1
+          fi
+          if [[ -n "$REQUESTED_CONTEXTDB_SHA" ]] && [[ "$contextdb_sha" != "$REQUESTED_CONTEXTDB_SHA" ]]; then
+            echo "locked ContextDB SHA does not match contextdb_sha" >&2
+            exit 1
+          fi
+          printf 'Context Graph SHA: %s\n' "$context_graph_sha"
+          printf 'ContextDB SHA: %s\n' "$contextdb_sha"
+          printf 'Base SHA: %s\nHead SHA: %s\nEvent SHA: %s\n' "$BASE_SHA" "$HEAD_SHA" "$EVENT_SHA"
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        env:
+          DISPOSABLE_WORK_ROOT: ${{ runner.temp }}/quality-work
+          REPORT_PATH: ${{ runner.temp }}/quality-report.json
+          GRAY_PATH: ${{ runner.temp }}/quality-gray.json
+          ADJUDICATED_PATH: ${{ runner.temp }}/quality-adjudicated.json
+        with:
+          toolchain: 1.94.1
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        env:
+          DISPOSABLE_WORK_ROOT: ${{ runner.temp }}/quality-work
+          REPORT_PATH: ${{ runner.temp }}/quality-report.json
+          GRAY_PATH: ${{ runner.temp }}/quality-gray.json
+          ADJUDICATED_PATH: ${{ runner.temp }}/quality-adjudicated.json
+        with:
+          cache-bin: false
+          workspaces: workspace/context-graph -> target
+      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2
+        env:
+          DISPOSABLE_WORK_ROOT: ${{ runner.temp }}/quality-work
+          REPORT_PATH: ${{ runner.temp }}/quality-report.json
+          GRAY_PATH: ${{ runner.temp }}/quality-gray.json
+          ADJUDICATED_PATH: ${{ runner.temp }}/quality-adjudicated.json
+        with:
+          tool: cargo-deny@0.20.2,cargo-expand@1.0.124,cargo-nextest@0.9.140
+      - run: bash scripts/gate.sh answer-quality
+        env:
+          DISPOSABLE_WORK_ROOT: ${{ runner.temp }}/quality-work
+          REPORT_PATH: ${{ runner.temp }}/quality-report.json
+          GRAY_PATH: ${{ runner.temp }}/quality-gray.json
+          ADJUDICATED_PATH: ${{ runner.temp }}/quality-adjudicated.json
+  llm-byok:
+    if: github.event_name == 'workflow_dispatch' && inputs.trusted
+    environment: trusted-integration
+    needs: [trusted-inputs]
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      REQUESTED_CONTEXTDB_SHA: ${{ inputs.contextdb_sha }}
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+      APPROVED_SESSION_LIST: ${{ vars.APPROVED_SESSION_LIST }}
+      APPROVED_GOLD_DIR: ${{ vars.APPROVED_GOLD_DIR }}
+      VARIANT_LABEL: candidate
+      CONFIGURED_MODEL_ID: ${{ vars.CONFIGURED_MODEL_ID }}
+      QUALITY_INPUT_RECEIPT: ${{ vars.QUALITY_INPUT_RECEIPT }}
+      QUALITY_ACCEPTANCE_RECEIPT: ${{ vars.QUALITY_ACCEPTANCE_RECEIPT }}
+      CG_SMOKE_REAL_JSONL: ${{ vars.CG_SMOKE_REAL_JSONL }}
+      CG_SMOKE_HUB_TICKET: ${{ secrets.CG_SMOKE_HUB_TICKET }}
+      CG_SMOKE_TENANT: ${{ vars.CG_SMOKE_TENANT }}
+      CG_SMOKE_SKIP_BUILD: '1'
+      CONTEXTDB: ${{ vars.CONTEXTDB_SMOKE_BINARY }}
+      CONTEXTDB_BUILD_RECEIPT: ${{ vars.CONTEXTDB_BUILD_RECEIPT }}
+      CG_LLM_SMOKE_HOSTED_ENDPOINT: ${{ vars.CG_LLM_SMOKE_HOSTED_ENDPOINT }}
+      CG_LLM_SMOKE_HOSTED_MODEL: ${{ vars.CG_LLM_SMOKE_HOSTED_MODEL }}
+      CG_LLM_SMOKE_HOSTED_API_KEY_ENV: OPENROUTER_API_KEY
+      CG_LLM_SMOKE_LOCAL_ENDPOINT: ${{ vars.CG_LLM_SMOKE_LOCAL_ENDPOINT }}
+      CG_LLM_SMOKE_LOCAL_MODEL: ${{ vars.CG_LLM_SMOKE_LOCAL_MODEL }}
+    steps:
+      - name: Require the approved workflow revision
+        working-directory: .
+        env:
+          DISPOSABLE_WORK_ROOT: ${{ runner.temp }}/quality-work
+          REPORT_PATH: ${{ runner.temp }}/quality-report.json
+          GRAY_PATH: ${{ runner.temp }}/quality-gray.json
+          ADJUDICATED_PATH: ${{ runner.temp }}/quality-adjudicated.json
+          APPROVED_SHA: ${{ inputs.cg_sha }}
+        run: |
+          [[ "$APPROVED_SHA" == "$GITHUB_SHA" ]] || { echo 'PENDING: trusted source must equal approved dispatch revision'; exit 2; }
+      - name: Validate exact ContextDB SHA
+        if: github.event_name == 'workflow_dispatch'
+        working-directory: .
+        env:
+          DISPOSABLE_WORK_ROOT: ${{ runner.temp }}/quality-work
+          REPORT_PATH: ${{ runner.temp }}/quality-report.json
+          GRAY_PATH: ${{ runner.temp }}/quality-gray.json
+          ADJUDICATED_PATH: ${{ runner.temp }}/quality-adjudicated.json
+          CONTEXTDB_SHA: ${{ inputs.contextdb_sha }}
+        run: |
+          if [[ ! "$CONTEXTDB_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "contextdb_sha must be an exact 40-character lowercase hexadecimal commit SHA" >&2
+            exit 1
+          fi
+      - name: Check out Context Graph
+        env:
+          DISPOSABLE_WORK_ROOT: ${{ runner.temp }}/quality-work
+          REPORT_PATH: ${{ runner.temp }}/quality-report.json
+          GRAY_PATH: ${{ runner.temp }}/quality-gray.json
+          ADJUDICATED_PATH: ${{ runner.temp }}/quality-adjudicated.json
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          path: workspace/context-graph
+          ref: ${{ inputs.cg_sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Print and verify checked revisions
+        env:
+          DISPOSABLE_WORK_ROOT: ${{ runner.temp }}/quality-work
+          REPORT_PATH: ${{ runner.temp }}/quality-report.json
+          GRAY_PATH: ${{ runner.temp }}/quality-gray.json
+          ADJUDICATED_PATH: ${{ runner.temp }}/quality-adjudicated.json
+          TESTED_SHA: ${{ inputs.cg_sha || github.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ inputs.cg_sha || github.sha }}
+          EVENT_SHA: ${{ github.sha }}
+          REQUESTED_CONTEXTDB_SHA: ${{ inputs.contextdb_sha }}
+        run: |
+          context_graph_sha="$(git rev-parse HEAD)"
+          contextdb_sha="$(grep -o -m 1 -E 'contextdb[?]rev=[0-9a-f]{40}' Cargo.lock)"
+          contextdb_sha="${contextdb_sha##*=}"
+          if [[ ! "$context_graph_sha" =~ ^[0-9a-f]{40}$ ]] || [[ ! "$contextdb_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Context Graph checkout and locked ContextDB revision must be immutable 40-character commit SHAs" >&2
+            exit 1
+          fi
+          if [[ "$context_graph_sha" != "$TESTED_SHA" ]]; then
+            echo "checked-out Context Graph SHA does not match selected tested SHA" >&2
+            exit 1
+          fi
+          if [[ -n "$REQUESTED_CONTEXTDB_SHA" ]] && [[ "$contextdb_sha" != "$REQUESTED_CONTEXTDB_SHA" ]]; then
+            echo "locked ContextDB SHA does not match contextdb_sha" >&2
+            exit 1
+          fi
+          printf 'Context Graph SHA: %s\n' "$context_graph_sha"
+          printf 'ContextDB SHA: %s\n' "$contextdb_sha"
+          printf 'Base SHA: %s\nHead SHA: %s\nEvent SHA: %s\n' "$BASE_SHA" "$HEAD_SHA" "$EVENT_SHA"
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        env:
+          DISPOSABLE_WORK_ROOT: ${{ runner.temp }}/quality-work
+          REPORT_PATH: ${{ runner.temp }}/quality-report.json
+          GRAY_PATH: ${{ runner.temp }}/quality-gray.json
+          ADJUDICATED_PATH: ${{ runner.temp }}/quality-adjudicated.json
+        with:
+          toolchain: 1.94.1
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        env:
+          DISPOSABLE_WORK_ROOT: ${{ runner.temp }}/quality-work
+          REPORT_PATH: ${{ runner.temp }}/quality-report.json
+          GRAY_PATH: ${{ runner.temp }}/quality-gray.json
+          ADJUDICATED_PATH: ${{ runner.temp }}/quality-adjudicated.json
+        with:
+          cache-bin: false
+          workspaces: workspace/context-graph -> target
+      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2
+        env:
+          DISPOSABLE_WORK_ROOT: ${{ runner.temp }}/quality-work
+          REPORT_PATH: ${{ runner.temp }}/quality-report.json
+          GRAY_PATH: ${{ runner.temp }}/quality-gray.json
+          ADJUDICATED_PATH: ${{ runner.temp }}/quality-adjudicated.json
+        with:
+          tool: cargo-deny@0.20.2,cargo-expand@1.0.124,cargo-nextest@0.9.140
+      - run: bash scripts/gate.sh llm-byok
+        env:
+          DISPOSABLE_WORK_ROOT: ${{ runner.temp }}/quality-work
+          REPORT_PATH: ${{ runner.temp }}/quality-report.json
+          GRAY_PATH: ${{ runner.temp }}/quality-gray.json
+          ADJUDICATED_PATH: ${{ runner.temp }}/quality-adjudicated.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        env:
+          DISPOSABLE_WORK_ROOT: ${{ runner.temp }}/quality-work
+          REPORT_PATH: ${{ runner.temp }}/quality-report.json
+          GRAY_PATH: ${{ runner.temp }}/quality-gray.json
+          ADJUDICATED_PATH: ${{ runner.temp }}/quality-adjudicated.json
+        if: always()
+        with:
+          name: smoke-${{ github.job }}
+          path: ${{ runner.temp }}/job-receipt/*.json
+          retention-days: 14
+          if-no-files-found: warn
+  deterministic-llm:
+    if: github.event_name == 'workflow_dispatch' && inputs.trusted
+    environment: trusted-integration
+    needs: [trusted-inputs]
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      REQUESTED_CONTEXTDB_SHA: ${{ inputs.contextdb_sha }}
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+      APPROVED_SESSION_LIST: ${{ vars.APPROVED_SESSION_LIST }}
+      APPROVED_GOLD_DIR: ${{ vars.APPROVED_GOLD_DIR }}
+      VARIANT_LABEL: candidate
+      CONFIGURED_MODEL_ID: ${{ vars.CONFIGURED_MODEL_ID }}
+      QUALITY_INPUT_RECEIPT: ${{ vars.QUALITY_INPUT_RECEIPT }}
+      QUALITY_ACCEPTANCE_RECEIPT: ${{ vars.QUALITY_ACCEPTANCE_RECEIPT }}
+      CG_SMOKE_REAL_JSONL: ${{ vars.CG_SMOKE_REAL_JSONL }}
+      CG_SMOKE_HUB_TICKET: ${{ secrets.CG_SMOKE_HUB_TICKET }}
+      CG_SMOKE_TENANT: ${{ vars.CG_SMOKE_TENANT }}
+      CG_SMOKE_SKIP_BUILD: '1'
+      CONTEXTDB: ${{ vars.CONTEXTDB_SMOKE_BINARY }}
+      CONTEXTDB_BUILD_RECEIPT: ${{ vars.CONTEXTDB_BUILD_RECEIPT }}
+      CG_LLM_SMOKE_HOSTED_ENDPOINT: ${{ vars.CG_LLM_SMOKE_HOSTED_ENDPOINT }}
+      CG_LLM_SMOKE_HOSTED_MODEL: ${{ vars.CG_LLM_SMOKE_HOSTED_MODEL }}
+      CG_LLM_SMOKE_HOSTED_API_KEY_ENV: OPENROUTER_API_KEY
+      CG_LLM_SMOKE_LOCAL_ENDPOINT: ${{ vars.CG_LLM_SMOKE_LOCAL_ENDPOINT }}
+      CG_LLM_SMOKE_LOCAL_MODEL: ${{ vars.CG_LLM_SMOKE_LOCAL_MODEL }}
+    steps:
+      - name: Require the approved workflow revision
+        working-directory: .
+        env:
+          DISPOSABLE_WORK_ROOT: ${{ runner.temp }}/quality-work
+          REPORT_PATH: ${{ runner.temp }}/quality-report.json
+          GRAY_PATH: ${{ runner.temp }}/quality-gray.json
+          ADJUDICATED_PATH: ${{ runner.temp }}/quality-adjudicated.json
+          APPROVED_SHA: ${{ inputs.cg_sha }}
+        run: |
+          [[ "$APPROVED_SHA" == "$GITHUB_SHA" ]] || { echo 'PENDING: trusted source must equal approved dispatch revision'; exit 2; }
+      - name: Validate exact ContextDB SHA
+        if: github.event_name == 'workflow_dispatch'
+        working-directory: .
+        env:
+          DISPOSABLE_WORK_ROOT: ${{ runner.temp }}/quality-work
+          REPORT_PATH: ${{ runner.temp }}/quality-report.json
+          GRAY_PATH: ${{ runner.temp }}/quality-gray.json
+          ADJUDICATED_PATH: ${{ runner.temp }}/quality-adjudicated.json
+          CONTEXTDB_SHA: ${{ inputs.contextdb_sha }}
+        run: |
+          if [[ ! "$CONTEXTDB_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "contextdb_sha must be an exact 40-character lowercase hexadecimal commit SHA" >&2
+            exit 1
+          fi
+      - name: Check out Context Graph
+        env:
+          DISPOSABLE_WORK_ROOT: ${{ runner.temp }}/quality-work
+          REPORT_PATH: ${{ runner.temp }}/quality-report.json
+          GRAY_PATH: ${{ runner.temp }}/quality-gray.json
+          ADJUDICATED_PATH: ${{ runner.temp }}/quality-adjudicated.json
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          path: workspace/context-graph
+          ref: ${{ inputs.cg_sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Print and verify checked revisions
+        env:
+          DISPOSABLE_WORK_ROOT: ${{ runner.temp }}/quality-work
+          REPORT_PATH: ${{ runner.temp }}/quality-report.json
+          GRAY_PATH: ${{ runner.temp }}/quality-gray.json
+          ADJUDICATED_PATH: ${{ runner.temp }}/quality-adjudicated.json
+          TESTED_SHA: ${{ inputs.cg_sha || github.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ inputs.cg_sha || github.sha }}
+          EVENT_SHA: ${{ github.sha }}
+          REQUESTED_CONTEXTDB_SHA: ${{ inputs.contextdb_sha }}
+        run: |
+          context_graph_sha="$(git rev-parse HEAD)"
+          contextdb_sha="$(grep -o -m 1 -E 'contextdb[?]rev=[0-9a-f]{40}' Cargo.lock)"
+          contextdb_sha="${contextdb_sha##*=}"
+          if [[ ! "$context_graph_sha" =~ ^[0-9a-f]{40}$ ]] || [[ ! "$contextdb_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Context Graph checkout and locked ContextDB revision must be immutable 40-character commit SHAs" >&2
+            exit 1
+          fi
+          if [[ "$context_graph_sha" != "$TESTED_SHA" ]]; then
+            echo "checked-out Context Graph SHA does not match selected tested SHA" >&2
+            exit 1
+          fi
+          if [[ -n "$REQUESTED_CONTEXTDB_SHA" ]] && [[ "$contextdb_sha" != "$REQUESTED_CONTEXTDB_SHA" ]]; then
+            echo "locked ContextDB SHA does not match contextdb_sha" >&2
+            exit 1
+          fi
+          printf 'Context Graph SHA: %s\n' "$context_graph_sha"
+          printf 'ContextDB SHA: %s\n' "$contextdb_sha"
+          printf 'Base SHA: %s\nHead SHA: %s\nEvent SHA: %s\n' "$BASE_SHA" "$HEAD_SHA" "$EVENT_SHA"
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        env:
+          DISPOSABLE_WORK_ROOT: ${{ runner.temp }}/quality-work
+          REPORT_PATH: ${{ runner.temp }}/quality-report.json
+          GRAY_PATH: ${{ runner.temp }}/quality-gray.json
+          ADJUDICATED_PATH: ${{ runner.temp }}/quality-adjudicated.json
+        with:
+          toolchain: 1.94.1
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        env:
+          DISPOSABLE_WORK_ROOT: ${{ runner.temp }}/quality-work
+          REPORT_PATH: ${{ runner.temp }}/quality-report.json
+          GRAY_PATH: ${{ runner.temp }}/quality-gray.json
+          ADJUDICATED_PATH: ${{ runner.temp }}/quality-adjudicated.json
+        with:
+          cache-bin: false
+          workspaces: workspace/context-graph -> target
+      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2
+        env:
+          DISPOSABLE_WORK_ROOT: ${{ runner.temp }}/quality-work
+          REPORT_PATH: ${{ runner.temp }}/quality-report.json
+          GRAY_PATH: ${{ runner.temp }}/quality-gray.json
+          ADJUDICATED_PATH: ${{ runner.temp }}/quality-adjudicated.json
+        with:
+          tool: cargo-deny@0.20.2,cargo-expand@1.0.124,cargo-nextest@0.9.140
+      - run: bash scripts/gate.sh deterministic-llm
+        env:
+          DISPOSABLE_WORK_ROOT: ${{ runner.temp }}/quality-work
+          REPORT_PATH: ${{ runner.temp }}/quality-report.json
+          GRAY_PATH: ${{ runner.temp }}/quality-gray.json
+          ADJUDICATED_PATH: ${{ runner.temp }}/quality-adjudicated.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        env:
+          DISPOSABLE_WORK_ROOT: ${{ runner.temp }}/quality-work
+          REPORT_PATH: ${{ runner.temp }}/quality-report.json
+          GRAY_PATH: ${{ runner.temp }}/quality-gray.json
+          ADJUDICATED_PATH: ${{ runner.temp }}/quality-adjudicated.json
+        if: always()
+        with:
+          name: smoke-${{ github.job }}
+          path: ${{ runner.temp }}/job-receipt/*.json
+          retention-days: 14
+          if-no-files-found: warn
+  capture:
+    if: github.event_name == 'workflow_dispatch' && inputs.trusted
+    environment: trusted-integration
+    needs: [trusted-inputs]
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      REQUESTED_CONTEXTDB_SHA: ${{ inputs.contextdb_sha }}
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+      APPROVED_SESSION_LIST: ${{ vars.APPROVED_SESSION_LIST }}
+      APPROVED_GOLD_DIR: ${{ vars.APPROVED_GOLD_DIR }}
+      VARIANT_LABEL: candidate
+      CONFIGURED_MODEL_ID: ${{ vars.CONFIGURED_MODEL_ID }}
+      QUALITY_INPUT_RECEIPT: ${{ vars.QUALITY_INPUT_RECEIPT }}
+      QUALITY_ACCEPTANCE_RECEIPT: ${{ vars.QUALITY_ACCEPTANCE_RECEIPT }}
+      CG_SMOKE_REAL_JSONL: ${{ vars.CG_SMOKE_REAL_JSONL }}
+      CG_SMOKE_HUB_TICKET: ${{ secrets.CG_SMOKE_HUB_TICKET }}
+      CG_SMOKE_TENANT: ${{ vars.CG_SMOKE_TENANT }}
+      CG_SMOKE_SKIP_BUILD: '1'
+      CONTEXTDB: ${{ vars.CONTEXTDB_SMOKE_BINARY }}
+      CONTEXTDB_BUILD_RECEIPT: ${{ vars.CONTEXTDB_BUILD_RECEIPT }}
+      CG_LLM_SMOKE_HOSTED_ENDPOINT: ${{ vars.CG_LLM_SMOKE_HOSTED_ENDPOINT }}
+      CG_LLM_SMOKE_HOSTED_MODEL: ${{ vars.CG_LLM_SMOKE_HOSTED_MODEL }}
+      CG_LLM_SMOKE_HOSTED_API_KEY_ENV: OPENROUTER_API_KEY
+      CG_LLM_SMOKE_LOCAL_ENDPOINT: ${{ vars.CG_LLM_SMOKE_LOCAL_ENDPOINT }}
+      CG_LLM_SMOKE_LOCAL_MODEL: ${{ vars.CG_LLM_SMOKE_LOCAL_MODEL }}
+    steps:
+      - name: Require the approved workflow revision
+        working-directory: .
+        env:
+          DISPOSABLE_WORK_ROOT: ${{ runner.temp }}/quality-work
+          REPORT_PATH: ${{ runner.temp }}/quality-report.json
+          GRAY_PATH: ${{ runner.temp }}/quality-gray.json
+          ADJUDICATED_PATH: ${{ runner.temp }}/quality-adjudicated.json
+          APPROVED_SHA: ${{ inputs.cg_sha }}
+        run: |
+          [[ "$APPROVED_SHA" == "$GITHUB_SHA" ]] || { echo 'PENDING: trusted source must equal approved dispatch revision'; exit 2; }
+      - name: Validate exact ContextDB SHA
+        if: github.event_name == 'workflow_dispatch'
+        working-directory: .
+        env:
+          DISPOSABLE_WORK_ROOT: ${{ runner.temp }}/quality-work
+          REPORT_PATH: ${{ runner.temp }}/quality-report.json
+          GRAY_PATH: ${{ runner.temp }}/quality-gray.json
+          ADJUDICATED_PATH: ${{ runner.temp }}/quality-adjudicated.json
+          CONTEXTDB_SHA: ${{ inputs.contextdb_sha }}
+        run: |
+          if [[ ! "$CONTEXTDB_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "contextdb_sha must be an exact 40-character lowercase hexadecimal commit SHA" >&2
+            exit 1
+          fi
+      - name: Check out Context Graph
+        env:
+          DISPOSABLE_WORK_ROOT: ${{ runner.temp }}/quality-work
+          REPORT_PATH: ${{ runner.temp }}/quality-report.json
+          GRAY_PATH: ${{ runner.temp }}/quality-gray.json
+          ADJUDICATED_PATH: ${{ runner.temp }}/quality-adjudicated.json
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          path: workspace/context-graph
+          ref: ${{ inputs.cg_sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Print and verify checked revisions
+        env:
+          DISPOSABLE_WORK_ROOT: ${{ runner.temp }}/quality-work
+          REPORT_PATH: ${{ runner.temp }}/quality-report.json
+          GRAY_PATH: ${{ runner.temp }}/quality-gray.json
+          ADJUDICATED_PATH: ${{ runner.temp }}/quality-adjudicated.json
+          TESTED_SHA: ${{ inputs.cg_sha || github.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ inputs.cg_sha || github.sha }}
+          EVENT_SHA: ${{ github.sha }}
+          REQUESTED_CONTEXTDB_SHA: ${{ inputs.contextdb_sha }}
+        run: |
+          context_graph_sha="$(git rev-parse HEAD)"
+          contextdb_sha="$(grep -o -m 1 -E 'contextdb[?]rev=[0-9a-f]{40}' Cargo.lock)"
+          contextdb_sha="${contextdb_sha##*=}"
+          if [[ ! "$context_graph_sha" =~ ^[0-9a-f]{40}$ ]] || [[ ! "$contextdb_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Context Graph checkout and locked ContextDB revision must be immutable 40-character commit SHAs" >&2
+            exit 1
+          fi
+          if [[ "$context_graph_sha" != "$TESTED_SHA" ]]; then
+            echo "checked-out Context Graph SHA does not match selected tested SHA" >&2
+            exit 1
+          fi
+          if [[ -n "$REQUESTED_CONTEXTDB_SHA" ]] && [[ "$contextdb_sha" != "$REQUESTED_CONTEXTDB_SHA" ]]; then
+            echo "locked ContextDB SHA does not match contextdb_sha" >&2
+            exit 1
+          fi
+          printf 'Context Graph SHA: %s\n' "$context_graph_sha"
+          printf 'ContextDB SHA: %s\n' "$contextdb_sha"
+          printf 'Base SHA: %s\nHead SHA: %s\nEvent SHA: %s\n' "$BASE_SHA" "$HEAD_SHA" "$EVENT_SHA"
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        env:
+          DISPOSABLE_WORK_ROOT: ${{ runner.temp }}/quality-work
+          REPORT_PATH: ${{ runner.temp }}/quality-report.json
+          GRAY_PATH: ${{ runner.temp }}/quality-gray.json
+          ADJUDICATED_PATH: ${{ runner.temp }}/quality-adjudicated.json
+        with:
+          toolchain: 1.94.1
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        env:
+          DISPOSABLE_WORK_ROOT: ${{ runner.temp }}/quality-work
+          REPORT_PATH: ${{ runner.temp }}/quality-report.json
+          GRAY_PATH: ${{ runner.temp }}/quality-gray.json
+          ADJUDICATED_PATH: ${{ runner.temp }}/quality-adjudicated.json
+        with:
+          cache-bin: false
+          workspaces: workspace/context-graph -> target
+      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2
+        env:
+          DISPOSABLE_WORK_ROOT: ${{ runner.temp }}/quality-work
+          REPORT_PATH: ${{ runner.temp }}/quality-report.json
+          GRAY_PATH: ${{ runner.temp }}/quality-gray.json
+          ADJUDICATED_PATH: ${{ runner.temp }}/quality-adjudicated.json
+        with:
+          tool: cargo-deny@0.20.2,cargo-expand@1.0.124,cargo-nextest@0.9.140
+      - run: bash scripts/gate.sh capture
+        env:
+          DISPOSABLE_WORK_ROOT: ${{ runner.temp }}/quality-work
+          REPORT_PATH: ${{ runner.temp }}/quality-report.json
+          GRAY_PATH: ${{ runner.temp }}/quality-gray.json
+          ADJUDICATED_PATH: ${{ runner.temp }}/quality-adjudicated.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        env:
+          DISPOSABLE_WORK_ROOT: ${{ runner.temp }}/quality-work
+          REPORT_PATH: ${{ runner.temp }}/quality-report.json
+          GRAY_PATH: ${{ runner.temp }}/quality-gray.json
+          ADJUDICATED_PATH: ${{ runner.temp }}/quality-adjudicated.json
+        if: always()
+        with:
+          name: smoke-${{ github.job }}
+          path: ${{ runner.temp }}/job-receipt/*.json
+          retention-days: 14
+          if-no-files-found: warn
+  trusted-qualification:
+    name: trusted-qualification
+    if: always() && github.event_name == 'workflow_dispatch' && inputs.trusted
+    needs: [trusted-inputs, answer-quality, llm-byok, deterministic-llm, capture]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require the exact successful job inventory
+        working-directory: .
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PY_CHECK'
+          import json, os
+          expected = {'llm-byok', 'trusted-inputs', 'deterministic-llm', 'capture', 'answer-quality'}
+          needs = json.loads(os.environ['NEEDS_JSON'])
+          if set(needs) != expected or any(row.get('result') != 'success' for row in needs.values()):
+              raise SystemExit('required job inventory failed: ' + json.dumps(needs, sort_keys=True))
+          print('all required jobs succeeded')
+          PY_CHECK

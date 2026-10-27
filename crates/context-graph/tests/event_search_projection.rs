@@ -1,4 +1,4 @@
-//! RED proof for event-history projection.  Expected rendering lives in an independent fixture;
+//! Behavior proofs for event-history projection.  Expected rendering lives in an independent fixture;
 //! this file only captures real immutable events and drives the public runner.
 
 #![cfg(context_graph_internal_test_support)]
@@ -340,7 +340,7 @@ const DOCUMENT_ROLE_INSTRUCTION: &str = "search_document: ";
 const DOCUMENT_SPECIAL_TOKENS: usize = 2;
 
 /// This is deliberately independent of the production renderer and embedder: it fixes the
-/// renderer-v1 human prefix and the fixture tokenizer's scalar accounting in the RED proof.
+/// renderer-v1 human prefix and the fixture tokenizer's scalar accounting in the Behavior proofs.
 fn expected_oversized_passage(body: &str) -> String {
     format!("{OVERSIZED_HUMAN_PREFIX}{body}")
 }

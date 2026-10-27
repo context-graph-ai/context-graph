@@ -366,8 +366,12 @@ impl Store {
     /// created and checked exactly as [`Store::open_with_consumer_schema`] does, and its scope
     /// labels narrow the returned handle exactly as
     /// [`Store::open_with_consumer_schema_scoped`] does — a declaration naming no label narrows
-    /// nothing. The door is ADDITIVE: every opener that came before goes on creating an absent
-    /// store exactly as it always has.
+    /// nothing. Create-capable openers create an absent store.
+    ///
+    /// The caller supplies the engine's own reader-wait deadline and cancellation. An expired
+    /// deadline asks for an immediate held-by-readers refusal; cancellation ends that wait. None
+    /// carries no deadline or cancellation, as on DatabaseOpenOptions. These controls are passed
+    /// through to the single engine open, with no consumer retry after their refusal.
     ///
     /// [`CgError::StoreMissing`]: crate::CgError::StoreMissing
     /// [`CgError::StoreUnreadable`]: crate::CgError::StoreUnreadable
@@ -375,6 +379,8 @@ impl Store {
         config: StoreConfig,
         registrations: Vec<EmbedderRegistration>,
         declaration: ConsumerDeclaration,
+        reader_wait_deadline: Option<contextdb_engine::ReaderWaitDeadline>,
+        reader_wait_stop: Option<contextdb_engine::OwnerReadCancellation>,
     ) -> Result<Self> {
         let ConsumerDeclaration {
             schema,
@@ -385,7 +391,7 @@ impl Store {
             false,
             None,
             (!scope_labels.is_empty()).then_some(scope_labels),
-            DatabaseOpenExtras::existing_only(),
+            DatabaseOpenExtras::existing_only(reader_wait_deadline, reader_wait_stop),
             registrations,
             schema,
         )
@@ -993,9 +999,10 @@ pub(crate) struct DatabaseOpenExtras {
     plugin: Option<Arc<dyn DatabasePlugin>>,
     vector_session: Option<Arc<contextdb_engine::WriterVectorSession>>,
     owner_control: Option<ControlHandler>,
-    /// Whether this open may bring the store into existence. The default is the creating
-    /// disposition every opener that came before has always had.
+    /// Whether this open may bring the store into existence. The default permits creation.
     open_disposition: OpenDisposition,
+    reader_wait_deadline: Option<contextdb_engine::ReaderWaitDeadline>,
+    reader_wait_stop: Option<contextdb_engine::OwnerReadCancellation>,
 }
 
 impl DatabaseOpenExtras {
@@ -1006,28 +1013,27 @@ impl DatabaseOpenExtras {
     pub(crate) fn with_plugin(plugin: Arc<dyn DatabasePlugin>) -> Self {
         Self {
             plugin: Some(plugin),
-            vector_session: None,
-            owner_control: None,
-            open_disposition: OpenDisposition::default(),
+            ..Self::default()
         }
     }
 
     fn with_owner_control(handler: ControlHandler) -> Self {
         Self {
-            plugin: None,
-            vector_session: None,
             owner_control: Some(handler),
-            open_disposition: OpenDisposition::default(),
+            ..Self::default()
         }
     }
 
     /// The consumer edit door: open a store that already exists, or refuse.
-    fn existing_only() -> Self {
+    fn existing_only(
+        reader_wait_deadline: Option<contextdb_engine::ReaderWaitDeadline>,
+        reader_wait_stop: Option<contextdb_engine::OwnerReadCancellation>,
+    ) -> Self {
         Self {
-            plugin: None,
-            vector_session: None,
-            owner_control: None,
             open_disposition: OpenDisposition::ExistingOnly,
+            reader_wait_deadline,
+            reader_wait_stop,
+            ..Self::default()
         }
     }
 
@@ -1051,6 +1057,8 @@ impl DatabaseOpenExtras {
     ) -> DatabaseOpenOptions {
         let mut options = DatabaseOpenOptions {
             open_disposition: self.open_disposition,
+            reader_wait_deadline: self.reader_wait_deadline.clone(),
+            reader_wait_stop: self.reader_wait_stop.clone(),
             memory_limit: Some(write_memory_limit.get()),
             ..DatabaseOpenOptions::default()
         };
@@ -1070,7 +1078,7 @@ impl DatabaseOpenExtras {
     /// Say what a refused open means, in the vocabulary the door that asked for it promised.
     ///
     /// The consumer edit door owes its caller the missing-versus-unreadable answer it was opened
-    /// to give; every opener that creates an absent store keeps the wording it has always had.
+    /// to give; create-capable openers use their own refusal vocabulary.
     fn map_refusal(&self, db_path: &Path, error: EngineError) -> CgError {
         match self.open_disposition {
             OpenDisposition::ExistingOnly => map_consumer_open_err(db_path, error),
@@ -1089,37 +1097,42 @@ fn open_bootstrapped_database(
     consumer_schema: &ConsumerSchema,
 ) -> Result<(Arc<Database>, Option<Arc<Database>>)> {
     let registry = REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
-    let (mut guard, db, reused) =
-        open_retry::retry(db_path, open_retry::Contention::Readers, || {
-            // Each attempt reacquires and rechecks. A reader wait must never own the registry mutex.
-            let guard = registry.lock().expect("store registry lock");
-            if extras.is_plain()
-                && !replace_shared_handle
-                && let Some(existing) = guard.get(db_path).and_then(Weak::upgrade)
-            {
-                if let Some(session) = &extras.vector_session {
-                    existing.reattach_writer_vector_session(session);
-                }
-                return Ok((guard, existing, true));
+    let open = || {
+        // Each attempt reacquires and rechecks. A reader wait must never own the registry mutex.
+        let guard = registry.lock().expect("store registry lock");
+        if extras.is_plain()
+            && !replace_shared_handle
+            && let Some(existing) = guard.get(db_path).and_then(Weak::upgrade)
+        {
+            if let Some(session) = &extras.vector_session {
+                existing.reattach_writer_vector_session(session);
             }
-            let db = Arc::new(
-                {
-                    let options = extras.open_options(
-                        config.read_memory_limit_bytes,
-                        config.read_active_time_ms,
-                        config.write_memory_limit_bytes,
-                    );
-                    match &extras.vector_session {
-                        Some(session) => {
-                            Database::open_with_writer_vector_session(db_path, options, session)
-                        }
-                        None => Database::open_with_options(db_path, options),
+            return Ok((guard, existing, true));
+        }
+        let db = Arc::new(
+            {
+                let options = extras.open_options(
+                    config.read_memory_limit_bytes,
+                    config.read_active_time_ms,
+                    config.write_memory_limit_bytes,
+                );
+                match &extras.vector_session {
+                    Some(session) => {
+                        Database::open_with_writer_vector_session(db_path, options, session)
                     }
+                    None => Database::open_with_options(db_path, options),
                 }
-                .map_err(|error| extras.map_refusal(db_path, error))?,
-            );
-            Ok((guard, db, false))
-        })?;
+            }
+            .map_err(|error| extras.map_refusal(db_path, error))?,
+        );
+        Ok((guard, db, false))
+    };
+    let (mut guard, db, reused) =
+        if extras.reader_wait_deadline.is_some() || extras.reader_wait_stop.is_some() {
+            open()?
+        } else {
+            open_retry::retry(db_path, open_retry::Contention::Readers, open)?
+        };
     bootstrap_schema(&db, config, reused, consumer_schema)?;
     guard.insert(db_path.to_path_buf(), Arc::downgrade(&db));
     Ok(narrowed_handle(db, contexts, scope_labels))
@@ -1610,7 +1623,7 @@ fn initialize_schema(
     let mut plan = StartupSchemaPlan::new(db);
     // The shipped work-ledger schema (the seven append-only fabric tables and their two keyed
     // history indexes) is declared alongside cg's own, so a fresh store's whole startup schema
-    // becomes visible in one commit. The fabric slice consumes this ledger; the tables are inert
+    // becomes visible in one commit. Fabric consumes this ledger; the tables are inert
     // on a single-node install.
     for ddl in contextdb_engine::work_ledger::LEDGER_TABLE_DECLARATIONS {
         plan.declare(ddl)?;
@@ -1660,9 +1673,8 @@ fn initialize_schema(
 
 /// The startup declarations a store does not carry yet, collected so they install together.
 ///
-/// A peer replays every schema commit it receives over its whole schema, so a startup schema
-/// authored one statement per commit made a node's first push and pull cost the square of the
-/// schema size. Every missing declaration -- the tables carrying a vector column, a rank policy or
+/// A peer replays every schema commit over its whole schema. Installing declarations together
+/// avoids repeated schema replay. Every missing declaration -- tables carrying a vector column, a rank policy or
 /// DAG edges included, every index and every subscription event type -- joins one transaction, so
 /// a fresh store's whole startup schema becomes visible at once or not at all.
 struct StartupSchemaPlan<'a> {

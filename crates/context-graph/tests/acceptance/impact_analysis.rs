@@ -24,6 +24,10 @@ fn reopen_store(dir: &tempfile::TempDir) -> Store {
     .expect("reopen")
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "ContextDB keeps typed refusal details inline so error propagation needs no allocation."
+)]
 fn open_raw_database(dir: &tempfile::TempDir) -> Database {
     let db = Database::open(dir.path().join("cg.db")).expect("raw open");
     let registered = db.registered_trigger_callbacks();

@@ -1,8 +1,13 @@
 [package]
+publish = false
+keywords.workspace = true
+categories.workspace = true
 name = "cg-vision-embedder"
 version = "0.1.0"
 edition = "2024"
 license.workspace = true
+repository.workspace = true
+description = "SigLIP image and text embeddings for Context Graph"
 
 [dependencies]
 context-graph = { path = "../context-graph", default-features = false }

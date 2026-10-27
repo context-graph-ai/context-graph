@@ -3,14 +3,6 @@
 // Store-state tests: every assertion reads persisted Observation lanes from the store.
 // A HashMap cannot enforce lane separation (properties vs observed_properties/state_delta),
 // so all three tests fail under a HashMap.
-//
-// Placeholder behavior:
-//   - ModelCallUsage.flow_tag is always None (correct: "extraction" | "identity-judge" | "repair")
-//   - ModelCallUsage.model_id is always None (correct: carries the model id)
-//   - persist_usage_receipt writes to the properties lane correctly, but observed_properties
-//     and state_delta must remain empty for usage Observations (basis lane must stay clean)
-//   - Decision.confidence at capture time is None (the barrier); a model-emitted non-null
-//     confidence must NOT be stored
 
 use std::sync::Mutex;
 use std::time::Duration;
@@ -26,8 +18,8 @@ use context_graph::{
     ModelCallOutcome, Store, StoreConfig, capture_with_usage_visibility,
 };
 
+use super::action_test_extractors::SpanFaithfulExtractor;
 use super::fake_extractor::open_store_with_lexical_embedder;
-use super::refactor_extractor::SpanFaithfulExtractor;
 
 fn fresh_store(name: &str) -> (tempfile::TempDir, Store) {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -82,8 +74,7 @@ impl HostedProviderBoundary for UsageEmittingProvider {
 // one per classify_decision_relation() call (flow "identity-judge"). It keeps separate
 // persistent call counters (not drained) so the test can compare them to the tagged
 // usage records after capture. drain_model_usage returns exactly extraction_call_count +
-// judge_call_count records (all with flow_tag=None as placeholder); a real harness tags
-// each by flow, so:
+// judge_call_count records, each initially untagged; capture tags each by flow, so:
 //   count(flow_tag=="extraction") == extraction_call_count()
 //   count(flow_tag=="identity-judge") == judge_call_count()
 // A uniform hardcoded tag fails the judge-count assertion whenever judge_call_count > 0.
@@ -117,7 +108,6 @@ impl ConversationExtractor for FlowTaggedUsageExtractor {
     fn extract(&self, _request: ExtractionRequest<'_>) -> context_graph::Result<StructuredHarvest> {
         self.extraction_count
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        // Placeholder: flow_tag=None. The real harness sets flow_tag=Some("extraction").
         self.pending.lock().unwrap().push(ModelCallUsage {
             chunk_index: 0,
             usage: UsageReportState::Tokens(ProviderUsage {
@@ -155,7 +145,6 @@ impl ConversationExtractor for FlowTaggedUsageExtractor {
     ) -> context_graph::Result<Option<DecisionRelationSeed>> {
         self.judge_count
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        // Placeholder: flow_tag=None. The real harness sets flow_tag=Some("identity-judge").
         self.pending.lock().unwrap().push(ModelCallUsage {
             chunk_index: 0,
             usage: UsageReportState::Tokens(ProviderUsage {
@@ -274,9 +263,6 @@ fn usage_tokens_and_time_written_to_observation_properties_lane_never_observed_p
     }
 }
 
-// Runtime test 2 (store-state): ModelCallUsage.flow_tag is None and model_id is None
-// for every record in the placeholder. The placeholder records usage keyed by chunk_index
-// only (current shape), making per-flow cost attribution impossible.
 //
 // The test drives a capture against a store that already holds one decision so that the
 // harness invokes classify_decision_relation (the identity-judge flow). FlowTaggedUsageExtractor
@@ -284,8 +270,7 @@ fn usage_tokens_and_time_written_to_observation_properties_lane_never_observed_p
 // we can assert:
 //   count(flow_tag=="extraction") == extraction_call_count()
 //   count(flow_tag=="identity-judge") == judge_call_count()
-// A uniform hardcoded tag fails the judge-count assertion; flow_tag=None (placeholder) gives
-// count==0 != actual call count, so both count assertions fail.
+// Each usage record carries its actual flow tag and model, with separate extraction and judge totals.
 #[test]
 fn per_call_usage_is_tagged_by_flow_and_model_not_just_chunk() {
     let (_dir, store) = fresh_store("j_per_call_flow");
@@ -293,7 +278,7 @@ fn per_call_usage_is_tagged_by_flow_and_model_not_just_chunk() {
     // Seed the store with a prior decision so the harness triggers judge calls on the
     // second capture (classify_decision_relation is invoked for each new decision against
     // existing ones).
-    let seed_extractor = super::refactor_extractor::SpanFaithfulExtractor;
+    let seed_extractor = super::action_test_extractors::SpanFaithfulExtractor;
     record_conversation_with_extractor(
         &store,
         CaptureRequest {
@@ -356,27 +341,23 @@ fn per_call_usage_is_tagged_by_flow_and_model_not_just_chunk() {
         .count();
 
     // Count-tied assertions: tag counts must equal actual call counts.
-    // Placeholder (flow_tag=None): extraction_tagged==0 != expected_extraction_count.
+    // An absent flow tag gives extraction_tagged==0 != expected_extraction_count.
     // Uniform hardcoded tag (all "extraction"): judge_tagged==0 != expected_judge_count.
     assert_eq!(
         extraction_tagged, expected_extraction_count,
-        "count of flow_tag==\"extraction\" records ({extraction_tagged}) must equal extraction_call_count ({expected_extraction_count}); wrong stub returns flow_tag=None"
+        "count of flow_tag==\"extraction\" records ({extraction_tagged}) must equal extraction_call_count ({expected_extraction_count}); a missing flow tag is invalid"
     );
     assert_eq!(
         judge_tagged, expected_judge_count,
-        "count of flow_tag==\"identity-judge\" records ({judge_tagged}) must equal judge_call_count ({expected_judge_count}); wrong stub returns flow_tag=None"
+        "count of flow_tag==\"identity-judge\" records ({judge_tagged}) must equal judge_call_count ({expected_judge_count}); a missing flow tag is invalid"
     );
 
-    // Every record must carry a non-None model_id. Placeholder: all None.
     assert!(
         usage.iter().all(|u| u.model_id.is_some()),
-        "every usage record must have model_id=Some(_); wrong stub returns None"
+        "every usage record must have model_id=Some(_); a missing model id is invalid"
     );
 }
 
-// Runtime test 3 (store-state): placeholder harness stores the model-emitted confidence
-// on the Decision row. Correct behavior: confidence is always None at capture regardless
-// of what the model emitted.
 #[test]
 fn model_emitted_confidence_can_never_set_decision_confidence() {
     let (_dir, store) = fresh_store("j_confidence_barrier");
@@ -409,11 +390,11 @@ fn model_emitted_confidence_can_never_set_decision_confidence() {
     // The harness must NOT store the model-emitted confidence (0.95).
     assert!(
         decision.confidence.is_none(),
-        "stored decision confidence must be None at capture time regardless of model-emitted value; wrong stub stores Some({:?})",
+        "stored decision confidence must be None at capture time regardless of model-emitted value; got Some({:?})",
         decision.confidence
     );
 
-    // The constant 0.9 (old fabrication path) must never appear.
+    // Confidence must not be fabricated as the constant 0.9.
     assert_ne!(
         decision.confidence,
         Some(0.9),

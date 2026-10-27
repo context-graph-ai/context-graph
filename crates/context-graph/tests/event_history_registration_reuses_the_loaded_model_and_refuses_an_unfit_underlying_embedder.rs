@@ -185,7 +185,7 @@ fn event_history_registration_reuses_the_loaded_model_and_refuses_an_unfit_under
     )
     .expect("a store must open with the event-history registration built through the real API");
 
-    // RED arm 1: a non-768-dimension underlying embedder must be refused, not silently
+    // regression arm 1: a non-768-dimension underlying embedder must be refused, not silently
     // advertised under the dedicated 768-dimension event-history space.
     let wrong_dimension_model = Arc::new(NomicTextEmbedder::new_for_dimension(
         nomic_real_model::local_offline_config(nomic_real_model::canonical_model_dir()),
@@ -201,7 +201,7 @@ fn event_history_registration_reuses_the_loaded_model_and_refuses_an_unfit_under
          error, got {wrong_dimension_result:?}"
     );
 
-    // RED arm 2: a download-enabled config must be refused — the canonical registration promises
+    // regression arm 2: a download-enabled config must be refused — the canonical registration promises
     // a cache-only, offline model, never one that might silently reach the network mid-run.
     let download_enabled_config = EmbedderConfig::default_nomic();
     let download_enabled_model = Arc::new(NomicTextEmbedder::new(download_enabled_config));
@@ -215,7 +215,7 @@ fn event_history_registration_reuses_the_loaded_model_and_refuses_an_unfit_under
          got {download_enabled_result:?}"
     );
 
-    // RED arm 3: a config pinned to a revision other than the canonical one must be refused —
+    // regression arm 3: a config pinned to a revision other than the canonical one must be refused —
     // the registration must never silently advertise weights it has not verified are the
     // canonical revision.
     let wrong_revision_config = EmbedderConfig {

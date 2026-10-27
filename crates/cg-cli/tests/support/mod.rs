@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 use tempfile::TempDir;
@@ -192,6 +192,16 @@ fn run_cg_observing_provider_before_exit_inner(
             Err(err) => panic!("remove stale provider marker {}: {err}", marker.display()),
         }
     }
+    let release_directory = tempfile::tempdir_in("/tmp").expect("short provider release directory");
+    let release_path = release_directory.path().join("provider.sock");
+    let mut release_listener = Some(
+        std::os::unix::net::UnixListener::bind(&release_path).expect("provider release listener"),
+    );
+    fs::write(
+        provider_started_marker.with_file_name("completion-release-address"),
+        release_path.as_os_str().as_encoded_bytes(),
+    )
+    .expect("publish provider release address");
     let mut command = Command::new(cg_bin());
     command
         .args(args)
@@ -222,29 +232,28 @@ fn run_cg_observing_provider_before_exit_inner(
     let (tx, rx) = mpsc::channel();
     let stdout_handle = spawn_stream_reader(stdout, tx.clone());
     let stderr_handle = spawn_stream_reader(stderr, tx);
-    let deadline = Instant::now() + Duration::from_secs(90);
     let mut observed_before_exit = false;
     let mut observed_while_provider_running = false;
-    let status = loop {
-        while let Ok(chunk) = rx.try_recv() {
-            if chunk.contains(needle) {
-                observed_before_exit = true;
-                if provider_started_marker.exists() && !provider_exited_marker.exists() {
-                    observed_while_provider_running = true;
+    for chunk in rx {
+        if chunk.contains(needle) {
+            observed_before_exit |= child.try_wait().expect("child status").is_none();
+            if provider_started_marker.exists() && !provider_exited_marker.exists() {
+                observed_while_provider_running = true;
+                if let Some(listener) = release_listener.take() {
+                    let (mut release, _) =
+                        listener.accept().expect("provider is held at completion");
+                    release
+                        .write_all(&[1])
+                        .expect("release provider after observing progress");
                 }
             }
         }
-        if let Some(status) = child.try_wait().expect("poll cg child") {
-            break status;
-        }
-        if Instant::now() >= deadline {
-            child.kill().expect("kill timed-out cg child");
-            break child.wait().expect("collect killed cg child");
-        }
-        thread::sleep(Duration::from_millis(20));
-    };
+    }
+    let status = child.wait().expect("collect cg child");
     let stdout = stdout_handle.join().expect("join stdout reader");
     let stderr = stderr_handle.join().expect("join stderr reader");
+    fs::remove_file(provider_started_marker.with_file_name("completion-release-address"))
+        .expect("remove provider release address");
     ObservedCommandOutput {
         output: CommandOutput {
             code: status.code().unwrap_or(-1),
@@ -284,30 +293,21 @@ pub fn run_cg_writing_stdin_after_output(
     let (tx, rx) = mpsc::channel();
     let stdout_handle = spawn_stream_reader(stdout, tx.clone());
     let stderr_handle = spawn_stream_reader(stderr, tx);
-    let deadline = Instant::now() + Duration::from_secs(10);
     let mut observed_before_exit = false;
     let mut held_stdin = None;
-    let status = loop {
-        while let Ok(chunk) = rx.try_recv() {
-            if chunk.contains(needle) {
-                observed_before_exit = true;
-            }
-        }
-        if observed_before_exit && let Some(mut child_stdin) = stdin.take() {
+    for chunk in rx {
+        if chunk.contains(needle)
+            && let Some(mut child_stdin) = stdin.take()
+        {
+            // The command is waiting on the stdin this test still owns.
+            observed_before_exit = child.try_wait().expect("child status").is_none();
             child_stdin
                 .write_all(stdin_after.as_bytes())
                 .expect("write delayed cg stdin");
             held_stdin = Some(child_stdin);
         }
-        if let Some(status) = child.try_wait().expect("poll cg child") {
-            break status;
-        }
-        if Instant::now() >= deadline {
-            child.kill().expect("kill timed-out cg child");
-            break child.wait().expect("collect killed cg child");
-        }
-        thread::sleep(Duration::from_millis(20));
-    };
+    }
+    let status = child.wait().expect("collect cg child");
     let stdout = stdout_handle.join().expect("join stdout reader");
     let stderr = stderr_handle.join().expect("join stderr reader");
     drop(held_stdin);
@@ -426,6 +426,7 @@ impl CompletionBehavior {
 
 pub struct FakeProviderRig {
     _root: TempDir,
+    driver_interpreter: PathBuf,
     pub root_path: PathBuf,
     pub bin_dir: PathBuf,
     pub fixture_dir: PathBuf,
@@ -434,6 +435,8 @@ pub struct FakeProviderRig {
 
 impl FakeProviderRig {
     pub fn new() -> Self {
+        // Bind the harness dependency before cg receives its restricted provider PATH.
+        let driver_interpreter = fixture_driver_interpreter();
         let root = TempDir::new().expect("fake provider root");
         let root_path = root.path().to_path_buf();
         let bin_dir = root_path.join("bin");
@@ -442,6 +445,7 @@ impl FakeProviderRig {
         fs::create_dir_all(&fixture_dir).expect("fake fixture dir");
         let rig = Self {
             _root: root,
+            driver_interpreter,
             root_path,
             bin_dir,
             fixture_dir,
@@ -693,7 +697,8 @@ impl FakeProviderRig {
 
     fn write_wrapper(&self, provider: Provider) {
         let script = format!(
-            "#!/bin/sh\npython3 {} {} {} \"$@\"\n",
+            "#!/bin/sh\nexec {} {} {} {} \"$@\"\n",
+            shell_quote(&self.driver_interpreter),
             shell_quote(self.fixture_dir.join("fake_provider.py")),
             shell_quote(provider.binary_name()),
             shell_quote(&self.fixture_dir),
@@ -709,7 +714,8 @@ import json
 import os
 import pathlib
 import sys
-import time
+import socket
+import threading
 
 provider = sys.argv[1]
 root = pathlib.Path(sys.argv[2])
@@ -767,7 +773,7 @@ def write_log(mode, prompt=""):
         out.write(json.dumps(record, sort_keys=True) + "\n")
 
 def mark(name):
-    (fixture / name).write_text(str(time.time()))
+    (fixture / name).write_text("reached")
 
 def proof(secret, prompt):
     value = 14695981039346656037
@@ -1175,7 +1181,7 @@ def claude_envelope(reply, is_error=False, status=None):
 if "--help" in args:
     write_log("probe")
     if read("help_probe_behavior", "normal") == "hang":
-        time.sleep(120)
+        threading.Event().wait()
     if provider == "codex" and args and args[0] == "exec":
         print(read("exec_help_flags", "--output-last-message\n-C"))
     elif provider == "agy":
@@ -1199,7 +1205,7 @@ if "auth" in args and "status" in args:
     write_log("auth-status-probe")
     probe_behavior = read("auth_probe_behavior", "normal")
     if probe_behavior == "hang":
-        time.sleep(120)
+        threading.Event().wait()
     if probe_behavior == "unsupported":
         print("unknown command: auth status", file=sys.stderr)
         sys.exit(2)
@@ -1271,9 +1277,11 @@ if read("login_state", "valid") == "expired":
 
 behavior = read("completion_behavior", "succeed")
 if behavior == "hang":
-    time.sleep(120)
-if behavior in ("sleep-then-succeed", "sleep-then-extract-harvest"):
-    time.sleep(1)
+    threading.Event().wait()
+if behavior in ("sleep-then-succeed", "sleep-then-extract-harvest") and (fixture / "completion-release-address").exists():
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as release:
+        release.connect(read("completion-release-address"))
+        assert release.recv(1) == b"\x01", "parent explicitly releases completion after observing progress"
 if behavior == "billing-required":
     mark("completion_exited")
     if provider == "claude":
@@ -1366,24 +1374,17 @@ pub fn run_variadic_fake(argv: &[&str], stdin: &str) -> CommandOutput {
         LoginState::Valid,
         CompletionBehavior::Succeed,
     );
-    let mut command = Command::new(rig.bin_dir.join("claude"));
+    let mut command = Command::new("/bin/sh");
+    command.arg(rig.bin_dir.join("claude"));
     command
         .args(argv)
         .env("PATH", rig.path_env())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut attempts = 0;
-    let mut child = loop {
-        match command.spawn() {
-            Ok(child) => break child,
-            Err(err) if err.raw_os_error() == Some(26) && attempts < 20 => {
-                attempts += 1;
-                thread::sleep(Duration::from_millis(10));
-            }
-            Err(err) => panic!("spawn fake claude: {err}"),
-        }
-    };
+    let mut child = command
+        .spawn()
+        .expect("spawn fake claude through its shell interpreter");
     if let Some(mut child_stdin) = child.stdin.take()
         && let Err(err) = child_stdin.write_all(stdin.as_bytes())
     {
@@ -1473,6 +1474,32 @@ fn walk_files(root: &Path) -> Vec<PathBuf> {
     }
     out.sort();
     out
+}
+
+fn fixture_driver_interpreter() -> PathBuf {
+    let runner_path = std::env::var_os("PATH")
+        .expect("fake provider fixture requires python3 on the test runner PATH (PATH is unset)");
+    for directory in std::env::split_paths(&runner_path) {
+        // Canonicalization binds relative PATH entries and follows interpreter symlinks.
+        let Ok(candidate) = fs::canonicalize(directory.join("python3")) else {
+            continue;
+        };
+        let Ok(metadata) = fs::metadata(&candidate) else {
+            continue;
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if metadata.permissions().mode() & 0o111 == 0 {
+                continue;
+            }
+        }
+        return candidate;
+    }
+    panic!("fake provider fixture requires an executable python3 on the test runner PATH");
 }
 
 fn shell_quote(value: impl AsRef<Path>) -> String {

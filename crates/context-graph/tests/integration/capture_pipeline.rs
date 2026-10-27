@@ -331,6 +331,7 @@ fn decision_entity_edges(
 
 #[test]
 fn impact_fires_across_two_separately_captured_sessions() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let (_dir, store) = fresh_store();
     let db_path = store.db_path().to_path_buf();
     let first = record_conversation_with_extractor(
@@ -647,6 +648,7 @@ fn impact_fires_across_two_separately_captured_sessions() {
 
 #[test]
 fn impact_silent_when_changed_entity_has_no_serving_decision() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let (dir, store) = fresh_store();
     let db_path = dir.path().join("cg.db");
     let first = record_conversation_with_extractor(
@@ -763,6 +765,7 @@ fn impact_silent_when_changed_entity_has_no_serving_decision() {
 
 #[test]
 fn dedup_cross_capture_contradiction_classified_conflicts_not_swallowed() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let (_dir, store) = fresh_store();
     let db_path = store.db_path().to_path_buf();
     let first = record_conversation_with_extractor(
@@ -930,6 +933,7 @@ fn dedup_cross_capture_contradiction_classified_conflicts_not_swallowed() {
 
 #[test]
 fn digest_embedding_uses_text_space_metadata() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let dir = tempfile::tempdir().expect("tempdir");
     let store = Store::open(StoreConfig {
         db_path: dir.path().join("cg.db"),
@@ -989,6 +993,7 @@ fn digest_embedding_uses_text_space_metadata() {
 
 #[test]
 fn text_projection_is_derived_evidence_for_text_search() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let (dir, store) = fresh_store();
     let db_path = dir.path().join("cg.db");
     let context_id = context(&store, "projection");
@@ -998,7 +1003,7 @@ fn text_projection_is_derived_evidence_for_text_search() {
     let mut evidence = text_evidence(observation_id, context_id);
     evidence.id = evidence_id;
     evidence.kind = EvidenceKind::ImageFrame;
-    evidence.source_ref = "vigil-edge://camera-7/frame/42".to_string();
+    evidence.source_ref = "s3://camera-7/frame/42".to_string();
     evidence.mime_type = Some("image/jpeg".to_string());
     evidence.text_projection = Some("auth module file shown in screenshot".to_string());
     let result = store
@@ -1045,7 +1050,7 @@ fn text_projection_is_derived_evidence_for_text_search() {
 
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].id, evidence_id);
-    assert_eq!(rows[0].source_ref, "vigil-edge://camera-7/frame/42");
+    assert_eq!(rows[0].source_ref, "s3://camera-7/frame/42");
     assert_eq!(
         rows[0].text_projection.as_deref(),
         Some("auth module file shown in screenshot")
@@ -1067,6 +1072,7 @@ fn text_projection_is_derived_evidence_for_text_search() {
 
 #[test]
 fn record_observation_emits_intention_anchored_invalidation_on_basis_change() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let (_dir, store) = fresh_store();
     let context_id = context(&store, "basis-change");
     let entity_id = entity(&store, context_id, "auth module file", "src/auth.py");
@@ -1110,6 +1116,7 @@ fn record_observation_emits_intention_anchored_invalidation_on_basis_change() {
 
 #[test]
 fn impact_goal_unserved_only_when_last_serving_decision_invalidated() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let (_dir, store) = fresh_store();
     let context_id = context(&store, "still-served");
     let auth_entity = entity(&store, context_id, "auth module file", "src/auth.py");
@@ -1266,6 +1273,7 @@ fn impact_goal_unserved_only_when_last_serving_decision_invalidated() {
 
 #[test]
 fn by_intention_returns_active_serving_decisions() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let (dir, store) = fresh_store();
     let db_path = dir.path().join("cg.db");
     let context_id = context(&store, "by-intention");
@@ -1316,6 +1324,7 @@ fn by_intention_returns_active_serving_decisions() {
 
 #[test]
 fn by_entity_returns_based_on_and_about_decisions() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let (dir, store) = fresh_store();
     let db_path = dir.path().join("cg.db");
     let context_id = context(&store, "by-entity");

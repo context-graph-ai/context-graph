@@ -1,4 +1,4 @@
-//! RED regressions for durable interpretation-build restart behavior.
+//! regression regressions for durable interpretation-build restart behavior.
 //!
 //! The fixtures capture real events through the public Store API.  Mapper callbacks only inspect
 //! the generation and sealed membership that the public runner has already created.

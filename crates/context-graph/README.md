@@ -1,25 +1,15 @@
 # context-graph
 
-The embeddable memory core behind `cg`. It gives an agent or an application a
-durable, queryable memory of the work it has done — intentions, decisions,
-observations and the digests that tie them together — stored in a local
-contextdb database and searched by meaning as well as by structure. Link it as a
-library and you get the ontology, the store and its domain behavior, embedding
-registration, status reads, and the administrative owner plane; the `cg`
-binary is one consumer of it.<!-- enforced by: `one_handle_serves_owner_frames_and_embeds_interleaved`, `a_fold_that_refuses_a_later_page_leaves_no_cursor_behind` -->
+The embeddable memory core behind `cg`, kept in a local store.
 
-| Version | License | Maintainer | Repository |
-| --- | --- | --- | --- |
-| 0.1.0 | Apache-2.0 | [John Cyriac](mailto:lucidprogrammer@hotmail.com) | [context-graph-ai/context-graph](https://github.com/context-graph-ai/context-graph) |
+Intentions and decisions written to the store persist across a reopen, and a decision keeps the intention it serves and the entities it is based on. <!-- enforced by: `intention_create_persists_across_reopen`, `decision_create_with_serves_and_based_on_edges_persisted` -->
 
-## Add it from source
+## Add from source
 
-This crate is not yet published on crates.io.
-
-Prerequisites: Git and Rust 1.94.1 via rustup.
+From an application beside this repository:
 
 ```sh
-rustup toolchain install 1.94.1
+cargo add context-graph --path ../context-graph/crates/context-graph
 ```
 
 The current workspace pins ContextDB
@@ -650,7 +640,8 @@ somewhere different:<!-- enforced by: `an_absent_store_is_refused_as_missing_and
 - **`StoreNeedsWritableRecovery`** — the store is there and its committed image
   needs one writable open to settle: the last writer left state only a writable
   hydration performs. This is the one refusal you may answer by opening the
-  store WRITABLE (`Store::open_existing_for_change`), recovering it, and
+  store WRITABLE (`Store::open_existing_for_change`, passing the caller's reader-wait deadline
+  and cancellation), recovering it, and
   carrying on. The substrate's own words for the condition travel in `reason`.
 - **`StoreUnreadable`** — the store is there and cannot be read at all: a
   permission, a mount, real damage. Reaching for a writable handle here is the

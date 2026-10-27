@@ -78,6 +78,10 @@ fn ensure_trigger_declared(db: &Database, name: &str, ddl: &str) -> Result<()> {
     Ok(())
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "ContextDB keeps typed refusal details inline so error propagation needs no allocation."
+)]
 fn run_conflict_detection(db: &Database, ctx: &TriggerContext) -> contextdb_core::Result<()> {
     let decision_id = match ctx.table.as_str() {
         "decisions" => required_uuid(&ctx.row_values, "id")?,
@@ -91,6 +95,10 @@ fn run_conflict_detection(db: &Database, ctx: &TriggerContext) -> contextdb_core
     detect_conflicts_for_decision(db, ctx.tx, decision_id)
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "ContextDB keeps typed refusal details inline so error propagation needs no allocation."
+)]
 fn detect_conflicts_for_decision(
     db: &Database,
     tx: TxId,
@@ -124,6 +132,10 @@ fn detect_conflicts_for_decision(
     Ok(())
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "ContextDB keeps typed refusal details inline so error propagation needs no allocation."
+)]
 fn insert_conflict_row(
     db: &Database,
     tx: TxId,
@@ -188,6 +200,10 @@ fn deterministic_conflict_id(context_id: Uuid, older: Uuid, newer: Uuid) -> Uuid
         .into_uuid()
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "ContextDB keeps typed refusal details inline so error propagation needs no allocation."
+)]
 fn decision_projection(
     db: &Database,
     tx: TxId,
@@ -210,6 +226,10 @@ fn decision_projection(
     }))
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "ContextDB keeps typed refusal details inline so error propagation needs no allocation."
+)]
 fn outcome_success(
     db: &Database,
     tx: TxId,
@@ -231,6 +251,10 @@ fn outcome_success(
         .transpose()
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "ContextDB keeps typed refusal details inline so error propagation needs no allocation."
+)]
 fn based_on_entities(
     db: &Database,
     tx: TxId,
@@ -253,6 +277,10 @@ fn based_on_entities(
         .collect()
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "ContextDB keeps typed refusal details inline so error propagation needs no allocation."
+)]
 fn active_candidates_on_entity(
     db: &Database,
     tx: TxId,
@@ -285,6 +313,10 @@ fn active_candidates_on_entity(
         .collect()
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "ContextDB keeps typed refusal details inline so error propagation needs no allocation."
+)]
 fn served_intersection(
     db: &Database,
     tx: TxId,
@@ -301,6 +333,10 @@ fn served_intersection(
     Ok(left_set.intersection(&right_set).copied().collect())
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "ContextDB keeps typed refusal details inline so error propagation needs no allocation."
+)]
 fn served_intentions(
     db: &Database,
     tx: TxId,
@@ -323,6 +359,10 @@ fn served_intentions(
         .collect()
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "ContextDB keeps typed refusal details inline so error propagation needs no allocation."
+)]
 fn required_uuid(values: &HashMap<String, Value>, column: &str) -> contextdb_core::Result<Uuid> {
     match values.get(column) {
         Some(Value::Uuid(value)) => Ok(*value),
@@ -332,6 +372,10 @@ fn required_uuid(values: &HashMap<String, Value>, column: &str) -> contextdb_cor
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "ContextDB keeps typed refusal details inline so error propagation needs no allocation."
+)]
 fn column_index(columns: &[String], column: &str) -> contextdb_core::Result<usize> {
     columns
         .iter()
@@ -339,6 +383,10 @@ fn column_index(columns: &[String], column: &str) -> contextdb_core::Result<usiz
         .ok_or_else(|| EngineError::Other(format!("missing column {column}").into()))
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "ContextDB keeps typed refusal details inline so error propagation needs no allocation."
+)]
 fn row_uuid(row: &[Value], columns: &[String], column: &str) -> contextdb_core::Result<Uuid> {
     match row.get(column_index(columns, column)?) {
         Some(Value::Uuid(value)) => Ok(*value),
@@ -348,6 +396,10 @@ fn row_uuid(row: &[Value], columns: &[String], column: &str) -> contextdb_core::
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "ContextDB keeps typed refusal details inline so error propagation needs no allocation."
+)]
 fn row_text(row: &[Value], columns: &[String], column: &str) -> contextdb_core::Result<String> {
     match row.get(column_index(columns, column)?) {
         Some(Value::Text(value)) => Ok(value.clone()),
@@ -357,6 +409,10 @@ fn row_text(row: &[Value], columns: &[String], column: &str) -> contextdb_core::
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "ContextDB keeps typed refusal details inline so error propagation needs no allocation."
+)]
 fn row_bool(row: &[Value], columns: &[String], column: &str) -> contextdb_core::Result<bool> {
     match row.get(column_index(columns, column)?) {
         Some(Value::Bool(value)) => Ok(*value),
@@ -366,6 +422,10 @@ fn row_bool(row: &[Value], columns: &[String], column: &str) -> contextdb_core::
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "ContextDB keeps typed refusal details inline so error propagation needs no allocation."
+)]
 fn row_txid(row: &[Value], columns: &[String], column: &str) -> contextdb_core::Result<TxId> {
     match row.get(column_index(columns, column)?) {
         Some(Value::TxId(value)) => Ok(*value),

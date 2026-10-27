@@ -1,6 +1,6 @@
 //! Gold answer-key format: session-level labels drafted from the ORIGINAL session files (never
-//! through cg) and curated. Session-level by design — chunk-aligned labels are forbidden
-//! (the importer fix changes chunk boundaries and would invalidate them).
+//! through cg) and curated. Labels are session-level; chunk-aligned labels are forbidden because
+//! chunk boundaries vary.
 //!
 //! The format is omission-capable by construction: gold lists what SHOULD have been extracted,
 //! independent of anything a model emitted — the surface `cg fix` does not have.
@@ -30,7 +30,7 @@ pub struct GoldIntention {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GoldDecision {
     pub statement: String,
-    /// Key of the intention this decision serves (the trunk attachment).
+    /// Key of the intention this decision serves (the goal linkage attachment).
     pub serves: String,
     /// Where the decisive evidence lives in the source transcript.
     pub made_in: MadeIn,

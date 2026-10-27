@@ -79,9 +79,8 @@ fn normal_test_binary_rejects_embeddinggemma_fixture_artifacts_as_production_man
 
 /// Where an operator's registrations live is decided once, by the command the operator ran, and
 /// handed down. A second rule inside this crate is how `cg model show` comes back empty while the
-/// entries the operator wrote sit in another directory — this crate has shipped that defect once
-/// already for the model-cache root. So the crate's own sources must not resolve the data root at
-/// all: no `CG_DATA_ROOT` read, no `$HOME/.cg` fallback, no `default_data_root`. The root arrives
+/// entries the operator wrote sit in another directory. The crate's own sources must not resolve
+/// the data root: no `CG_DATA_ROOT` read, no `$HOME/.cg` fallback, no `default_data_root`. It arrives
 /// through `Catalog::open_with_scope_against_root`/`_roots` and is used as given.
 #[test]
 fn the_catalog_never_resolves_the_data_root_for_itself() {

@@ -1,11 +1,8 @@
-//! An `EventSearchInference` an external plug-in receives from its OWN checked entrypoint carries
-//! nothing today that names which embedder's profile authorized it. So a plug-in embedder that
-//! prepares under its own encoding profile, then forwards the inference it is handed straight into
-//! the bundled Nomic embedder's implementer-facing hook (`embed_prepared_document_hook`/
-//! `embed_prepared_query_hook`) — bypassing the checked, library-owned `embed_prepared_document`/
-//! `embed_prepared_query` entrypoints on the Nomic side entirely — gets back a real vector stamped
-//! with the reserved event-history identity, from tokens the canonical Nomic preparer never
-//! produced and never authorized.
+//! An `EventSearchInference` carries the profile and role authorized by its checked entrypoint.
+//! The bundled Nomic hooks refuse an inference forwarded by a plug-in under its own encoding,
+//! even when the plug-in calls those hooks directly and bypasses Nomic's checked entrypoints.
+//! Only tokens authorized for Nomic's own profile and role may produce a vector under the reserved
+//! event-history identity.
 //!
 //! Every case below must be refused before Nomic's forward pass produces anything: a plug-in
 //! forwarding its own document inference into Nomic's document hook, its own query inference into

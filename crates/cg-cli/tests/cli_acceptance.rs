@@ -99,6 +99,57 @@ fn assert_condition(output: &CommandOutput, expected: &str) {
     );
 }
 
+// Only these public fixture arguments are safe to include in invocation diagnostics.
+fn provider_diagnostic_arg(arg: &str) -> &str {
+    match arg {
+        "--version" | "--help" | "exec" | "auth" | "status" | "--json" => arg,
+        _ => "<redacted>",
+    }
+}
+
+// Used only by tests whose command output is public fixture status, never a live reply.
+fn print_provider_diagnostics(harness: &CliHarness, outputs: &[(&str, &CommandOutput)]) {
+    for (command, output) in outputs {
+        eprintln!(
+            "{command}: status={} stdout={:?} stderr={:?}",
+            output.code, output.stdout, output.stderr
+        );
+    }
+    // Keep log order; never print the fixture's env, prompt, or arbitrary argument values.
+    match fs::read_to_string(&harness.providers.log_path) {
+        Ok(log) => {
+            for line in log.lines() {
+                match serde_json::from_str::<Value>(line) {
+                    Ok(record) => {
+                        let provider = match record.get("provider").and_then(Value::as_str) {
+                            Some("claude") => "claude",
+                            Some("codex") => "codex",
+                            Some("agy") => "agy",
+                            _ => "<redacted>",
+                        };
+                        let mode = match record.get("mode").and_then(Value::as_str) {
+                            Some("probe") => "probe",
+                            Some("auth-status-probe") => "auth-status-probe",
+                            Some("completion") => "completion",
+                            _ => "<redacted>",
+                        };
+                        let argv = record.get("argv").and_then(Value::as_array).map(|args| {
+                            args.iter()
+                                .map(|arg| provider_diagnostic_arg(arg.as_str().unwrap_or("")))
+                                .collect::<Vec<_>>()
+                        });
+                        eprintln!(
+                            "fixture invocation: provider={provider} mode={mode} argv={argv:?}"
+                        );
+                    }
+                    Err(_) => eprintln!("fixture invocation: unreadable JSON record"),
+                }
+            }
+        }
+        Err(err) => eprintln!("fixture invocation log unavailable: {:?}", err.kind()),
+    }
+}
+
 fn completion_count(output_harness: &CliHarness) -> usize {
     output_harness.providers.completion_count()
 }
@@ -324,6 +375,7 @@ fn sandboxed_install(prefix: &std::path::Path, home: &std::path::Path) -> Comman
     }
 }
 
+/// Root help presents public verbs and hidden integration commands keep their own help.
 #[test]
 fn cli_help_root() {
     let harness = CliHarness::new();
@@ -333,11 +385,25 @@ fn cli_help_root() {
         help.stdout.contains("model")
             && help.stdout.contains("status")
             && help.stdout.contains("selftest")
-            && help.stdout.contains("disconnect <agent>")
-            && help.stdout.contains("connect <agent> --remove-all"),
+            && help.stdout.contains("model fetch --defaults"),
         "root help must list the shipped verb groups; stdout={:?}",
         help.stdout
     );
+    for command in ["connect", "disconnect"] {
+        assert!(
+            !help
+                .stdout
+                .lines()
+                .any(|line| line.trim_start().starts_with(command))
+        );
+        let command_help = harness.run(&[command, "--help"]);
+        assert_eq!(command_help.code, 0);
+        assert!(
+            command_help
+                .stdout
+                .contains(&format!("cg {command} <agent>"))
+        );
+    }
     let model_pos = help.stdout.find("model auth login");
     let status_pos = help.stdout.find("status");
     assert!(
@@ -350,14 +416,11 @@ fn cli_help_root() {
         "bare cg must show help text, got {:?}",
         bare.stdout
     );
-    // STALE-CONTRACT FIX (2026-07-03): this assertion predated the daily-loop work, which made
-    // `cg connect claude-code` the real injection-hook installer (exit 0, hooks written into
-    // the harness-isolated HOME). That work documented this failure as a known baseline instead
-    // of updating it; updated here to the shipped contract.
+    // `cg connect claude-code` installs injection hooks into the isolated HOME and exits 0.
     let install = harness.run(&["connect", "claude-code"]);
     assert_eq!(
         install.code, 0,
-        "connect claude-code installs the injection hooks (daily-loop shipped contract)"
+        "connect claude-code installs the injection hooks (capture shipped contract)"
     );
 }
 
@@ -677,8 +740,8 @@ fn cli_status_connection_slice_shows_name_quota_kind_of_spend_and_expectation() 
 #[test]
 fn cli_status_without_connection_says_so_and_points_at_connect() {
     let output = CliHarness::new().run(&["model", "status"]);
-    // `cg model status` reports a missing connection with its own settled exit code 4
-    // (`model_byok_status_exit_code`), where the retired top-level status exited 0.
+    // `cg model status` reports a missing connection with exit code 4
+    // (`model_byok_status_exit_code`).
     assert_eq!(output.code, 4);
     let parsed = parse_single_json_object(&output.stdout);
     assert!(
@@ -1716,7 +1779,7 @@ fn no_host_session_message_guides_to_model_connect() {
     for output in [connect, selftest] {
         assert!(
             !output.stdout.to_lowercase().contains("local model"),
-            "no-host-session guidance must not recommend the removed local-model path: {}",
+            "no-host-session guidance must not recommend a local-model path: {}",
             output.stdout
         );
         assert!(
@@ -1860,7 +1923,7 @@ fn selftest_bounds_a_hung_provider_cli_with_typed_failure() {
 timeout_ms = 700
 "#,
     );
-    let _ = harness.run(&[
+    let login = harness.run(&[
         "model",
         "auth",
         "login",
@@ -1869,6 +1932,13 @@ timeout_ms = 700
         "--consent",
     ]);
     let output = harness.run(&["selftest"]);
+    print_provider_diagnostics(
+        &harness,
+        &[
+            ("cg model auth login --connection claude --consent", &login),
+            ("cg selftest", &output),
+        ],
+    );
     assert_eq!(output.code, 6);
     assert_condition(&output, "live_call_failed");
     assert_bucket(&output, "timeout");
@@ -2045,10 +2115,7 @@ fn install_writes_no_agent_hook_and_changes_no_agent_config() {
     let output = sandboxed_install(&prefix, &home);
     assert_eq!(output.code, 0, "install script must complete in sandbox");
     let after = fs::read_to_string(&config).expect("read config after install");
-    assert_eq!(
-        after, before,
-        "install must not inject an agent hook before observe ships"
-    );
+    assert_eq!(after, before, "install must not inject an observe hook");
     assert!(
         !catalog_disk_contains(&home, "cg observe --agent claude-code"),
         "sandbox must not contain an injected cg observe hook"
@@ -2118,6 +2185,7 @@ fn cg_doctor_runs_only_free_checks_names_drift_and_spends_nothing() {
     );
     let output = harness.run(&["doctor"]);
     assert_eq!(output.code, 1, "doctor drift findings exit 1");
+    print_provider_diagnostics(&harness, &[("cg doctor", &output)]);
     assert!(output.stdout.contains("--mcp-config"));
     assert!(output.stdout.contains("2.2.0-drift"));
     assert!(
@@ -2128,7 +2196,7 @@ fn cg_doctor_runs_only_free_checks_names_drift_and_spends_nothing() {
     assert!(output.stdout.contains("OK: model/codex/flags-in-help"));
     assert!(
         !output.stdout.contains("model/agy/flags-in-help"),
-        "doctor must not enumerate a provider withdrawn from embedded specs"
+        "doctor must not enumerate providers absent from embedded specs"
     );
     assert!(
         !output
@@ -2222,6 +2290,71 @@ fn cg_doctor_runs_only_free_checks_names_drift_and_spends_nothing() {
 }
 
 #[test]
+fn cg_doctor_fixture_driver_ignores_python3_shadowed_on_provider_path() {
+    let harness = CliHarness::new();
+    harness.providers.install(
+        Provider::Codex,
+        &unique_label("codex"),
+        LoginState::Valid,
+        CompletionBehavior::Succeed,
+    );
+    write_file(
+        harness.data_root.path().join("cg/providers.toml"),
+        r#"[providers.codex]
+timeout_ms = 700
+"#,
+    );
+
+    let shadow_python = harness.providers.bin_dir.join("python3");
+    let shadow_marker = harness.providers.bin_dir.join("python3.invoked");
+    write_file(&shadow_python, "#!/bin/sh\n: > \"${0}.invoked\"\nexit 97\n");
+    let executable_permissions = fs::metadata(harness.providers.bin_dir.join("codex"))
+        .expect("installed fixture wrapper metadata")
+        .permissions();
+    fs::set_permissions(&shadow_python, executable_permissions)
+        .expect("make rejecting python3 executable");
+
+    let clock = contextdb_engine::local_transport::MonotonicDeadlineClock::new();
+    let output = harness.run(&["doctor"]);
+    let elapsed = std::time::Duration::from_millis(
+        contextdb_core::read_contract::DeadlineClock::now_ms(&clock),
+    );
+    print_provider_diagnostics(&harness, &[("cg doctor", &output)]);
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "fixture version/help checks must keep the existing doctor deadline"
+    );
+    assert!(
+        !shadow_marker.exists(),
+        "provider discovery PATH must not select the fixture driver's interpreter"
+    );
+    let codex_probes = harness
+        .providers
+        .probe_records()
+        .into_iter()
+        .filter(|record| record.get("provider").and_then(Value::as_str) == Some("codex"))
+        .collect::<Vec<_>>();
+    for expected_argv in [
+        vec![json!("--version")],
+        vec![json!("exec"), json!("--help")],
+    ] {
+        assert!(
+            codex_probes.iter().any(|record| {
+                record.get("argv").and_then(Value::as_array) == Some(&expected_argv)
+            }),
+            "the intended fixture driver must record {expected_argv:?}; got {codex_probes:?}"
+        );
+    }
+    assert!(
+        output.stdout.contains("OK: model/codex/flags-in-help"),
+        "valid fixture version/help must pass: stdout={:?} stderr={:?}",
+        output.stdout,
+        output.stderr
+    );
+    assert_eq!(completion_count(&harness), 0, "doctor never spends");
+}
+
+#[test]
 fn cg_doctor_bounds_hung_subcommand_help_check() {
     let harness = CliHarness::new();
     harness.providers.install(
@@ -2239,13 +2372,21 @@ timeout_ms = 700
     );
     let started = std::time::Instant::now();
     let output = harness.run(&["doctor"]);
+    let elapsed = started.elapsed();
+    print_provider_diagnostics(&harness, &[("cg doctor", &output)]);
     assert!(
-        started.elapsed() < std::time::Duration::from_secs(5),
+        elapsed < std::time::Duration::from_secs(5),
         "doctor help drift checks must be bounded by the provider metadata timeout"
     );
     assert_eq!(output.code, 1);
     assert!(output.stdout.contains("model/codex/flags-in-help"));
-    assert!(output.stdout.contains("help check timed out"));
+    assert!(
+        output.stdout.contains("help check timed out"),
+        "provider help check status={} stdout={:?} stderr={:?}",
+        output.code,
+        output.stdout,
+        output.stderr
+    );
     assert_eq!(completion_count(&harness), 0, "doctor never spends");
 }
 
@@ -2261,6 +2402,7 @@ fn cg_doctor_empty_required_help_flags_still_checks_binary_and_version() {
     write_agy_provider_override(harness.data_root.path(), &[]);
 
     let output = harness.run(&["doctor"]);
+    print_provider_diagnostics(&harness, &[("cg doctor", &output)]);
 
     assert!(
         output.stdout.contains("OK: model/agy/flags-in-help"),
@@ -2295,6 +2437,7 @@ fn cg_doctor_empty_required_help_flags_still_checks_binary_and_version() {
     let missing = CliHarness::new();
     write_agy_provider_override(missing.data_root.path(), &[]);
     let output = missing.run(&["doctor"]);
+    print_provider_diagnostics(&missing, &[("cg doctor", &output)]);
     assert!(
         output
             .stdout
@@ -2318,6 +2461,7 @@ fn cg_doctor_empty_required_help_flags_still_checks_binary_and_version() {
         .set_version_probe_fails(Provider::Agy);
     write_agy_provider_override(failed_version.data_root.path(), &[]);
     let output = failed_version.run(&["doctor"]);
+    print_provider_diagnostics(&failed_version, &[("cg doctor", &output)]);
     assert_eq!(output.code, 1);
     assert!(
         output
@@ -2347,7 +2491,7 @@ fn provider_spec_loads_embedded_and_user_override_layers() {
     }
     assert!(
         !specs.providers.contains_key("agy"),
-        "agy must not ship as an embedded provider until a pure-completion drive is verified"
+        "agy must be absent from the embedded provider list"
     );
     let claude = specs.providers.get("claude");
     assert!(
@@ -2387,7 +2531,7 @@ fn provider_spec_loads_embedded_and_user_override_layers() {
             && agy
                 .last_verified
                 .contains("pure-completion drive not embedded"),
-        "agy may return through a full user override, not through the embedded catalog"
+        "agy requires a full user override rather than an embedded catalog entry"
     );
 
     let overrides = [ProviderOverride {
@@ -2675,25 +2819,19 @@ fn reply_extraction_engine_matches_recorded_envelopes() {
     let claude = extract_reply("claude", "json", CLAUDE_SUCCESS, None);
     assert_eq!(
         claude.as_deref(),
-        Ok(
-            "Host session proof received. I can answer through the logged-in Claude CLI; turn capture should stay off until ingestion ships."
-        ),
+        Ok("The logged-in Claude CLI returned this completion."),
         "claude JSON framing must extract /result"
     );
     let codex = extract_reply("codex", "file", "", Some(&codex_file));
     assert_eq!(
         codex.as_deref(),
-        Ok(
-            "Host session proof received. I can answer through this logged-in Codex CLI; no turn capture should begin until ingestion ships.\n"
-        ),
+        Ok("The logged-in Codex CLI returned this completion.\n"),
         "codex file framing must read --output-last-message"
     );
     let agy = extract_reply("agy", "text", AGY_PLAIN, None);
     assert_eq!(
         agy.as_deref(),
-        Ok(
-            "Host session proof received. I can answer through the local Agy CLI; capture remains disabled until ingestion ships.\n"
-        ),
+        Ok("The local Agy CLI returned this completion.\n"),
         "text framing returns the whole stdout"
     );
     let missing = extract_reply("claude", "json", "{\"type\":\"result\"}", None);

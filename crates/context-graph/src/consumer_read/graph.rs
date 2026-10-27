@@ -1,19 +1,8 @@
 //! The typed graph reads a consumer gets over a store it must not change.
 //!
-//! A downstream runtime whose store is held by another process — or whose whole job forbids it to
-//! risk changing one — still has to answer "why did this happen?" and "what happened lately?".
-//! Those answers are graph reads: an audit trail, an observation and the observations around it,
-//! the decision that fired, the intention it served, the entity it was about, and the context all
-//! of it sits in. Every one of them used to be a typed `&Store` method behind the WRITABLE open,
-//! and that open mutates the store file. So a fallback had two bad choices: change a store it was
-//! told not to touch, or decode the rows itself and drift from what the writable path answers.
-//!
-//! [`ConsumerGraphView`] is the third answer. It carries the same reads, with the same signatures
-//! and the same answer types as [`crate::Store`]'s, over the read-only
-//! [`ConsumerReader`]'s session — and it is the SAME code: one SQL text and one decoder per read,
-//! authored once behind [`crate::store::graph_rows::GraphRows`] and run by whichever executor the
-//! caller reached it through. There is no second decoder to drift and no copied statement to fall
-//! behind a schema change.
+//! Graph reads use the read-only [`ConsumerReader`] session. [`ConsumerGraphView`] and
+//! [`crate::Store`] share SQL and decoding through [`crate::store::graph_rows::GraphRows`],
+//! so consumers receive the same typed answers without a writable open.
 //!
 //! # What a consumer must declare
 //!

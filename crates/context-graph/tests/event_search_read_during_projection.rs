@@ -508,31 +508,33 @@ fn consumer_cursor_fetches_unread_passage_versions_across_currency_maintenance()
 const REOPEN_CHILD_ENV: &str = "CG_READ_DURING_PROJECTION_REOPEN_CHILD";
 const REOPEN_TEST: &str = "readers_are_never_refused_while_another_process_reopens_the_store";
 
-/// How long the child keeps reopening the Store. Bounded so the reads it overlaps stay a handful
-/// and the child's own memory stays small.
-const REOPEN_WINDOW: std::time::Duration = std::time::Duration::from_secs(3);
-
 /// How many read attempts the parent makes, each through one reader that is dropped before the
 /// next attempt opens another.
 const READ_ATTEMPTS: usize = 50;
 
 /// The child half of the cross-process test: open and close a plain writable Store on the named
 /// path in a tight loop, as the detached worker does between claim, render/embed and commit, until
-/// the parent has finished its reads or the reopen window closes.
+/// the parent explicitly reports completion of its reads.
 fn run_reopening_child(spec: &str) {
-    let mut parts = spec.split('\n');
-    let (Some(path), Some(started), Some(stop)) = (parts.next(), parts.next(), parts.next()) else {
-        panic!("child spec is path, start marker and stop marker");
-    };
-    let path = Path::new(path);
-    let stop = Path::new(stop);
-    let cap = std::time::Instant::now() + REOPEN_WINDOW;
+    use std::io::{Read, Write};
+    let (path, socket) = spec
+        .split_once('\n')
+        .expect("child spec is store path and control socket");
+    let mut control = std::os::unix::net::UnixStream::connect(socket).expect("parent control");
+    control
+        .set_nonblocking(true)
+        .expect("nonblocking stop check between opens");
     let mut opened = 0_u64;
-    while !stop.exists() && std::time::Instant::now() < cap {
-        // A writable open may be refused while a reader is hydrating; the worker retries that.
+    loop {
+        let mut stop = [0];
+        match control.read(&mut stop) {
+            Ok(_) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(error) => panic!("parent control: {error}"),
+        }
         if let Ok(store) = Store::open_with_embedder_registrations(
             StoreConfig {
-                db_path: path.to_path_buf(),
+                db_path: Path::new(path).to_path_buf(),
                 extra_embedding_spaces: vec![FixtureEmbedder.embedding_space()],
                 default_text_embedder: None,
                 ..StoreConfig::default()
@@ -540,10 +542,12 @@ fn run_reopening_child(spec: &str) {
             vec![FixtureEmbedder::registration()],
         ) {
             opened += 1;
-            if opened == 1 {
-                std::fs::write(started, b"started").expect("write the start marker");
-            }
             drop(store);
+            if opened == 5 {
+                control
+                    .write_all(&[1])
+                    .expect("announce five completed reopens");
+            }
         }
     }
     println!("child opened the writable Store {opened} times");
@@ -562,27 +566,27 @@ fn readers_are_never_refused_while_another_process_reopens_the_store() {
     let path = root.path().join("reader-across-processes.db");
     let (worker, context_id) = ready_store_with_pending_event(&path);
     drop(worker);
-    let started = root.path().join("child-started");
-    let stop = root.path().join("parent-finished");
+    use std::io::{Read, Write};
+    let socket_dir = tempfile::tempdir_in("/tmp").expect("short control socket directory");
+    let socket = socket_dir.path().join("control.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).expect("control listener");
 
     let child = process::Command::new(std::env::current_exe().expect("test binary path"))
         .args(["--exact", REOPEN_TEST, "--nocapture", "--test-threads", "1"])
         .env(
             REOPEN_CHILD_ENV,
-            format!(
-                "{}\n{}\n{}",
-                path.display(),
-                started.display(),
-                stop.display()
-            ),
+            format!("{}\n{}", path.display(), socket.display()),
         )
         .stdout(process::Stdio::piped())
         .stderr(process::Stdio::piped())
         .spawn()
         .expect("spawn the reopening child");
-    while !started.exists() {
-        std::thread::yield_now();
-    }
+    let (mut control, _) = listener.accept().expect("reopening child connected");
+    let mut ready = [0];
+    control
+        .read_exact(&mut ready)
+        .expect("child completed five reopens");
+    assert_eq!(ready, [1]);
 
     let mut refusals = Vec::new();
     for attempt in 0..READ_ATTEMPTS {
@@ -601,7 +605,9 @@ fn readers_are_never_refused_while_another_process_reopens_the_store() {
             refusals.push(format!("attempt {attempt}: {refusal}"));
         }
     }
-    std::fs::write(&stop, b"finished").expect("write the stop marker");
+    control
+        .write_all(&[1])
+        .expect("stop the reopening child after all reads");
     let output = child.wait_with_output().expect("the child finishes");
     let child_report = format!(
         "{}{}",

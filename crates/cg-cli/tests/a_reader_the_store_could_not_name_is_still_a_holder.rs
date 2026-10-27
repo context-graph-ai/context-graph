@@ -10,16 +10,10 @@
 //! the list. So "two readers are holding this store, and here is one of them" is a real answer the
 //! shipped rendering has to give.
 //!
-//! Today it gives half of it. `describe_readers` (`crates/context-graph/src/error.rs:446-455`)
-//! walks the verified list and stops, so a store held by two readers of which one published no
-//! identity renders as "2 direct readers are still reading it … Verified process 4242
-//! (cg-status)". The second holder — a live process, on this machine, holding this store — leaves
-//! no trace in the sentence. An operator who kills the one process they were given and finds the
-//! store still busy has been sent after the wrong thing, and three surfaces told them that could
-//! not happen: `cg status --help`, the crate README's refusal section, and `AGENTS.md` all promise
-//! "every reader by process id and name" without qualification.
+//! `describe_readers` discloses observed holders whose identities cannot be verified alongside
+//! the verified process list. Help and reference text qualify the naming promise accordingly.
 //!
-//! The owner's ruling on this is that the promise is "every VERIFIED reader", and that a reader
+//! The contract on this is that the promise is "every VERIFIED reader", and that a reader
 //! observed but not named is a valid state that must be DISCLOSED rather than dropped — the same
 //! move `MemoryCliError::StoreLocked` already makes for a writer that published no pid, which
 //! renders as "another process (which has not published its pid)" rather than as "pid 0" or as
@@ -43,7 +37,7 @@ use context_graph::{CgError, ReaderIdentity};
 const BUSY_STORE_PATH: &str = "/data/cg/memory.db";
 
 /// Ways a rendering can tell an operator that a holder is there and could not be named. The
-/// wording is the fixer's to choose; that the disclosure EXISTS is the contract. The first entry
+/// wording may vary; that the disclosure EXISTS is the contract. The first entry
 /// is the vocabulary this CLI already uses for a writer that published no pid.
 const DISCLOSES_A_HOLDER_IT_COULD_NOT_NAME: [&str; 7] = [
     "has not published",
@@ -190,13 +184,13 @@ fn cg_status_help_promises_only_the_readers_the_store_could_verify() {
     assert_promises_only_the_verified_readers("`cg status --help`", &said);
 }
 
-/// The operator surface: the crate README's "What `cg status` says when the store cannot be read".
+/// The operator reference promises only the readers the store could verify.
 #[test]
 fn the_crate_readme_promises_only_the_readers_the_store_could_verify() {
-    let path = repository_root().join("crates/context-graph/README.md");
+    let path = repository_root().join("docs/cli.md");
     let said = std::fs::read_to_string(&path)
         .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
-    assert_promises_only_the_verified_readers("`crates/context-graph/README.md`", &said);
+    assert_promises_only_the_verified_readers("`docs/cli.md`", &said);
 }
 
 /// The contributor surface: the routing file a contributor is handed before they touch the

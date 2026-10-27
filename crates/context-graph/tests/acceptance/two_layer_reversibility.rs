@@ -1,18 +1,8 @@
 // Two-layer reversibility tests.
 //
 // Store-state tests: every assertion reads from the persisted overlay/teaching-event
-// tables. A HashMap that overwrites in place fails the "original unchanged" assertion;
-// a placeholder that returns empty tables fails the "overlay entry / compensation event exists"
-// assertions.
-//
-// Current placeholder behavior in overlay.rs:
-//   - record_correction returns an entry but does NOT persist it
-//   - read_with_overlay always returns the original value
-//   - reverse_overlay returns None (no compensation event)
-//   - is_dropped always returns false
-//   - list_overlay_entries_for_item always returns empty
-//   - list_compensation_events always returns empty
-//   - apply_teaching_events_in_order always returns the original
+// tables. Original values remain unchanged, and overlay entries and compensation
+// events persist separately.
 
 use context_graph::ingest::{CaptureRequest, record_conversation_with_extractor};
 use context_graph::overlay::{
@@ -92,11 +82,8 @@ fn fresh_store(name: &str) -> (tempfile::TempDir, Store) {
     (dir, store)
 }
 
-// LIVE PATH: after a correction via the library action seam, the PRODUCTION read path — the
-// Intention anchor `by_intention` (decisions are read through anchors, never a flat list) — returns
-// the corrected value while the raw stored row is byte-unchanged. The overlay read-merge has zero
-// production callers in HEAD, so `by_intention` returns the RAW row → the corrected-view assertion
-// fails (honest RED).
+// A correction through the library action seam appears in the Intention anchor `by_intention`
+// read view while the original stored Decision row remains byte-unchanged.
 #[test]
 fn correction_overrides_on_read_without_editing_the_original_capture() {
     let (_dir, store) = fresh_store("i_correction_overrides");
@@ -125,8 +112,8 @@ fn correction_overrides_on_read_without_editing_the_original_capture() {
         "the action seam must record a Correction overlay"
     );
 
-    // PRODUCTION read path (the Intention anchor) must return the CORRECTED value. HEAD's
-    // `by_intention` returns the raw, un-merged row → RED.
+    // PRODUCTION read path (the Intention anchor) must return the CORRECTED value. an incorrect implementation's
+    // `by_intention` returns the raw, un-merged row → regression.
     let view = store
         .by_intention(captured.intention_id, DiscoveryFilter::default())
         .expect("by_intention read view");
@@ -136,7 +123,7 @@ fn correction_overrides_on_read_without_editing_the_original_capture() {
         .expect("decision present via its Intention anchor");
     assert_eq!(
         viewed.description, corrected_value,
-        "the PRODUCTION read path (by_intention) must show the corrected value; HEAD returns the RAW \
+        "the PRODUCTION read path (by_intention) must show the corrected value; an implementation that returns the RAW \
          row (the overlay read-merge has no production caller) — got {:?}",
         viewed.description
     );
@@ -157,8 +144,7 @@ fn correction_overrides_on_read_without_editing_the_original_capture() {
     );
 }
 
-// Test 2 (store-state): reverse_overlay returns None (no compensation event);
-// list_compensation_events returns empty.
+// Reversing a correction restores the original read value and logs a compensation event.
 #[test]
 fn reversal_un_applies_everywhere_and_never_rewrites_stored_history() {
     let (_dir, _store) = fresh_store("i_reversal_un_applies");
@@ -170,10 +156,9 @@ fn reversal_un_applies_everywhere_and_never_rewrites_stored_history() {
     let mut entry = record_correction(&_store, item_id, corrected_value);
     let compensation = reverse_overlay(&_store, &mut entry);
 
-    // Placeholder: compensation is None. The real implementation logs it.
     assert!(
         compensation.is_some(),
-        "reversal must produce a compensation event; placeholder returns None"
+        "reversal must produce a compensation event"
     );
     let event = compensation.unwrap();
     assert_eq!(
@@ -186,15 +171,12 @@ fn reversal_un_applies_everywhere_and_never_rewrites_stored_history() {
     let read_value = read_with_overlay(original_value, item_id, &entries);
     assert_eq!(
         read_value, original_value,
-        "read view must revert after reversal; placeholder still returns corrected"
+        "read view must revert after reversal"
     );
 
     // The correction event row must still exist in history (no hard deletes).
     let all_entries = list_overlay_entries_for_item(&_store, item_id);
-    assert!(
-        !all_entries.is_empty(),
-        "history entry must remain; placeholder hard-deletes it"
-    );
+    assert!(!all_entries.is_empty(), "history entry must remain");
     assert!(
         all_entries.iter().any(|e| e.reversed),
         "reversal must mark entry as reversed, not delete it"
@@ -204,15 +186,15 @@ fn reversal_un_applies_everywhere_and_never_rewrites_stored_history() {
     let comp_events = list_compensation_events(&_store);
     assert!(
         !comp_events.is_empty(),
-        "list_compensation_events must return the logged event; placeholder returns empty"
+        "list_compensation_events must return the logged event"
     );
 }
 
 // LIVE PATH: confirming a grouping via the library action seam adds links over three REAL captured
 // Intentions and the PRODUCTION read path — the EXISTING `list_intentions_in_context` — returns the
 // grouped view (each Intention carries the canonical catalog link), while each raw Intention row
-// (read via the `admin_raw_*` layer) is byte-unchanged and the link is reversible. HEAD's
-// `list_intentions_in_context` returns the ungrouped rows (no overlay merge) → RED.
+// (read via the `admin_raw_*` layer) is byte-unchanged and the link is reversible. an incorrect implementation's
+// `list_intentions_in_context` returns the ungrouped rows (no overlay merge) → regression.
 #[test]
 fn grouping_links_intentions_without_changing_or_deleting_any_row() {
     let (_dir, store) = fresh_store("i_grouping_links");
@@ -267,8 +249,8 @@ fn grouping_links_intentions_without_changing_or_deleting_any_row() {
     }
 
     // PRODUCTION read path must return the GROUPED view: every intention carries the canonical link.
-    // HEAD's list_intentions_in_context returns the ungrouped rows (blueprint_catalog_id is the
-    // capture's auto-group id / None, never the overlay's canonical id) → RED.
+    // an incorrect implementation's list_intentions_in_context returns the ungrouped rows (blueprint_catalog_id is the
+    // capture's auto-group id / None, never the overlay's canonical id) → regression.
     let grouped_view = store
         .list_intentions_in_context(context_id)
         .expect("grouped read view");
@@ -277,7 +259,7 @@ fn grouping_links_intentions_without_changing_or_deleting_any_row() {
             intention.blueprint_catalog_id.as_deref(),
             Some(catalog_id),
             "the PRODUCTION read path (list_intentions_in_context) must show intention '{}' grouped \
-             under the canonical catalog entry; HEAD returns the ungrouped row \
+             under the canonical catalog entry; an implementation that returns the ungrouped row \
              (blueprint_catalog_id={:?})",
             intention.description,
             intention.blueprint_catalog_id
@@ -323,9 +305,8 @@ fn grouping_links_intentions_without_changing_or_deleting_any_row() {
     let _ = DiscoveryFilter::default();
 }
 
-// LIVE PATH: a drop via the library action seam removes the item from the PRODUCTION read path —
-// the Intention anchor `by_intention` — as an overlay exclusion, while the raw row is byte-unchanged.
-// HEAD's `by_intention` returns the raw (un-excluded) row → the exclusion assertion fails (RED).
+// A drop through the library action seam excludes the item from the Intention anchor
+// `by_intention` read view while preserving the original stored row.
 #[test]
 fn drop_excludes_from_read_view_but_preserves_provenance() {
     let (_dir, store) = fresh_store("i_drop_preserves");
@@ -350,14 +331,13 @@ fn drop_excludes_from_read_view_but_preserves_provenance() {
         "the seam records a Drop overlay"
     );
 
-    // PRODUCTION read path (the Intention anchor) must EXCLUDE the dropped decision. HEAD returns it → RED.
+    // The Intention-anchored read view excludes the dropped decision.
     let view = store
         .by_intention(captured.intention_id, DiscoveryFilter::default())
         .expect("by_intention read view");
     assert!(
         !view.iter().any(|d| d.id == captured.decision_id),
-        "the PRODUCTION read path (by_intention) must EXCLUDE a dropped item; HEAD still returns the \
-         raw (un-excluded) row — view ids: {:?}",
+        "by_intention must exclude the dropped item; observed view ids: {:?}",
         view.iter().map(|d| d.id).collect::<Vec<_>>()
     );
 
@@ -382,8 +362,7 @@ fn drop_excludes_from_read_view_but_preserves_provenance() {
     );
 }
 
-// Test 5 (store-state): record_wrong_type_correction does not persist an overlay;
-// apply_correction returns teaching_event=None.
+// Wrong-type corrections persist an overlay and log a teaching event.
 #[test]
 fn corrected_intention_that_was_a_decision_stays_reversible_and_logs_a_lesson() {
     let (_dir, _store) = fresh_store("i_wrong_type_correction");
@@ -397,7 +376,7 @@ fn corrected_intention_that_was_a_decision_stays_reversible_and_logs_a_lesson() 
     let entries = list_overlay_entries_for_item(&_store, decision_item_id);
     assert!(
         !entries.is_empty(),
-        "wrong-type correction entry must be persisted; wrong stub returns empty"
+        "wrong-type correction entry must be persisted"
     );
     assert!(
         entries
@@ -412,7 +391,7 @@ fn corrected_intention_that_was_a_decision_stays_reversible_and_logs_a_lesson() 
             .expect("read succeeds");
     assert!(
         correction_result.teaching_event.is_some(),
-        "apply_correction must log a teaching event for a wrong-type correction; wrong stub returns None"
+        "apply_correction must log a teaching event for a wrong-type correction"
     );
     let event = correction_result.teaching_event.unwrap();
     assert_eq!(
@@ -422,7 +401,7 @@ fn corrected_intention_that_was_a_decision_stays_reversible_and_logs_a_lesson() 
     // The content must not be empty.
     assert!(
         !event.content.is_empty(),
-        "teaching event content must describe the kind change; wrong stub is empty"
+        "teaching event content must describe the kind change"
     );
     // Kind must be WrongTypeCorrection or Correction.
     assert!(
@@ -444,11 +423,11 @@ fn corrected_intention_that_was_a_decision_stays_reversible_and_logs_a_lesson() 
     let entries_after = list_overlay_entries_for_item(&_store, decision_item_id);
     assert!(
         !entries_after.is_empty(),
-        "overlay history must remain after reversal; wrong stub hard-deletes"
+        "overlay history must remain after reversal"
     );
 }
 
-// Test 6 (store-state): reverse_overlay returns None (no compensation event logged).
+// Reversing a grouping logs a compensation event and retains its history.
 #[test]
 fn grouping_reversal_is_logged_as_a_compensation_event() {
     let (_dir, _store) = fresh_store("i_grouping_reversal_logged");
@@ -459,10 +438,9 @@ fn grouping_reversal_is_logged_as_a_compensation_event() {
     let mut entry = record_grouping_link(&_store, intention_id, catalog_id);
     let compensation = reverse_overlay(&_store, &mut entry);
 
-    // Placeholder: returns None. The real implementation logs a grouping-reversal compensation event.
     assert!(
         compensation.is_some(),
-        "grouping reversal must log a compensation event; wrong stub returns None"
+        "grouping reversal must log a compensation event"
     );
     let event = compensation.unwrap();
     // Kind must be GroupingReversal.
@@ -481,7 +459,7 @@ fn grouping_reversal_is_logged_as_a_compensation_event() {
     let events = list_compensation_events(&_store);
     assert!(
         !events.is_empty(),
-        "list_compensation_events must include the grouping reversal; wrong stub returns empty"
+        "list_compensation_events must include the grouping reversal"
     );
     assert!(
         events.iter().any(|e| e.reversed_overlay_id == entry.id),
@@ -490,19 +468,15 @@ fn grouping_reversal_is_logged_as_a_compensation_event() {
 
     // Grouping link must be marked reversed, not deleted.
     let entries = list_overlay_entries_for_item(&_store, intention_id);
-    assert!(
-        !entries.is_empty(),
-        "grouping link history must remain; wrong stub hard-deletes"
-    );
+    assert!(!entries.is_empty(), "grouping link history must remain");
     assert!(
         entries.iter().any(|e| e.reversed),
         "reversed grouping link must be marked reversed, not deleted"
     );
 }
 
-// Test 7 (store-state): placeholder does not track state so the end read state is always
-// the original. list_overlay_entries_for_item returns empty, so the correction was never
-// applied in the first place.
+// Concurrent reversal and matching capture preserve the original read value and
+// retain the reversed correction in the overlay history.
 #[test]
 fn reversal_concurrent_with_matching_capture_has_deterministic_end_state() {
     let (_dir, _store) = fresh_store("i_concurrent_reversal");
@@ -528,7 +502,7 @@ fn reversal_concurrent_with_matching_capture_has_deterministic_end_state() {
     // Both orderings must end with the original value restored (reversal wins).
     assert_eq!(
         read_a, original_value,
-        "after reversal, read view must return original; wrong stub never applied the correction"
+        "after reversal, read view must return original"
     );
     assert_eq!(
         read_b, original_value,
@@ -543,16 +517,14 @@ fn reversal_concurrent_with_matching_capture_has_deterministic_end_state() {
     // History entries must exist.
     assert!(
         !entries_a.is_empty(),
-        "history entries must exist for item_id_a; wrong stub returns empty"
+        "history entries must exist for item_id_a"
     );
     assert!(
         !entries_b.is_empty(),
-        "history entries must exist for item_id_b; wrong stub returns empty"
+        "history entries must exist for item_id_b"
     );
 }
 
-// Test 8 (store-state via the overlay API): placeholder apply_teaching_events_in_order
-// always returns the original value; a correction-only call must return the corrected value.
 #[test]
 fn out_of_order_reversal_teaching_event_converges_to_same_read_view() {
     let original_value = "code_reference";
@@ -567,12 +539,12 @@ fn out_of_order_reversal_teaching_event_converges_to_same_read_view() {
     reversal_entry.reversed = true;
 
     // Standalone correction (no reversal): must return the corrected value.
-    // Placeholder always returns original_value.
+    // The correction takes effect without a reversal.
     let correction_only = vec![correction_entry.clone()];
     let read_correction_only = apply_teaching_events_in_order(original_value, &correction_only);
     assert_eq!(
         read_correction_only, corrected_value,
-        "correction alone must produce the corrected value; wrong stub always returns original"
+        "correction alone must produce the corrected value"
     );
 
     // In-order: [correction, reversal]. Net effect: original restored.
@@ -600,8 +572,6 @@ fn out_of_order_reversal_teaching_event_converges_to_same_read_view() {
 // value and a dropped decision is EXCLUDED — with the raw row byte-unchanged. The contract is "no
 // surface without an API beneath it": the fold must live in the library, not only in the CLI.
 //
-// RED today: `find_via_digests` / `digest_source_details` read the raw `description` column and never
-// consult the overlay, so the corrected-value and dropped-exclusion assertions fail.
 #[test]
 fn find_via_digests_folds_overlay_corrections_and_drops_beneath_the_library_read() {
     let (_dir, store) = fresh_store("i_digest_overlay_fold");
@@ -667,8 +637,7 @@ fn find_via_digests_folds_overlay_corrections_and_drops_beneath_the_library_read
     assert!(
         corrected_visible,
         "find_via_digests must fold the correction overlay at the LIBRARY level — the hit's \
-         decision_texts must show the corrected value '{corrected_value}'; HEAD reads the raw \
-         description and only the CLI folds the overlay. decision_texts: {:?}",
+         decision_texts must show the corrected value '{corrected_value}'; observed decision_texts: {:?}",
         after_correction
             .iter()
             .flat_map(|h| h.decision_texts.clone())
@@ -695,7 +664,7 @@ fn find_via_digests_folds_overlay_corrections_and_drops_beneath_the_library_read
         after_drop
             .iter()
             .all(|h| !h.decision_ids.contains(&decision_id)),
-        "find_via_digests must EXCLUDE a dropped decision at the LIBRARY level; HEAD's digest read \
+        "find_via_digests must EXCLUDE a dropped decision at the LIBRARY level; an incorrect implementation's digest read \
          still returns the raw (un-excluded) decision. decision_ids: {:?}",
         after_drop
             .iter()

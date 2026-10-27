@@ -169,7 +169,7 @@ impl Store {
                 .unwrap_or_else(ContextId::new_v7),
         };
         let space = self
-            .embedding_space_for_id(embedding_space_id)
+            .embedding_space_for_write(embedding_space_id)
             .map_err(|_| CgError::UnknownEmbeddingSpace {
                 id: embedding_space_id.to_string(),
             })?;
@@ -270,6 +270,10 @@ impl Store {
         Ok(id)
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "ContextDB keeps typed refusal details inline so error propagation needs no allocation."
+    )]
     fn insert_entity_reference_handle_in_tx(
         &self,
         tx: crate::TxId,

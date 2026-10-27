@@ -1,4 +1,4 @@
-//! RED controls for refusing invalid atomic interpretation/search activation pairs.
+//! regression controls for refusing invalid atomic interpretation/search activation pairs.
 
 #![cfg(context_graph_internal_test_support)]
 

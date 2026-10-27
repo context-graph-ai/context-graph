@@ -1,38 +1,15 @@
 //! What a status total COST is reported as what it really was, never as zero.
 //!
-//! ## The promise
+//! Observed status totals account for the work each read performs, including nested reads.
+//! A read cannot examine fewer rows than it returns, and a total includes the work of every
+//! contributing read rather than only the largest individual observation.
 //!
-//! `context_graph::tier0`'s observing totals exist so a caller can find out what asking for a
-//! status actually spent — `cg status` on a developer's year of sessions is the read that gets
-//! slow, and the module's own words are that what a read examined "comes from the engine's own
-//! progress reports, not from this module's arithmetic" (src/status_reads.rs:16-18). A number that
-//! is reported as 0 for every read is arithmetic, and it is false arithmetic: a read that handed
-//! back a hundred rows looked at at least a hundred.
+//! The fixture captures 250 digests so scans span several bounded pages. Queue totals include
+//! keyed work-ledger and completion reads within the digest scan; raw footprint totals include
+//! every captured chunk. Their observations must account for those rows.
 //!
-//! ## What is observed today
-//!
-//! `StatusReads::examined` (src/status_reads.rs:112-114) is
-//! `self.examined.try_iter().max().unwrap_or(0)` over a channel shared by every read the session
-//! makes. Two things go wrong in it and this file pins both:
-//!
-//! - When the engine published no progress report for a read — which is the ordinary case, because
-//!   reports are withheld until a read has done enough to be worth reporting — the drain finds
-//!   nothing and `unwrap_or(0)` puts a 0 in front of the caller as though it were an observation.
-//!   Every read of a 250-digest store reports 0 examined today, several of them while handing back
-//!   100 rows.
-//! - `max` is the wrong combiner across NESTED reads. `queue_counts_observed` folds a keyed
-//!   `work_jobs` read and a keyed completions read INSIDE the fold of its digest scan
-//!   (src/tier0.rs:527-585), all on one session and one channel. What those nested reads examined
-//!   ADDS to what the total cost; taking the largest of them reports the deepest single read and
-//!   throws the rest away.
-//!
-//! ## Why the numbers below are floors rather than exact values
-//!
-//! How many items the engine walks to answer a statement is the engine's business and may change
-//! with its planner. What cannot change is that it never looks at fewer rows than it hands back,
-//! and never at fewer than the rows that had to be considered to produce the answer. So every
-//! assertion here is a floor derived from the fixture, and passing them cannot be arranged by
-//! inflating a counter: an honest report satisfies them and a zeroed one cannot.
+//! Exact engine work depends on the query planner. Assertions therefore use floors derived
+//! from the fixture rather than pinning an exact number of examined rows.
 
 use std::sync::Mutex;
 
@@ -102,7 +79,7 @@ fn fixture() -> (tempfile::TempDir, Store, ContextId) {
             chunk_window: CHUNK_WINDOW,
         },
     )
-    .expect("tier-0 capture of the fixture");
+    .expect("model-free capture of the fixture");
     assert_eq!(
         report.digest_ids.len(),
         CAPTURED_DIGESTS,

@@ -11,6 +11,7 @@ use std::collections::BTreeSet;
 
 #[test]
 fn provider_schema_and_prompt_guidance_cover_full_seed_shape() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let descriptor = CaptureHarnessConfig::default()
         .schema_descriptor()
         .expect("default capture config must expose a schema descriptor");

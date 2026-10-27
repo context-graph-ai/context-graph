@@ -132,6 +132,10 @@ fn transition_deadline() -> Instant {
 ///
 /// The typed refusal comes back only when the owner neither begins serving nor lets go inside the
 /// bound. Every other answer, success or refusal, is returned at once.
+#[expect(
+    clippy::result_large_err,
+    reason = "ContextDB keeps typed refusal details inline so error propagation needs no allocation."
+)]
 fn open_through_owner_transitions(
     path: &Path,
     options: ReadSessionOptions,
@@ -483,6 +487,10 @@ impl ConsumerReader {
     ///
     /// A cursor is a second way out of the same session and is narrowed by the same two layers:
     /// the engine's row gate on the rows, and the declaration on a table-keyed `SHOW`.
+    #[expect(
+        clippy::result_large_err,
+        reason = "ContextDB keeps typed refusal details inline so error propagation needs no allocation."
+    )]
     pub fn open_cursor(
         &self,
         sql: &str,
@@ -561,6 +569,10 @@ impl ConsumerReader {
     /// gone is answered by selecting the route again — the owner that took over, or the file once
     /// nobody holds it — and asking the same question there. The wait is bounded by the declared
     /// writer-transition allowance; past it the typed refusal is the answer.
+    #[expect(
+        clippy::result_large_err,
+        reason = "ContextDB keeps typed refusal details inline so error propagation needs no allocation."
+    )]
     fn on_session<T>(
         &self,
         call: impl Fn(&ReadSession) -> std::result::Result<T, contextdb_core::Error>,
@@ -585,12 +597,20 @@ impl ConsumerReader {
     }
 
     /// One statement on the session, before any declaration narrowing.
+    #[expect(
+        clippy::result_large_err,
+        reason = "ContextDB keeps typed refusal details inline so error propagation needs no allocation."
+    )]
     fn raw_execute(&self, sql: &str, params: &HashMap<String, Value>) -> Result<QueryResult> {
         self.on_session(|session| session.execute(sql, params))
             .map_err(map_engine_err)
     }
 
     /// One metadata question on the session, before any declaration narrowing.
+    #[expect(
+        clippy::result_large_err,
+        reason = "ContextDB keeps typed refusal details inline so error propagation needs no allocation."
+    )]
     fn raw_metadata(
         &self,
         request: MetadataRequest,

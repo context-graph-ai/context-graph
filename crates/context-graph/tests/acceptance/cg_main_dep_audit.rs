@@ -1,3 +1,9 @@
+#[path = "../common/ci_stages.rs"]
+mod ci_stages;
+use ci_stages::{
+    REQUIRED_PR_JOB_AGGREGATE_RUN, VETTED_DISK_RECLAMATION_LINES, VETTED_JOB_RECEIPT_RUN,
+};
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -36,6 +42,7 @@ const AUDIT_CAPTURE_PATHS: &[&str] = &[
     "$RUNNER_TEMP/context-graph-tree.txt",
 ];
 const COMMAND_LOOKUP_SAFE_ACTIONS: &[&str] = &[
+    "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
     "actions/checkout@v4",
     "actions/cache@v4",
     "dtolnay/rust-toolchain@stable",
@@ -90,16 +97,17 @@ const EXACT_REVISION_VERIFIER_LINES: &[&str] = &[
     "echo \"Context Graph checkout and locked ContextDB revision must be immutable 40-character commit SHAs\" >&2",
     "exit 1",
     "fi",
-    "if [[ \"$context_graph_sha\" != \"$GITHUB_SHA\" ]]; then",
-    "echo \"checked-out Context Graph SHA does not match GITHUB_SHA\" >&2",
+    "if [[ \"$context_graph_sha\" != \"$TESTED_SHA\" ]]; then",
+    "echo \"checked-out Context Graph SHA does not match selected tested SHA\" >&2",
     "exit 1",
     "fi",
-    "if [[ \"${{ github.event_name }}\" == \"workflow_dispatch\" ]] && [[ \"$contextdb_sha\" != \"$REQUESTED_CONTEXTDB_SHA\" ]]; then",
+    "if [[ -n \"$REQUESTED_CONTEXTDB_SHA\" ]] && [[ \"$contextdb_sha\" != \"$REQUESTED_CONTEXTDB_SHA\" ]]; then",
     "echo \"locked ContextDB SHA does not match contextdb_sha\" >&2",
     "exit 1",
     "fi",
     "printf 'Context Graph SHA: %s\\n' \"$context_graph_sha\"",
     "printf 'ContextDB SHA: %s\\n' \"$contextdb_sha\"",
+    "printf 'Base SHA: %s\\nHead SHA: %s\\nEvent SHA: %s\\n' \"$BASE_SHA\" \"$HEAD_SHA\" \"$EVENT_SHA\"",
 ];
 const VETTED_AUDIT_RUN_LINES: &[&str] = &[
     "require_file_without_match() {",
@@ -128,33 +136,34 @@ const VETTED_AUDIT_RUN_LINES: &[&str] = &[
     "require_file_without_match '(^|[[:space:]])candle-embeddinggemma([[:space:]]|$)' \"$RUNNER_TEMP/context-graph-tree.txt\"",
 ];
 const VETTED_COLD_MISS_MODEL_SEED_LINES: &[&str] = &[
-    "rustup run stable cargo run -p context-graph-cli --bin cg -- model fetch --defaults",
-    "rustup run stable cargo test -p context-graph --test nomic_document_preparer_adds_exactly_one_system_task_prefix",
+    "rustup run 1.94.1 cargo run -p context-graph-cli --bin cg -- model fetch --defaults",
+    "rustup run 1.94.1 cargo test -p context-graph --test nomic_document_preparer_adds_exactly_one_system_task_prefix",
 ];
 const VETTED_OFFLINE_REAL_MODEL_PROOF_LINES: &[&str] = &[
-    "rustup run stable cargo test -p context-graph \\",
+    "rustup run 1.94.1 cargo test -p context-graph \\",
     "--test nomic_document_preparer_adds_exactly_one_system_task_prefix \\",
     "--test nomic_query_preparer_adds_exactly_one_system_task_prefix \\",
     "--test event_search_uses_role_preparation_while_digest_record_and_evidence_paths_remain_byte_for_byte_unchanged",
 ];
 const VETTED_DOCUMENTATION_CLAIM_VALIDATION_LINES: &[&str] = &[
-    "base=\"${DOCUMENTATION_BASE_SHA:-HEAD^}\"",
-    "if [[ -z \"$base\" ]] || [[ \"$base\" =~ ^0+$ ]] || ! git rev-parse --verify --quiet \"${base}^{commit}\" > /dev/null; then",
-    "base=\"HEAD^\"",
-    "fi",
-    "git rev-parse --verify --quiet \"${base}^{commit}\" > /dev/null",
+    "base=\"${DOCUMENTATION_BASE_SHA:-}\"",
+    "if [[ -z \"$base\" ]] || [[ \"$base\" =~ ^0+$ ]] || ! git rev-parse --verify --quiet \"HEAD^\" > /dev/null || ! git rev-parse --verify --quiet \"${base}^{commit}\" > /dev/null; then",
+    "echo \"initial state, no comparison: auditing all documentation\"",
+    "python3 scripts/validate-doc-coverage.py --all",
+    "else",
     "printf 'comparing the touched doc files against %s\\n' \"$base\"",
     "python3 scripts/validate-doc-coverage.py --base \"$base\"",
+    "fi",
     "bash scripts/check-doc-validator-negative-control.sh",
 ];
 const VETTED_GATE_WALL_CLOCK_BASELINE_DIRECTION_LINES: &[&str] = &[
-    "base=\"${DOCUMENTATION_BASE_SHA:-HEAD^}\"",
-    "if [[ -z \"$base\" ]] || [[ \"$base\" =~ ^0+$ ]] || ! git rev-parse --verify --quiet \"${base}^{commit}\" > /dev/null; then",
-    "base=\"HEAD^\"",
-    "fi",
-    "git rev-parse --verify --quiet \"${base}^{commit}\" > /dev/null",
+    "base=\"${DOCUMENTATION_BASE_SHA:-}\"",
+    "if [[ -z \"$base\" ]] || [[ \"$base\" =~ ^0+$ ]] || ! git rev-parse --verify --quiet \"HEAD^\" > /dev/null || ! git rev-parse --verify --quiet \"${base}^{commit}\" > /dev/null; then",
+    "echo \"initial state, no comparison: gate wall-clock baseline\"",
+    "else",
     "printf 'comparing the gate wall-clock baseline against %s\\n' \"$base\"",
     "python3 scripts/check-gate-wall-clock.py --base \"$base\"",
+    "fi",
 ];
 
 fn crate_root() -> PathBuf {
@@ -174,8 +183,22 @@ fn read_workspace_file(path: &str) -> String {
 }
 
 fn read_workflow_yaml() -> YamlValue {
-    serde_yaml_ng::from_str(&read_workspace_file(".github/workflows/ci.yml"))
-        .expect("workflow yaml")
+    {
+        let mut yaml = serde_yaml_ng::from_str(&read_workspace_file(".github/workflows/ci.yml"))
+            .expect("workflow yaml");
+        yaml = ci_stages::platform_coverage(
+            yaml,
+            serde_yaml_ng::from_str(
+                &std::fs::read_to_string(
+                    workspace_root().join(".github/workflows/macos-advisory.yml"),
+                )
+                .expect("advisory readable"),
+            )
+            .expect("advisory yaml"),
+        );
+        ci_stages::effective(&mut yaml, &read_workspace_file("scripts/gate.sh"));
+        yaml
+    }
 }
 
 fn default_build_dependency_names(manifest_path: &str) -> Vec<String> {
@@ -271,8 +294,8 @@ fn nested_check_target_dir() -> PathBuf {
 }
 
 /// The published promise is that a consumer who turns the default features off gets a core that
-/// fetches nothing. Two things have to be true for that sentence to mean anything, and neither was
-/// checked anywhere: the crate has to actually BUILD in that shape, and the shape has to really
+/// fetches nothing. This requires both a successful build in that shape and a dependency tree that
+/// omits network fetching. The shape must
 /// drop the dependency that can open a socket. So this compiles it and reads its dependency tree,
 /// with the default tree as a positive control so a tree reader that silently found nothing cannot
 /// pass.
@@ -585,7 +608,10 @@ fn workflow_job_steps(yaml: &YamlValue) -> Vec<(&Mapping, Vec<&Mapping>)> {
         .and_then(YamlValue::as_mapping)
         .expect("workflow jobs map");
     let mut job_steps = Vec::new();
-    for job_value in jobs.values() {
+    for (name, job_value) in jobs {
+        if ci_stages::is_reusable_job(name, job_value) {
+            continue;
+        }
         let Some(job) = job_value.as_mapping() else {
             continue;
         };
@@ -613,6 +639,9 @@ fn step_uses_can_mask_command_lookup(step: &Mapping) -> bool {
         }
         Some("actions/cache@v4") => cache_inputs_can_shadow_workspace_or_command_lookup(step),
         Some("Swatinem/rust-cache@v2") => rust_cache_inputs_can_shadow_command_lookup(step),
+        Some("actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093") => {
+            ci_stages::artifact_download_can_shadow_command_lookup(step)
+        }
         Some(uses) => !COMMAND_LOOKUP_SAFE_ACTIONS.contains(&uses),
     }
 }
@@ -624,7 +653,11 @@ fn checkout_inputs_can_shadow_workspace(step: &Mapping) -> bool {
 fn step_is_credential_free_context_graph_checkout(step: &Mapping) -> bool {
     step_uses(step) == Some("actions/checkout@v4")
         && step_with_fields(step).is_some_and(|with| {
-            with.len() == 3
+            with.len() == 4
+                && mapping_get(with, "ref").and_then(YamlValue::as_str)
+                    == Some(
+                        "${{ github.event.pull_request.head.sha || inputs.cg_sha || github.sha }}",
+                    )
                 && mapping_get(with, "path").and_then(YamlValue::as_str)
                     == Some(CONTEXT_GRAPH_CHECKOUT_PATH)
                 && mapping_get(with, "persist-credentials").is_some_and(yaml_explicit_false)
@@ -669,19 +702,20 @@ fn cache_path_is_model_cache_only(value: &YamlValue) -> bool {
 }
 
 fn allowed_model_cache_path(path: &str) -> bool {
+    // The catalog delegates these fallback roots to the bundled loader.
     [
         "${{ env.CG_MODEL_CACHE_ROOT }}",
-        "~/.cache/cg/embedders",
-        "~/AppData/Local/cg/embedders",
-        "~/Library/Caches/cg/embedders",
-        "$HOME/.cache/cg/embedders",
-        "${HOME}/.cache/cg/embedders",
-        "$HOME/AppData/Local/cg/embedders",
-        "${HOME}/AppData/Local/cg/embedders",
-        "$HOME/Library/Caches/cg/embedders",
-        "${HOME}/Library/Caches/cg/embedders",
-        "$LOCALAPPDATA/cg/embedders",
-        "${LOCALAPPDATA}/cg/embedders",
+        cg_catalog::DEFAULT_CACHE_ROOT_LINUX_MACOS,
+        "~/AppData/Local/cg/models",
+        "$HOME/.cache/cg/models",
+        "${HOME}/.cache/cg/models",
+        "$HOME/AppData/Local/cg/models",
+        "${HOME}/AppData/Local/cg/models",
+        "$LOCALAPPDATA/cg/models",
+        "${LOCALAPPDATA}/cg/models",
+        "%LOCALAPPDATA%/cg/models",
+        "$XDG_CACHE_HOME/cg/models",
+        "${XDG_CACHE_HOME}/cg/models",
     ]
     .iter()
     .any(|prefix| path == *prefix || path.starts_with(&format!("{prefix}/")))
@@ -822,9 +856,10 @@ fn workflow_command_lookup_can_mask_failures(workflow: &YamlValue) -> bool {
                     || step_uses_can_mask_command_lookup(step)
                     || step_run(step).is_some_and(|run| {
                         !run_is_vetted_command_lookup_run(run)
-                            && all_run_shell_lines(run)
-                                .into_iter()
-                                .any(shell_line_mutates_command_lookup)
+                            && all_run_shell_lines(run).into_iter().any(|line| {
+                                line_has_unpinned_rustup_wrapper(line)
+                                    || shell_line_mutates_command_lookup(line)
+                            })
                     })
             })
     })
@@ -861,13 +896,14 @@ fn job_matrix_os_values_are_known_github_hosted(job: &Mapping) -> bool {
     let Some(matrix) = job_matrix(job) else {
         return false;
     };
-    mapping_get(matrix, "include").is_none()
-        && mapping_get(matrix, "exclude").is_none()
-        && job_matrix_values(job, "os").is_some_and(|values| {
-            values
-                .iter()
-                .all(|value| is_safe_github_hosted_runner(value))
-        })
+    ci_stages::exact_physical_matrix(matrix)
+        || (mapping_get(matrix, "include").is_none()
+            && mapping_get(matrix, "exclude").is_none()
+            && job_matrix_values(job, "os").is_some_and(|values| {
+                values
+                    .iter()
+                    .all(|value| is_safe_github_hosted_runner(value))
+            }))
 }
 
 fn job_matrix(job: &Mapping) -> Option<&Mapping> {
@@ -911,7 +947,50 @@ fn step_enforcing_run<'a>(
 }
 
 fn step_uses(step: &Mapping) -> Option<&str> {
-    mapping_get(step, "uses").and_then(YamlValue::as_str)
+    let uses = mapping_get(step, "uses").and_then(YamlValue::as_str)?;
+    // Exact immutable revisions retain the action identity and its declared version.
+    match uses {
+        "actions/checkout@11d5960a326750d5838078e36cf38b85af677262" => {
+            assert!(
+                include_str!("../../../../.github/workflows/ci.yml").contains(
+                    "uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4"
+                )
+            );
+            Some("actions/checkout@v4")
+        }
+        "dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249" => {
+            assert!(
+                include_str!("../../../../.github/workflows/ci.yml").contains(
+                    "uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable"
+                )
+            );
+            Some("dtolnay/rust-toolchain@stable")
+        }
+        "Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c" => {
+            assert!(
+                include_str!("../../../../.github/workflows/ci.yml").contains(
+                    "uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2"
+                )
+            );
+            Some("Swatinem/rust-cache@v2")
+        }
+        "taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8" => {
+            assert!(
+                include_str!("../../../../.github/workflows/ci.yml").contains(
+                    "uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2"
+                )
+            );
+            Some("taiki-e/install-action@v2")
+        }
+        "actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830" => {
+            assert!(
+                include_str!("../../../../.github/workflows/ci.yml")
+                    .contains("uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4")
+            );
+            Some("actions/cache@v4")
+        }
+        _ => Some(uses),
+    }
 }
 
 fn step_with_fields(step: &Mapping) -> Option<&Mapping> {
@@ -955,6 +1034,118 @@ fn step_is_exact_contextdb_sha_input_validation(step: &Mapping) -> bool {
             .is_some_and(|run| active_run_lines(run) == EXACT_CONTEXTDB_SHA_INPUT_VALIDATION_LINES)
 }
 
+fn job_verifies_selected_checkout(job: &Mapping) -> bool {
+    let steps = mapping_get(job, "steps")
+        .and_then(YamlValue::as_sequence)
+        .into_iter()
+        .flatten()
+        .filter_map(YamlValue::as_mapping)
+        .collect::<Vec<_>>();
+    let checkout = steps
+        .iter()
+        .position(|step| step_is_credential_free_context_graph_checkout(step));
+    let verification = steps
+        .iter()
+        .position(|step| step_is_exact_revision_verification(step));
+    matches!((checkout, verification), (Some(c), Some(v)) if c < v)
+}
+
+fn assert_selected_checkout_verification(workflow: &YamlValue) {
+    for job in [
+        "source",
+        "lint",
+        "docs",
+        "test",
+        "features",
+        "controls",
+        "feature-qualification-core",
+        "feature-qualification-sync",
+    ] {
+        assert!(
+            job_verifies_selected_checkout(
+                workflow["jobs"][job].as_mapping().expect("required job")
+            ),
+            "{job} must verify its selected checkout before running its commands"
+        );
+        let mut missing = workflow.clone();
+        let steps = missing["jobs"][job]["steps"]
+            .as_sequence_mut()
+            .expect("job steps");
+        let before = steps.len();
+        steps.retain(|step| {
+            !step
+                .as_mapping()
+                .is_some_and(step_is_exact_revision_verification)
+        });
+        assert_eq!(
+            steps.len() + 1,
+            before,
+            "remove exactly the revision verifier"
+        );
+        assert!(
+            !job_verifies_selected_checkout(
+                missing["jobs"][job].as_mapping().expect("required job")
+            ),
+            "removing verification from {job} must fail"
+        );
+        let mut wrong = workflow.clone();
+        let mut changed = false;
+        for step in wrong["jobs"][job]["steps"]
+            .as_sequence_mut()
+            .expect("job steps")
+        {
+            if step
+                .as_mapping()
+                .is_some_and(step_is_exact_revision_verification)
+            {
+                step["env"]["TESTED_SHA"] = YamlValue::String("${{ github.sha }}".to_string());
+                changed = true;
+            }
+        }
+        assert!(changed);
+        assert!(
+            !job_verifies_selected_checkout(wrong["jobs"][job].as_mapping().expect("required job")),
+            "verifying the merge event instead of the selected head must fail"
+        );
+    }
+    let root = workspace_root();
+    let head = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(&root)
+        .output()
+        .expect("read checkout revision");
+    assert!(head.status.success());
+    let head = String::from_utf8(head.stdout).expect("SHA text");
+    let head = head.trim();
+    let verifier = EXACT_REVISION_VERIFIER_LINES.join("\n");
+    for (tested, event, expected) in [
+        (head, "0".repeat(40), true),
+        (head, head.to_string(), true),
+        (
+            "0000000000000000000000000000000000000000",
+            head.to_string(),
+            false,
+        ),
+    ] {
+        let output = Command::new("bash")
+            .args(["-e", "-c", &verifier])
+            .current_dir(&root)
+            .env("TESTED_SHA", tested)
+            .env("EVENT_SHA", event)
+            .env("BASE_SHA", "")
+            .env("HEAD_SHA", tested)
+            .env("REQUESTED_CONTEXTDB_SHA", "")
+            .output()
+            .expect("execute the shipped revision verifier");
+        assert_eq!(
+            output.status.success(),
+            expected,
+            "the checkout must match the selected tested SHA for PR and push events: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
 fn step_is_exact_revision_verification(step: &Mapping) -> bool {
     mapping_get(step, "if").is_none()
         && !step_continue_on_error_can_mask_failures(step)
@@ -963,6 +1154,11 @@ fn step_is_exact_revision_verification(step: &Mapping) -> bool {
             .and_then(|env| mapping_get(env, "REQUESTED_CONTEXTDB_SHA"))
             .and_then(YamlValue::as_str)
             == Some("${{ inputs.contextdb_sha }}")
+        && mapping_get(step, "env")
+            .and_then(YamlValue::as_mapping)
+            .and_then(|env| mapping_get(env, "TESTED_SHA"))
+            .and_then(YamlValue::as_str)
+            == Some("${{ github.event.pull_request.head.sha || inputs.cg_sha || github.sha }}")
         && step_run(step).is_some_and(run_is_exact_revision_verifier)
 }
 
@@ -973,6 +1169,7 @@ fn step_is_context_graph_checkout(workflow: &YamlValue, job: &Mapping, step: &Ma
 
 fn step_pins_stable_rust_toolchain(workflow: &YamlValue, job: &Mapping, step: &Mapping) -> bool {
     step_uses(step) == Some("dtolnay/rust-toolchain@stable")
+        && step_with_field(step, "toolchain").and_then(YamlValue::as_str) == Some("1.94.1")
         && action_step_can_enforce_failure(workflow, job, step)
 }
 
@@ -1016,7 +1213,9 @@ fn prior_steps_prepare_audit_tools(
 }
 
 fn prior_step_can_precede_audit(workflow: &YamlValue, job: &Mapping, step: &Mapping) -> bool {
-    step_is_exact_contextdb_sha_input_validation(step)
+    (step_run(step).is_some_and(|run| active_run_lines(run) == VETTED_DISK_RECLAMATION_LINES)
+        && mapping_get(step, "if").and_then(YamlValue::as_str) == Some("runner.os == 'Linux'"))
+        || step_is_exact_contextdb_sha_input_validation(step)
         || step_is_exact_revision_verification(step)
         || step_is_context_graph_checkout(workflow, job, step)
         || step_pins_stable_rust_toolchain(workflow, job, step)
@@ -1686,7 +1885,135 @@ fn run_is_exact_revision_verifier(run: &str) -> bool {
     active_run_lines(run) == EXACT_REVISION_VERIFIER_LINES
 }
 
+const VETTED_GATE_WALL_CLOCK_MEASUREMENT_LINES: &[&str] = &[
+    "export CG_GATE_JUNIT=\"$repository_root/target/nextest/gate/junit.xml\"",
+    "default_baseline",
+    "rustup run 1.94.1 cargo test -p context-graph --test test_estate_audit gate_wall_seconds_never_exceed_the_frozen_baseline -- --ignored --exact",
+    "python3 scripts/check-gate-wall-clock.py --junit \"$CG_GATE_JUNIT\"",
+];
+
+fn line_has_unpinned_rustup_wrapper(line: &str) -> bool {
+    let words = line.split_whitespace().collect::<Vec<_>>();
+    words.first() == Some(&"rustup") && !words.starts_with(&["rustup", "run", "1.94.1", "cargo"])
+}
+
+fn assert_pinned_rustup_wrappers(workflow: &YamlValue) {
+    for lines in [
+        VETTED_COLD_MISS_MODEL_SEED_LINES,
+        VETTED_OFFLINE_REAL_MODEL_PROOF_LINES,
+        VETTED_GATE_WALL_CLOCK_MEASUREMENT_LINES,
+    ] {
+        let pinned = lines.join("\n");
+        assert!(run_is_vetted_command_lookup_run(&pinned));
+        for toolchain in ["stable", "nightly", "1.95.0", "$TOOLCHAIN"] {
+            let unknown = pinned.replace("rustup run 1.94.1", &format!("rustup run {toolchain}"));
+            assert!(
+                !run_is_vetted_command_lookup_run(&unknown),
+                "unknown wrappers are never vetted"
+            );
+            assert!(
+                all_run_shell_lines(&unknown)
+                    .into_iter()
+                    .any(line_has_unpinned_rustup_wrapper)
+            );
+        }
+    }
+    for toolchain in ["stable", "nightly", "1.95.0", "$TOOLCHAIN"] {
+        let mut unknown = workflow.clone();
+        let steps = unknown["jobs"]["test"]["steps"]
+            .as_sequence_mut()
+            .expect("test steps");
+        let mut changed = false;
+        for step in steps {
+            if step.as_mapping().and_then(step_run).is_some_and(|run| {
+                run == ci_stages::body(include_str!("../../../../scripts/gate.sh"), "model_seed")
+            }) {
+                let run = step["run"]
+                    .as_str()
+                    .expect("seed run")
+                    .replace("rustup run 1.94.1", &format!("rustup run {toolchain}"));
+                step["run"] = YamlValue::String(run);
+                changed = true;
+            }
+        }
+        assert!(changed, "the control must mutate the real seed step");
+        assert!(
+            workflow_command_lookup_can_mask_failures(&unknown),
+            "{toolchain} must fail the workflow scan"
+        );
+    }
+}
+
+fn assert_exact_python_blocks(workflow: &YamlValue) {
+    ci_stages::assert_exact_shared_commands(workflow, workflow_command_lookup_can_mask_failures);
+    for block in [VETTED_JOB_RECEIPT_RUN, REQUIRED_PR_JOB_AGGREGATE_RUN] {
+        assert!(run_is_vetted_command_lookup_run(block));
+        for altered in [
+            block.replace(
+                "import json, os",
+                "import json, os; os.environ['PATH'] = '/tmp/shadow'",
+            ),
+            format!("{block}python3 -c 'print(123)'\n"),
+        ] {
+            assert_ne!(
+                altered, block,
+                "the control must alter exact executable content"
+            );
+            assert!(
+                !run_is_vetted_command_lookup_run(&altered),
+                "changed Python bodies are not vetted"
+            );
+            let mut mutated = workflow.clone();
+            let mut changed = 0;
+            for (name, job) in mutated["jobs"].as_mapping_mut().expect("jobs map") {
+                if ci_stages::is_reusable_job(name, job) {
+                    continue;
+                }
+                for step in job["steps"].as_sequence_mut().expect("job steps") {
+                    if step["run"].as_str() == Some(block) {
+                        step["run"] = YamlValue::String(altered.clone());
+                        changed += 1;
+                    }
+                }
+            }
+            assert!(
+                changed > 0,
+                "the control must mutate a shipped Python block"
+            );
+            assert!(
+                workflow_command_lookup_can_mask_failures(&mutated),
+                "changed receipt or aggregate bodies must be rejected"
+            );
+        }
+    }
+    let mut unknown = workflow.clone();
+    let mut interpreter_step = Mapping::new();
+    interpreter_step.insert(
+        YamlValue::String("run".to_string()),
+        YamlValue::String("python3 -c 'print(123)'".to_string()),
+    );
+    unknown["jobs"]["lint"]["steps"]
+        .as_sequence_mut()
+        .expect("lint steps")
+        .push(YamlValue::Mapping(interpreter_step));
+    assert!(
+        workflow_command_lookup_can_mask_failures(&unknown),
+        "an unrelated interpreter step remains rejected"
+    );
+    let disk = VETTED_DISK_RECLAMATION_LINES.join("\n");
+    assert!(run_is_vetted_command_lookup_run(&disk));
+    assert!(!run_is_vetted_command_lookup_run(&format!(
+        "{disk}\npython3 -c 'print(123)'"
+    )));
+}
+
 fn run_is_vetted_command_lookup_run(run: &str) -> bool {
+    if ci_stages::exact_shared_command(run) {
+        return true;
+    }
+    if run == VETTED_JOB_RECEIPT_RUN || run == REQUIRED_PR_JOB_AGGREGATE_RUN {
+        return true;
+    }
     let lines = active_run_lines(run);
     lines == EXACT_CONTEXTDB_SHA_INPUT_VALIDATION_LINES
         || lines == EXACT_REVISION_VERIFIER_LINES
@@ -1695,6 +2022,8 @@ fn run_is_vetted_command_lookup_run(run: &str) -> bool {
         || lines == VETTED_OFFLINE_REAL_MODEL_PROOF_LINES
         || lines == VETTED_DOCUMENTATION_CLAIM_VALIDATION_LINES
         || lines == VETTED_GATE_WALL_CLOCK_BASELINE_DIRECTION_LINES
+        || lines == VETTED_GATE_WALL_CLOCK_MEASUREMENT_LINES
+        || lines == VETTED_DISK_RECLAMATION_LINES
 }
 
 fn run_is_vetted_gate_wall_clock_baseline_direction_run(run: &str) -> bool {
@@ -1749,8 +2078,90 @@ fn run_contains_consecutive_lines(run: &str, expected: &[&str]) -> bool {
         .any(|window| window == expected)
 }
 
+/// CI audits the dependency graph and verifies the selected checkout in every required job.
 #[test]
 fn ci_runs_cargo_deny_and_cargo_expand_symbol_check() {
+    assert!(run_invokes_deny_against_workspace_config(
+        "cargo deny --config deny.toml check"
+    ));
+    assert!(run_invokes_deny_against_workspace_config(
+        "cargo deny -c deny.toml check"
+    ));
+    for rejected in [
+        "cargo deny check --config deny.toml",
+        "cargo deny check -c deny.toml",
+        "cargo deny check",
+        "cargo deny --config other.toml check",
+        "cargo deny --config deny.toml check || true",
+        "cargo deny --config deny.toml check --exclude banned",
+    ] {
+        assert!(
+            !run_invokes_deny_against_workspace_config(rejected),
+            "the dependency audit must reject {rejected}"
+        );
+    }
+
+    let workflow: YamlValue =
+        serde_yaml_ng::from_str(include_str!("../../../../.github/workflows/ci.yml"))
+            .expect("workflow YAML");
+    let workflow = ci_stages::platform_coverage(
+        workflow,
+        serde_yaml_ng::from_str(include_str!(
+            "../../../../.github/workflows/macos-advisory.yml"
+        ))
+        .expect("advisory yaml"),
+    );
+    assert!(ci_stages::controls_are_required(&workflow));
+    for mutation in [
+        "platform",
+        "setup",
+        "full command",
+        "optional",
+        "source",
+        "admission",
+    ] {
+        let mut changed = workflow.clone();
+        match mutation {
+            "platform" => changed["jobs"]["controls"]["strategy"]["matrix"]["os"] = YamlValue::Null,
+            "setup" => {
+                changed["jobs"]["controls"]["steps"][3]["run"] = YamlValue::String("true".into())
+            }
+            "full command" => {
+                changed["jobs"]["controls"]["steps"][4]["run"] =
+                    YamlValue::String(format!("{} StageEvidence", ci_stages::CONTROLS_RUN))
+            }
+            "optional" => changed["jobs"]["controls"]["continue-on-error"] = YamlValue::Bool(true),
+            "source" => {
+                changed["jobs"]["controls"]["steps"][1]["with"]["ref"] =
+                    YamlValue::String("${{ github.sha }}".into())
+            }
+            _ => changed["jobs"]["required"]["needs"] = YamlValue::Null,
+        }
+        assert!(
+            !ci_stages::controls_are_required(&changed),
+            "{mutation} must fail the controls contract"
+        );
+    }
+    for run in [ci_stages::CONTROLS_SETUP, ci_stages::CONTROLS_RUN] {
+        assert!(ci_stages::exact_controls_command(run));
+        assert!(!ci_stages::exact_controls_command(&format!("{run}; true")));
+        assert!(!ci_stages::exact_controls_command(&format!(
+            "{run} StageEvidence"
+        )));
+    }
+    assert_selected_checkout_verification(&read_workflow_yaml());
+    assert_pinned_rustup_wrappers(&read_workflow_yaml());
+    assert!(allowed_model_cache_path(
+        cg_catalog::DEFAULT_CACHE_ROOT_LINUX_MACOS
+    ));
+    assert!(allowed_model_cache_path(
+        &cg_catalog::DEFAULT_CACHE_ROOT_WINDOWS.replace('\\', "/")
+    ));
+    assert!(
+        !allowed_model_cache_path("~/.cache/cg/embedders"),
+        "the unsupported cache root is not read by the loader"
+    );
+
     assert_no_cargo_audit_aliases();
     let yaml = read_workflow_yaml();
     let steps = workflow_steps(&yaml);
@@ -1820,92 +2231,245 @@ fn ci_runs_cargo_deny_and_cargo_expand_symbol_check() {
     }
 }
 
+fn ci_job_steps(job: &Mapping) -> Vec<&Mapping> {
+    mapping_get(job, "steps")
+        .and_then(YamlValue::as_sequence)
+        .into_iter()
+        .flatten()
+        .filter_map(YamlValue::as_mapping)
+        .collect()
+}
+
+fn split_ci_prerequisites_are_enforced(workflow: &YamlValue) -> bool {
+    let Some(jobs) = value_mapping_get(workflow, "jobs").and_then(YamlValue::as_mapping) else {
+        return false;
+    };
+    let (Some(lint), Some(tests), Some(required)) = (
+        mapping_get(jobs, "lint").and_then(YamlValue::as_mapping),
+        mapping_get(jobs, "test").and_then(YamlValue::as_mapping),
+        mapping_get(jobs, "required").and_then(YamlValue::as_mapping),
+    ) else {
+        return false;
+    };
+    let lint_steps = ci_job_steps(lint);
+    let test_steps = ci_job_steps(tests);
+    let audit_index = lint_steps.iter().position(|step| {
+        step_enforcing_run(workflow, lint, step).is_some_and(run_is_vetted_audit_run)
+    });
+    let lint_index = lint_steps.iter().position(|step| {
+        step_enforcing_run(workflow, lint, step).is_some_and(|run| {
+            run.trim() == "rustup run 1.94.1 cargo clippy --workspace --all-targets -- -D warnings"
+        })
+    });
+    let test_index = test_steps.iter().position(|step| {
+        step_enforcing_run(workflow, tests, step)
+            .is_some_and(|run| run.trim() == "rustup run 1.94.1 cargo test --workspace --no-run")
+    });
+    let baseline_index = test_steps.iter().position(|step| {
+        step_enforcing_run(workflow, tests, step)
+            .is_some_and(run_is_vetted_gate_wall_clock_baseline_direction_run)
+    });
+    if !matches!((audit_index, lint_index), (Some(a), Some(l)) if a < l)
+        || !matches!((test_index, baseline_index), (Some(t), Some(b)) if t < b)
+    {
+        return false;
+    }
+    for job_steps in [&lint_steps, &test_steps] {
+        if !job_steps.iter().any(|step| {
+            step_is_credential_free_context_graph_checkout(step)
+                && step_with_field(step, "ref").and_then(YamlValue::as_str)
+                    == Some(
+                        "${{ github.event.pull_request.head.sha || inputs.cg_sha || github.sha }}",
+                    )
+        }) || !job_steps
+            .iter()
+            .any(|step| step_is_exact_revision_verification(step))
+        {
+            return false;
+        }
+    }
+    let needs = mapping_get(required, "needs")
+        .and_then(YamlValue::as_sequence)
+        .and_then(|needs| {
+            needs
+                .iter()
+                .map(YamlValue::as_str)
+                .collect::<Option<Vec<_>>>()
+        });
+    let Some(mut needs) = needs else {
+        return false;
+    };
+    needs.sort_unstable();
+    if needs
+        != [
+            "controls",
+            "docs",
+            "feature-qualification-core",
+            "feature-qualification-sync",
+            "features",
+            "lint",
+            "source",
+            "test",
+        ]
+        || mapping_get(required, "if").and_then(YamlValue::as_str) != Some("always()")
+        || job_continue_on_error_can_mask_failures(required)
+    {
+        return false;
+    }
+    ci_job_steps(required).iter().any(|step| {
+        step_run(step).is_some_and(|run| run.trim() == REQUIRED_PR_JOB_AGGREGATE_RUN.trim())
+            && !step_if_field_can_disable_guard(step)
+            && !step_continue_on_error_can_mask_failures(step)
+            && mapping_get(step, "env")
+                .and_then(YamlValue::as_mapping)
+                .and_then(|env| mapping_get(env, "NEEDS_JSON"))
+                .and_then(YamlValue::as_str)
+                == Some("${{ toJSON(needs) }}")
+    })
+}
+
+fn remove_ci_steps(workflow: &mut YamlValue, job_name: &str, predicate: impl Fn(&str) -> bool) {
+    let steps = workflow["jobs"][job_name]["steps"]
+        .as_sequence_mut()
+        .expect("job steps");
+    let before = steps.len();
+    steps.retain(|step| !step.as_mapping().and_then(step_run).is_some_and(&predicate));
+    assert!(steps.len() < before, "the control must remove a real step");
+}
+
+/// Audit, lint and workspace tests share the selected revision and remain required across jobs.
 #[test]
 fn ci_command_lookup_audit_covers_mutations_after_dependency_audit_and_before_workspace_tests() {
-    let mut yaml = read_workflow_yaml();
+    assert_exact_python_blocks(&read_workflow_yaml());
+    let yaml = read_workflow_yaml();
     assert!(
         !workflow_command_lookup_can_mask_failures(&yaml),
         "the checked-in workflow must start without a command-lookup mutation"
     );
-
-    let mutation_run = "printf '%s\\n' \"$RUNNER_TEMP/shadow-bin\" >> \"$GITHUB_PATH\"";
     assert!(
-        shell_line_mutates_command_lookup(mutation_run),
-        "the audit's line classifier must recognize the injected GITHUB_PATH mutation"
+        split_ci_prerequisites_are_enforced(&yaml),
+        "audit precedes lint, tests precede baseline inspection, both verify the same selected checkout, and the aggregate requires both"
     );
 
-    let jobs = yaml
-        .as_mapping_mut()
-        .and_then(|workflow| workflow.get_mut(YamlValue::String("jobs".to_string())))
-        .and_then(YamlValue::as_mapping_mut)
-        .expect("workflow jobs map");
-    let mut injected = false;
-    for job_value in jobs.values_mut() {
-        let Some(steps) = job_value
-            .as_mapping_mut()
-            .and_then(|job| job.get_mut(YamlValue::String("steps".to_string())))
-            .and_then(YamlValue::as_sequence_mut)
-        else {
-            continue;
-        };
-        let audit_index = steps.iter().position(|step| {
-            step.as_mapping()
-                .and_then(step_run)
-                .is_some_and(run_is_vetted_audit_run)
-        });
-        let lint_index = steps.iter().position(|step| {
-            step.as_mapping().and_then(step_run).is_some_and(|run| {
-                run.trim()
-                    == "rustup run stable cargo clippy --workspace --all-targets -- -D warnings"
-            })
-        });
-        let workspace_test_index = steps.iter().position(|step| {
-            step.as_mapping()
-                .and_then(step_run)
-                .is_some_and(|run| run.trim() == "rustup run stable cargo test --workspace")
-        });
-        let (Some(audit_index), Some(lint_index), Some(workspace_test_index)) =
-            (audit_index, lint_index, workspace_test_index)
-        else {
-            continue;
-        };
-        assert!(
-            audit_index < lint_index && lint_index < workspace_test_index,
-            "the real workflow fixture must place dependency audit before lint and workspace tests"
-        );
-        let baseline_direction_index = steps.iter().position(|step| {
-            step.as_mapping()
-                .and_then(step_run)
-                .is_some_and(run_is_vetted_gate_wall_clock_baseline_direction_run)
+    for (job, command) in [
+        ("lint", "cargo deny --config deny.toml check"),
+        (
+            "lint",
+            "cargo clippy --workspace --all-targets -- -D warnings",
+        ),
+        ("test", "cargo test --workspace"),
+    ] {
+        let mut missing = yaml.clone();
+        remove_ci_steps(&mut missing, job, |run| {
+            if job == "test" {
+                run.trim() == "rustup run 1.94.1 cargo test --workspace --no-run"
+            } else {
+                run.contains(command)
+            }
         });
         assert!(
-            baseline_direction_index.is_some_and(|index| index > workspace_test_index),
-            "the real workflow fixture must run the gate wall-clock baseline-direction check \
-             (python3 scripts/check-gate-wall-clock.py --base) after cargo test --workspace"
+            !split_ci_prerequisites_are_enforced(&missing),
+            "removing {command} from {job} must fail the prerequisites"
         );
+    }
+    for job in ["lint", "test", "controls"] {
+        let mut missing_need = yaml.clone();
+        missing_need["jobs"]["required"]["needs"]
+            .as_sequence_mut()
+            .expect("aggregate needs")
+            .retain(|need| need.as_str() != Some(job));
+        assert!(!split_ci_prerequisites_are_enforced(&missing_need));
+    }
+    let mut wrong_checkout = yaml.clone();
+    for step in wrong_checkout["jobs"]["test"]["steps"]
+        .as_sequence_mut()
+        .expect("test steps")
+    {
+        if step
+            .as_mapping()
+            .is_some_and(step_is_credential_free_context_graph_checkout)
+        {
+            step["with"]["ref"] = YamlValue::String("${{ github.sha }}".to_string());
+        }
+    }
+    assert!(!split_ci_prerequisites_are_enforced(&wrong_checkout));
 
+    let aggregate_code = REQUIRED_PR_JOB_AGGREGATE_RUN
+        .strip_prefix("python3 - <<'PY_CHECK'\n")
+        .and_then(|run| run.strip_suffix("PY_CHECK\n"))
+        .expect("exact aggregate Python block");
+    let success = serde_json::json!({
+        "source": {"result": "success"}, "lint": {"result": "success"},
+        "docs": {"result": "success"}, "test": {"result": "success"},
+        "features": {"result": "success"}, "controls": {"result": "success"},
+        "feature-qualification-core": {"result": "success"}, "feature-qualification-sync": {"result": "success"}
+    });
+    let evaluate = |needs: &serde_json::Value| {
+        Command::new("python3")
+            .args(["-I", "-c", aggregate_code])
+            .env("NEEDS_JSON", needs.to_string())
+            .output()
+            .expect("evaluate the shipped aggregate")
+            .status
+            .success()
+    };
+    assert!(evaluate(&success));
+    for job in ["lint", "test", "controls"] {
+        let mut missing = success.clone();
+        missing.as_object_mut().expect("needs map").remove(job);
+        assert!(!evaluate(&missing), "missing {job} must fail the aggregate");
+        for result in ["failure", "cancelled", "skipped"] {
+            let mut failed = success.clone();
+            failed[job]["result"] = serde_json::Value::String(result.to_string());
+            assert!(!evaluate(&failed), "{job} {result} must fail the aggregate");
+        }
+    }
+    let mut unexpected = success;
+    unexpected["extra"] = serde_json::json!({"result": "success"});
+    assert!(!evaluate(&unexpected));
+
+    let mutation_run = "printf '%s\\n' \"$RUNNER_TEMP/shadow-bin\" >> \"$GITHUB_PATH\"";
+    assert!(shell_line_mutates_command_lookup(mutation_run));
+    for (job, command, after) in [
+        (
+            "lint",
+            "rustup run 1.94.1 cargo clippy --workspace --all-targets -- -D warnings",
+            true,
+        ),
+        (
+            "test",
+            "rustup run 1.94.1 cargo test --workspace --no-run",
+            false,
+        ),
+    ] {
+        let mut mutated = yaml.clone();
+        let steps = mutated["jobs"][job]["steps"]
+            .as_sequence_mut()
+            .expect("job steps");
+        let index = steps
+            .iter()
+            .position(|step| {
+                step.as_mapping()
+                    .and_then(step_run)
+                    .is_some_and(|run| run.trim() == command)
+            })
+            .expect("the guarded command must run");
+        let index = index + usize::from(after);
         let mut mutation_step = Mapping::new();
         mutation_step.insert(
             YamlValue::String("run".to_string()),
             YamlValue::String(mutation_run.to_string()),
         );
-        steps.insert(workspace_test_index, YamlValue::Mapping(mutation_step));
+        steps.insert(index, YamlValue::Mapping(mutation_step));
         assert_eq!(
-            steps[workspace_test_index].as_mapping().and_then(step_run),
-            Some(mutation_run),
-            "the mutation must sit immediately before cargo test --workspace"
+            steps[index].as_mapping().and_then(step_run),
+            Some(mutation_run)
         );
-        injected = true;
-        break;
+        assert!(
+            workflow_command_lookup_can_mask_failures(&mutated),
+            "command lookup mutation in {job} must fail"
+        );
     }
-    assert!(
-        injected,
-        "the real workflow must expose one job containing dependency audit, lint, and workspace tests"
-    );
-    assert!(
-        workflow_command_lookup_can_mask_failures(&yaml),
-        "the command-lookup audit must inspect the whole job and reject a GITHUB_PATH mutation inserted after dependency audit and between lint and cargo test --workspace"
-    );
 }
 
 #[test]
@@ -2007,6 +2571,9 @@ fn nomic_loads_existing_acceptance_tests_remain_registered_with_catalog_workspac
         "cg_main_crate_has_no_embeddinggemma_runtime_code_grep_audit_against_cargo_expanded_source_plus_no_embeddinggemma_transitive_dep_in_cargo_tree",
         "cargo_tree_for_context_graph_default_dep_graph_carries_no_native_dep_sys_crates_no_python_runtime_no_api_key_dep",
     ] {
-        assert!(!tests.contains(retired), "retired audit still registered");
+        assert!(
+            !tests.contains(retired),
+            "unsupported audit remains registered"
+        );
     }
 }

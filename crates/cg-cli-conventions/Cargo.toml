@@ -1,8 +1,11 @@
 [package]
+keywords.workspace = true
+categories.workspace = true
 name = "cg-cli-conventions"
 version.workspace = true
 edition = "2024"
 license.workspace = true
+description = "Shared command reports, findings, and severity conventions for Context Graph"
 repository.workspace = true
 
 [dependencies]

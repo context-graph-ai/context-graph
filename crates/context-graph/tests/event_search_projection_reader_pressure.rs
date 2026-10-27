@@ -1,9 +1,8 @@
 //! A projection run keeps committing while direct readers continuously open, read status, and drop
 //! their Store views.
 //!
-//! Split from `event_search_projection_correctness.rs` into its own test binary: this reader
-//! pressure test alone peaks near 3 GB of resident memory, and sharing a binary with the other
-//! correctness tests pushed that binary past the per-binary memory cap.
+//! This reader-pressure test runs in its own binary to keep its roughly 3 GB peak resident
+//! memory separate from other correctness fixtures.
 
 #![cfg(context_graph_internal_test_support)]
 

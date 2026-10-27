@@ -2,8 +2,7 @@
 //! words `search_document:` / `search_query:` is never inspected or rejected for that reason: the
 //! preparer still adds exactly one system-added prefix outside the untouched content, so the
 //! literal words end up appearing twice in the model input — the system-added instruction first,
-//! the caller's own content second. A later retrieval proof covers the "searchable" half end to
-//! end; the preparer never special-cases this content.
+//! the caller's own content second. The preparer never special-cases this content.
 //!
 //! The proof compares VECTORS, not a token-count proxy: `embed_prepared_*`'s output must
 //! equal the same cached model's plain `embed` output over the exact reference string (one

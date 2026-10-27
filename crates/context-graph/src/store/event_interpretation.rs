@@ -513,6 +513,10 @@ fn persist_gap_page(
     Ok(())
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "ContextDB keeps typed refusal details inline so error propagation needs no allocation."
+)]
 fn persist_gap_link(
     store: &Store,
     context_id: ContextId,

@@ -1,8 +1,8 @@
-//! Connected-by-default capture context on the refactored harness path.
+//! Connected-by-default capture context on the shared extraction path.
 //!
 //! Capturing with only a tenant supplied (no explicit context) from two different
 //! working directories must land both captures in the SAME tenant context — the
-//! working directory plays no role. This drives the new harness path and reads the
+//! working directory plays no role. This drives the capture path and reads the
 //! persisted rows back at the store boundary, so a plain in-memory map could not
 //! satisfy it: the context_id is a property of the committed graph.
 
@@ -11,8 +11,8 @@ use context_graph::ingest::CaptureRequest;
 use context_graph::{ContextId, Store, StoreConfig};
 use contextdb_core::Value as DbValue;
 
+use super::action_test_extractors::SpanFaithfulExtractor;
 use super::fake_extractor::open_store_with_lexical_embedder;
-use super::refactor_extractor::SpanFaithfulExtractor;
 
 fn fresh_store() -> (tempfile::TempDir, Store) {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -66,7 +66,7 @@ fn persisted_decision_context(store: &Store, decision_text: &str) -> ContextId {
 }
 
 #[test]
-fn refactored_capture_context_defaults_to_tenant_not_working_directory() {
+fn capture_context_defaults_to_tenant_not_working_directory() {
     let (_dir, store) = fresh_store();
 
     let cwd_a = "/home/dev/project-a";

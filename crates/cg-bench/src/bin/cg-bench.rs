@@ -1,7 +1,7 @@
 //! The correctness bench runner: drives the REAL `cg`
 //! binaries (import + understand — the production path, never a side harness), reads each
 //! session's extraction back through the library, scores it against the curated gold
-//! with the frozen method (production nomic embedder cosine; gray zone ROUTED OUT to a file for
+//! with the scoring method (production nomic embedder cosine; gray zone ROUTED OUT to a file for
 //! adjudication, never auto-decided), and appends a variant row to the report.
 //!
 //! Usage:
@@ -158,7 +158,7 @@ fn main() {
         per_session.push((prefix, score, gold));
     }
 
-    // Aggregate per the frozen method: micro-averaged over items; intention fidelity over
+    // Aggregate per the scoring method: micro-averaged over items; intention fidelity over
     // sessions; type accuracy over matched entities.
     let sessions_n = per_session.len().max(1);
     let intention_fidelity = per_session
@@ -213,7 +213,7 @@ fn main() {
     });
     let mut rendered = report.render_markdown();
     rendered.push_str(
-        "\nNOTES (reading rules, frozen method): this table is LOWER-BOUND diagnostics — \
+        "\nNOTES (reading rules, scoring method): this table is LOWER-BOUND diagnostics — \
          auto-matches (cosine >= 0.75) only; gray-zone pairs are routed to the adjudication \
          file and NOT counted here; no verdict is final before adjudication + the manual \
          sample. `attach` is structurally 0 until adjudicated intention equivalence is applied \

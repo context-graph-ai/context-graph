@@ -76,6 +76,7 @@ fn seed_candidate(
 #[test]
 fn vector_search_with_context_id_in_filter_explain_uses_indexed_scan_filter_intersect_not_post_filter()
  {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let db_path =
         std::env::temp_dir().join(format!("explain-introspection-{}.db", uuid::Uuid::now_v7()));
     let store = Store::open(StoreConfig {
@@ -265,6 +266,7 @@ fn vector_search_with_context_id_in_filter_explain_uses_indexed_scan_filter_inte
 
 #[test]
 fn embeddinggemma_disabled_config_returns_typed_error_not_zero_vector() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let embedder = EmbeddingGemmaTextEmbedder::new(EmbedderConfig::disabled());
     let first = embedder.embed(EmbeddingInput::Text("same input".to_string()));
     let second = embedder.embed(EmbeddingInput::Text("same input".to_string()));

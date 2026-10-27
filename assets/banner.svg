@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="280" viewBox="0 0 1200 280" role="img" aria-labelledby="title desc">
+<title id="title">context-graph</title><desc id="desc">Memory with evidence: connect what was said to what a choice relied on.</desc>
+<rect width="1200" height="280" rx="18" fill="#101b2c"/>
+<g stroke="#53c6bb" stroke-width="3" fill="none"><path d="M900 78L1020 140L900 202L790 140Z"/><path d="M900 78V202M790 140H1020"/></g>
+<g fill="#53c6bb"><circle cx="900" cy="78" r="10"/><circle cx="1020" cy="140" r="10"/><circle cx="900" cy="202" r="10"/><circle cx="790" cy="140" r="10"/></g>
+<text x="64" y="126" fill="#f0f5fb" font-family="sans-serif" font-size="56" font-weight="700">context-graph</text>
+<text x="68" y="180" fill="#aebed2" font-family="sans-serif" font-size="24">Memory with evidence</text>
+</svg>

@@ -2,8 +2,7 @@
 //!
 //! Four integration tests asserting that `SchemaDescriptor` drives both the prompt schema
 //! block and the parse targets from one source (non-drift), and that `CaptureHarnessConfig`
-//! knobs are honored end-to-end. Every assertion fails on a placeholder value, never on a
-//! compile error or panic.
+//! knobs are honored end-to-end.
 
 use context_graph::harness::{
     CaptureHarnessConfig, SchemaDescriptor, SchemaFieldSpec, run_capture,
@@ -11,8 +10,8 @@ use context_graph::harness::{
 use context_graph::ingest::CaptureRequest;
 use context_graph::{EntityType, ListEntityFilter, Store, StoreConfig};
 
+use super::action_test_extractors::{CountingExtractor, SpanFaithfulExtractor};
 use super::fake_extractor::open_store_with_lexical_embedder;
-use super::refactor_extractor::{CountingExtractor, SpanFaithfulExtractor};
 
 // ---------------------------------------------------------------------------
 // Fixture helpers
@@ -28,14 +27,9 @@ fn fresh_store() -> (tempfile::TempDir, Store) {
     (dir, store)
 }
 
-// ---------------------------------------------------------------------------
-// Test 1 (single-source): placeholder returns hardcoded strings from
-// `render_prompt_schema_block()` and `parse_targets()` that are independent of
-// `self.fields`. Mutating `fields` proves they are a single-derived source: the mutated
-// field name must appear in BOTH the rendered string AND the parse target list.
-// ---------------------------------------------------------------------------
 #[test]
 fn prompt_schema_block_and_parser_derive_from_one_descriptor() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let mut descriptor = SchemaDescriptor::default();
 
     // ------ invariant: every field that is in the descriptor is in BOTH outputs ------
@@ -63,8 +57,6 @@ fn prompt_schema_block_and_parser_derive_from_one_descriptor() {
         );
     }
 
-    // ------ mutation arm: ADD a new field — must appear in BOTH outputs ------
-    // Placeholder: hardcoded lists do not update on mutation → fails here.
     descriptor.fields.push(SchemaFieldSpec {
         name: "new_field".to_string(),
         description: "a freshly added field".to_string(),
@@ -77,12 +69,12 @@ fn prompt_schema_block_and_parser_derive_from_one_descriptor() {
     assert!(
         block_after_add.contains("new_field"),
         "rendered schema block does not contain 'new_field' after it was added to descriptor \
-         — wrong stub: render_prompt_schema_block() is hardcoded, not derived from fields"
+         — the rendered prompt must derive from fields"
     );
     assert!(
         targets_after_add.contains(&"new_field".to_string()),
         "parse targets do not contain 'new_field' after it was added to descriptor \
-         — wrong stub: parse_targets() is hardcoded, not derived from fields"
+         — parse targets must derive from fields"
     );
 
     // ------ mutation arm: REMOVE a field — must disappear from BOTH outputs ------
@@ -105,22 +97,13 @@ fn prompt_schema_block_and_parser_derive_from_one_descriptor() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Test 2 (single-source): `CaptureHarnessConfig.recall_limit` bounds the candidate set
-// passed to the judge. Placeholder run_capture ignores recall_limit and passes the WHOLE
-// store as candidates.
 //
 // Primary load-bearing assertion: when recall_limit=2 and >2 prior decisions are in the
-// store, every received_candidate_sets() entry must have ≤2 items. Placeholder passes all
-// prior decisions → entries exceed 2 → assertion FAILS.
-//
-// Setup: seed 3 prior decisions (capture 3 times, each with a decision), then capture a
-// fourth time with recall_limit=Some(2) using a CountingExtractor. The placeholder
-// passes all 3 prior decisions to the judge (3 > 2), failing the ≤2 bound check.
-// ---------------------------------------------------------------------------
+// store, every received_candidate_sets() entry must have ≤2 items.
 #[test]
 fn capture_harness_config_threads_prompt_overrides_and_recall_limit_and_window_and_tier_and_skill_switch()
  {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let (_dir, store) = fresh_store();
 
     // Seed >2 prior decisions so recall_limit has something to bound.
@@ -148,9 +131,7 @@ fn capture_harness_config_threads_prompt_overrides_and_recall_limit_and_window_a
         review_mode: false,
         prompt_override: None,
         tier: Some("haiku".to_string()),
-        // The config grew additive fields (item_caps,
-        // entity_vocabulary, chunk_overlap); this exhaustive literal takes their defaults.
-        // Minimal frozen-file edit in its own commit — every assertion below is unchanged.
+        // Optional config fields take their defaults.
         ..CaptureHarnessConfig::default()
     };
 
@@ -170,11 +151,6 @@ fn capture_harness_config_threads_prompt_overrides_and_recall_limit_and_window_a
     )
     .expect("run_capture with recall_limit must succeed");
 
-    // Primary load-bearing assertion: each judge call must have received a candidate set
-    // bounded to ≤ recall_limit (2). Placeholder ignores recall_limit and passes all
-    // 3 prior decisions → each entry has len=3 > 2 → assertion FAILS.
-    // Also requires at least one judge call (the 4th capture has 1 decision in harvest,
-    // and 3 prior decisions exist, so placeholder behavior 2 calls the judge once with all 3).
     let received = counter.received_candidate_sets();
     assert!(
         !received.is_empty(),
@@ -186,7 +162,7 @@ fn capture_harness_config_threads_prompt_overrides_and_recall_limit_and_window_a
         assert!(
             candidate_set.len() <= 2,
             "judge call #{i}: candidate set must be bounded to ≤ recall_limit (2); \
-             wrong run_capture passed {} candidates (ignores recall_limit)",
+             observed {} candidates",
             candidate_set.len()
         );
     }
@@ -252,7 +228,7 @@ fn capture_harness_config_threads_prompt_overrides_and_recall_limit_and_window_a
 
     // CHUNK_WINDOW: a small window over a multi-segment transcript must drive chunking — more than
     // one Stage-1 extraction call. run_capture that ignores chunk_window extracts the whole
-    // transcript in ONE call → this fails (RED), exposing the unthreaded knob.
+    // transcript in ONE call → this fails , exposing the unthreaded knob.
     let (_w_dir, window_store) = fresh_store();
     let window_counter = CountingExtractor::new(SpanFaithfulExtractor);
     let long_transcript = (0..8)
@@ -285,23 +261,15 @@ fn capture_harness_config_threads_prompt_overrides_and_recall_limit_and_window_a
     );
 }
 
-// NOTE: `cli_capture_is_a_thin_caller_of_the_library_harness` moved to
-// `crates/cg-cli/tests/llm_client_refactor_cli.rs` — proving the CLI capture path produces a graph
-// identical to `run_capture` requires invoking the ACTUAL `cg` binary, reachable only from the
-// cg-cli crate (CARGO_BIN_EXE_cg + FakeProviderRig). The library-only consumer contract stays here
-// as `library_embedder_reaches_capture_without_the_cli` below.
+// CLI capture equivalence is exercised in crates/cg-cli/tests/understanding_actions_cli.rs.
+// The library-only embedding contract is exercised below.
 
 // ---------------------------------------------------------------------------
 // Test (single-source): A library consumer (vigil-style, opening `Store` directly) can
 // reach the FULL ontology contract without any cg-cli on the path.
-//
-// Primary load-bearing store assertion: a "type=module" entity must be stored as
-// EntityType::Module (not File). Placeholder run_capture uses the placeholder
-// From<ExtractedEntityType> mapping (Module→File) → stored entity_type is File →
-// assertion FAILS. This proves a library consumer reaches the full-ontology contract.
-// ---------------------------------------------------------------------------
 #[test]
 fn library_embedder_reaches_capture_without_the_cli() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     // Open the store directly — no CLI, no cg-cli import.
     let dir = tempfile::tempdir().expect("tempdir");
     let store = open_store_with_lexical_embedder(StoreConfig {
@@ -312,7 +280,7 @@ fn library_embedder_reaches_capture_without_the_cli() {
 
     let config = CaptureHarnessConfig::default();
 
-    // Use type=module to expose the wrong From mapping (Module→File).
+    // Use type=module to verify conversion preserves the Module variant.
     let (report, harness_report) = run_capture(
         &store,
         CaptureRequest {
@@ -347,11 +315,6 @@ fn library_embedder_reaches_capture_without_the_cli() {
          got 0 entities"
     );
 
-    // Primary load-bearing store assertion: the module entity must be stored as
-    // EntityType::Module. Placeholder From<ExtractedEntityType> maps Module→File →
-    // entity_type == EntityType::File ≠ EntityType::Module → FAILS.
-    // This is the deepest library-consumer contract: the full ontology is reachable
-    // without the CLI, and entity types must be correct.
     let module_entity = entities.iter().find(|e| e.name.contains("lib-module"));
     assert!(
         module_entity.is_some(),
@@ -362,7 +325,7 @@ fn library_embedder_reaches_capture_without_the_cli() {
             e.entity_type,
             EntityType::Module,
             "entity '{}' captured with type=module via direct library path must be stored as \
-             EntityType::Module; wrong From<ExtractedEntityType> maps Module→File → stored as {:?}",
+             EntityType::Module; stored as {:?}",
             e.name,
             e.entity_type
         );

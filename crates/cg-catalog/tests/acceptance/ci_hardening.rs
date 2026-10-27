@@ -1,3 +1,9 @@
+#[path = "../../../context-graph/tests/common/ci_stages.rs"]
+mod ci_stages;
+use ci_stages::{
+    REQUIRED_PR_JOB_AGGREGATE_RUN, VETTED_DISK_RECLAMATION_LINES, VETTED_JOB_RECEIPT_RUN,
+};
+
 use std::fs;
 use std::process::Command;
 
@@ -38,6 +44,7 @@ const ALLOWED_ADVISORY_IGNORES: &[&str] = &[
     // host at build time, never linked into a shipped artifact; no upgrade path
     // until bao-tree/genawaiter drop it.
     "RUSTSEC-2024-0370",
+    "RUSTSEC-2024-0449",
 ];
 const CARGO_AUDIT_ALIASES: &[&str] = &["deny", "expand"];
 const COMMAND_LOOKUP_ENV_KEYS: &[&str] = &["PATH", "BASH_ENV", "ENV", "SHELLOPTS", "IFS"];
@@ -63,6 +70,7 @@ const AUDIT_CAPTURE_PATHS: &[&str] = &[
     "$RUNNER_TEMP/context-graph-tree.txt",
 ];
 const COMMAND_LOOKUP_SAFE_ACTIONS: &[&str] = &[
+    "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
     "actions/checkout@v4",
     "actions/cache@v4",
     "dtolnay/rust-toolchain@stable",
@@ -139,16 +147,17 @@ const EXACT_REVISION_VERIFIER_LINES: &[&str] = &[
     "echo \"Context Graph checkout and locked ContextDB revision must be immutable 40-character commit SHAs\" >&2",
     "exit 1",
     "fi",
-    "if [[ \"$context_graph_sha\" != \"$GITHUB_SHA\" ]]; then",
-    "echo \"checked-out Context Graph SHA does not match GITHUB_SHA\" >&2",
+    "if [[ \"$context_graph_sha\" != \"$TESTED_SHA\" ]]; then",
+    "echo \"checked-out Context Graph SHA does not match selected tested SHA\" >&2",
     "exit 1",
     "fi",
-    "if [[ \"${{ github.event_name }}\" == \"workflow_dispatch\" ]] && [[ \"$contextdb_sha\" != \"$REQUESTED_CONTEXTDB_SHA\" ]]; then",
+    "if [[ -n \"$REQUESTED_CONTEXTDB_SHA\" ]] && [[ \"$contextdb_sha\" != \"$REQUESTED_CONTEXTDB_SHA\" ]]; then",
     "echo \"locked ContextDB SHA does not match contextdb_sha\" >&2",
     "exit 1",
     "fi",
     "printf 'Context Graph SHA: %s\\n' \"$context_graph_sha\"",
     "printf 'ContextDB SHA: %s\\n' \"$contextdb_sha\"",
+    "printf 'Base SHA: %s\\nHead SHA: %s\\nEvent SHA: %s\\n' \"$BASE_SHA\" \"$HEAD_SHA\" \"$EVENT_SHA\"",
 ];
 const EXACT_CONTEXTDB_SHA_INPUT_VALIDATION_LINES: &[&str] = &[
     "if [[ ! \"$CONTEXTDB_SHA\" =~ ^[0-9a-f]{40}$ ]]; then",
@@ -157,33 +166,34 @@ const EXACT_CONTEXTDB_SHA_INPUT_VALIDATION_LINES: &[&str] = &[
     "fi",
 ];
 const VETTED_COLD_MISS_MODEL_SEED_LINES: &[&str] = &[
-    "rustup run stable cargo run -p context-graph-cli --bin cg -- model fetch --defaults",
-    "rustup run stable cargo test -p context-graph --test nomic_document_preparer_adds_exactly_one_system_task_prefix",
+    "rustup run 1.94.1 cargo run -p context-graph-cli --bin cg -- model fetch --defaults",
+    "rustup run 1.94.1 cargo test -p context-graph --test nomic_document_preparer_adds_exactly_one_system_task_prefix",
 ];
 const VETTED_OFFLINE_REAL_MODEL_PROOF_LINES: &[&str] = &[
-    "rustup run stable cargo test -p context-graph \\",
+    "rustup run 1.94.1 cargo test -p context-graph \\",
     "--test nomic_document_preparer_adds_exactly_one_system_task_prefix \\",
     "--test nomic_query_preparer_adds_exactly_one_system_task_prefix \\",
     "--test event_search_uses_role_preparation_while_digest_record_and_evidence_paths_remain_byte_for_byte_unchanged",
 ];
 const VETTED_DOCUMENTATION_CLAIM_VALIDATION_LINES: &[&str] = &[
-    "base=\"${DOCUMENTATION_BASE_SHA:-HEAD^}\"",
-    "if [[ -z \"$base\" ]] || [[ \"$base\" =~ ^0+$ ]] || ! git rev-parse --verify --quiet \"${base}^{commit}\" > /dev/null; then",
-    "base=\"HEAD^\"",
-    "fi",
-    "git rev-parse --verify --quiet \"${base}^{commit}\" > /dev/null",
+    "base=\"${DOCUMENTATION_BASE_SHA:-}\"",
+    "if [[ -z \"$base\" ]] || [[ \"$base\" =~ ^0+$ ]] || ! git rev-parse --verify --quiet \"HEAD^\" > /dev/null || ! git rev-parse --verify --quiet \"${base}^{commit}\" > /dev/null; then",
+    "echo \"initial state, no comparison: auditing all documentation\"",
+    "python3 scripts/validate-doc-coverage.py --all",
+    "else",
     "printf 'comparing the touched doc files against %s\\n' \"$base\"",
     "python3 scripts/validate-doc-coverage.py --base \"$base\"",
+    "fi",
     "bash scripts/check-doc-validator-negative-control.sh",
 ];
 const VETTED_GATE_WALL_CLOCK_BASELINE_DIRECTION_LINES: &[&str] = &[
-    "base=\"${DOCUMENTATION_BASE_SHA:-HEAD^}\"",
-    "if [[ -z \"$base\" ]] || [[ \"$base\" =~ ^0+$ ]] || ! git rev-parse --verify --quiet \"${base}^{commit}\" > /dev/null; then",
-    "base=\"HEAD^\"",
-    "fi",
-    "git rev-parse --verify --quiet \"${base}^{commit}\" > /dev/null",
+    "base=\"${DOCUMENTATION_BASE_SHA:-}\"",
+    "if [[ -z \"$base\" ]] || [[ \"$base\" =~ ^0+$ ]] || ! git rev-parse --verify --quiet \"HEAD^\" > /dev/null || ! git rev-parse --verify --quiet \"${base}^{commit}\" > /dev/null; then",
+    "echo \"initial state, no comparison: gate wall-clock baseline\"",
+    "else",
     "printf 'comparing the gate wall-clock baseline against %s\\n' \"$base\"",
     "python3 scripts/check-gate-wall-clock.py --base \"$base\"",
+    "fi",
 ];
 
 fn workspace_root() -> std::path::PathBuf {
@@ -197,7 +207,20 @@ fn workspace_root() -> std::path::PathBuf {
 fn read_workflow_yaml() -> Value {
     let workflow = fs::read_to_string(workspace_root().join(".github/workflows/ci.yml"))
         .expect("workflow readable");
-    serde_yaml_ng::from_str(&workflow).expect("workflow yaml")
+    let mut yaml = serde_yaml_ng::from_str(&workflow).expect("workflow yaml");
+    yaml = ci_stages::platform_coverage(
+        yaml,
+        serde_yaml_ng::from_str(
+            &std::fs::read_to_string(workspace_root().join(".github/workflows/macos-advisory.yml"))
+                .expect("advisory readable"),
+        )
+        .expect("advisory yaml"),
+    );
+    ci_stages::effective(
+        &mut yaml,
+        &fs::read_to_string(workspace_root().join("scripts/gate.sh")).expect("shared stages"),
+    );
+    yaml
 }
 
 fn assert_no_cargo_audit_aliases() {
@@ -1187,7 +1210,10 @@ fn workflow_job_steps(yaml: &Value) -> Vec<(&Mapping, Vec<&Mapping>)> {
         .and_then(Value::as_mapping)
         .expect("workflow jobs map");
     let mut job_steps = Vec::new();
-    for job_value in jobs.values() {
+    for (name, job_value) in jobs {
+        if ci_stages::is_reusable_job(name, job_value) {
+            continue;
+        }
         let Some(job) = job_value.as_mapping() else {
             continue;
         };
@@ -1247,7 +1273,50 @@ fn env_overrides_command_lookup(value: &Value) -> bool {
 }
 
 fn step_uses(step: &Mapping) -> Option<&str> {
-    mapping_get(step, "uses").and_then(yaml_string)
+    let uses = mapping_get(step, "uses").and_then(yaml_string)?;
+    // Exact immutable revisions retain the action identity and its declared version.
+    match uses {
+        "actions/checkout@11d5960a326750d5838078e36cf38b85af677262" => {
+            assert!(
+                include_str!("../../../../.github/workflows/ci.yml").contains(
+                    "uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4"
+                )
+            );
+            Some("actions/checkout@v4")
+        }
+        "dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249" => {
+            assert!(
+                include_str!("../../../../.github/workflows/ci.yml").contains(
+                    "uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable"
+                )
+            );
+            Some("dtolnay/rust-toolchain@stable")
+        }
+        "Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c" => {
+            assert!(
+                include_str!("../../../../.github/workflows/ci.yml").contains(
+                    "uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2"
+                )
+            );
+            Some("Swatinem/rust-cache@v2")
+        }
+        "taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8" => {
+            assert!(
+                include_str!("../../../../.github/workflows/ci.yml").contains(
+                    "uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2"
+                )
+            );
+            Some("taiki-e/install-action@v2")
+        }
+        "actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830" => {
+            assert!(
+                include_str!("../../../../.github/workflows/ci.yml")
+                    .contains("uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4")
+            );
+            Some("actions/cache@v4")
+        }
+        _ => Some(uses),
+    }
 }
 
 fn step_run(step: &Mapping) -> Option<&str> {
@@ -1276,6 +1345,118 @@ fn step_is_exact_contextdb_sha_input_validation(step: &Mapping) -> bool {
         })
 }
 
+fn job_verifies_selected_checkout(job: &Mapping) -> bool {
+    let steps = mapping_get(job, "steps")
+        .and_then(Value::as_sequence)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_mapping)
+        .collect::<Vec<_>>();
+    let checkout = steps
+        .iter()
+        .position(|step| step_is_credential_free_context_graph_checkout(step));
+    let verification = steps
+        .iter()
+        .position(|step| step_is_exact_revision_verification(step));
+    matches!((checkout, verification), (Some(c), Some(v)) if c < v)
+}
+
+fn assert_selected_checkout_verification(workflow: &Value) {
+    for job in [
+        "source",
+        "lint",
+        "docs",
+        "test",
+        "features",
+        "controls",
+        "feature-qualification-core",
+        "feature-qualification-sync",
+    ] {
+        assert!(
+            job_verifies_selected_checkout(
+                workflow["jobs"][job].as_mapping().expect("required job")
+            ),
+            "{job} must verify its selected checkout before running its commands"
+        );
+        let mut missing = workflow.clone();
+        let steps = missing["jobs"][job]["steps"]
+            .as_sequence_mut()
+            .expect("job steps");
+        let before = steps.len();
+        steps.retain(|step| {
+            !step
+                .as_mapping()
+                .is_some_and(step_is_exact_revision_verification)
+        });
+        assert_eq!(
+            steps.len() + 1,
+            before,
+            "remove exactly the revision verifier"
+        );
+        assert!(
+            !job_verifies_selected_checkout(
+                missing["jobs"][job].as_mapping().expect("required job")
+            ),
+            "removing verification from {job} must fail"
+        );
+        let mut wrong = workflow.clone();
+        let mut changed = false;
+        for step in wrong["jobs"][job]["steps"]
+            .as_sequence_mut()
+            .expect("job steps")
+        {
+            if step
+                .as_mapping()
+                .is_some_and(step_is_exact_revision_verification)
+            {
+                step["env"]["TESTED_SHA"] = Value::String("${{ github.sha }}".to_string());
+                changed = true;
+            }
+        }
+        assert!(changed);
+        assert!(
+            !job_verifies_selected_checkout(wrong["jobs"][job].as_mapping().expect("required job")),
+            "verifying the merge event instead of the selected head must fail"
+        );
+    }
+    let root = workspace_root();
+    let head = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(&root)
+        .output()
+        .expect("read checkout revision");
+    assert!(head.status.success());
+    let head = String::from_utf8(head.stdout).expect("SHA text");
+    let head = head.trim();
+    let verifier = EXACT_REVISION_VERIFIER_LINES.join("\n");
+    for (tested, event, expected) in [
+        (head, "0".repeat(40), true),
+        (head, head.to_string(), true),
+        (
+            "0000000000000000000000000000000000000000",
+            head.to_string(),
+            false,
+        ),
+    ] {
+        let output = Command::new("bash")
+            .args(["-e", "-c", &verifier])
+            .current_dir(&root)
+            .env("TESTED_SHA", tested)
+            .env("EVENT_SHA", event)
+            .env("BASE_SHA", "")
+            .env("HEAD_SHA", tested)
+            .env("REQUESTED_CONTEXTDB_SHA", "")
+            .output()
+            .expect("execute the shipped revision verifier");
+        assert_eq!(
+            output.status.success(),
+            expected,
+            "the checkout must match the selected tested SHA for PR and push events: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
 fn step_is_exact_revision_verification(step: &Mapping) -> bool {
     mapping_get(step, "if").is_none()
         && !step_continue_on_error_can_mask_failures(step)
@@ -1284,6 +1465,11 @@ fn step_is_exact_revision_verification(step: &Mapping) -> bool {
             .and_then(|env| mapping_get(env, "REQUESTED_CONTEXTDB_SHA"))
             .and_then(yaml_string)
             == Some("${{ inputs.contextdb_sha }}")
+        && mapping_get(step, "env")
+            .and_then(Value::as_mapping)
+            .and_then(|env| mapping_get(env, "TESTED_SHA"))
+            .and_then(yaml_string)
+            == Some("${{ github.event.pull_request.head.sha || inputs.cg_sha || github.sha }}")
         && step_run(step).is_some_and(run_is_exact_revision_verifier)
 }
 
@@ -1296,6 +1482,9 @@ fn step_uses_can_mask_command_lookup(step: &Mapping) -> bool {
         }
         Some("actions/cache@v4") => cache_inputs_can_shadow_workspace_or_command_lookup(step),
         Some("Swatinem/rust-cache@v2") => rust_cache_inputs_can_shadow_command_lookup(step),
+        Some("actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093") => {
+            ci_stages::artifact_download_can_shadow_command_lookup(step)
+        }
         Some(uses) => !COMMAND_LOOKUP_SAFE_ACTIONS.contains(&uses),
     }
 }
@@ -1307,7 +1496,11 @@ fn checkout_inputs_can_shadow_workspace(step: &Mapping) -> bool {
 fn step_is_credential_free_context_graph_checkout(step: &Mapping) -> bool {
     step_uses(step) == Some("actions/checkout@v4")
         && step_with_fields(step).is_some_and(|with| {
-            with.len() == 3
+            with.len() == 4
+                && mapping_get(with, "ref").and_then(yaml_string)
+                    == Some(
+                        "${{ github.event.pull_request.head.sha || inputs.cg_sha || github.sha }}",
+                    )
                 && mapping_get(with, "path").and_then(yaml_string)
                     == Some(CONTEXT_GRAPH_CHECKOUT_PATH)
                 && mapping_get(with, "fetch-depth").is_some_and(|value| {
@@ -1448,9 +1641,83 @@ fn workflow_command_lookup_can_mask_failures(workflow: &Value) -> bool {
     })
 }
 
-/// The exact runs allowed to carry a line the command-lookup scan would otherwise flag, matched as
-/// whole line sequences so a vetted run cannot be widened by editing one line inside it.
+const VETTED_GATE_WALL_CLOCK_MEASUREMENT_LINES: &[&str] = &[
+    "export CG_GATE_JUNIT=\"$repository_root/target/nextest/gate/junit.xml\"",
+    "default_baseline",
+    "rustup run 1.94.1 cargo test -p context-graph --test test_estate_audit gate_wall_seconds_never_exceed_the_frozen_baseline -- --ignored --exact",
+    "python3 scripts/check-gate-wall-clock.py --junit \"$CG_GATE_JUNIT\"",
+];
+
+fn assert_exact_python_blocks(workflow: &Value) {
+    ci_stages::assert_exact_shared_commands(workflow, workflow_command_lookup_can_mask_failures);
+    for block in [VETTED_JOB_RECEIPT_RUN, REQUIRED_PR_JOB_AGGREGATE_RUN] {
+        assert!(run_is_vetted_command_lookup_run(block));
+        for altered in [
+            block.replace(
+                "import json, os",
+                "import json, os; os.environ['PATH'] = '/tmp/shadow'",
+            ),
+            format!("{block}python3 -c 'print(123)'\n"),
+        ] {
+            assert_ne!(
+                altered, block,
+                "the control must alter exact executable content"
+            );
+            assert!(
+                !run_is_vetted_command_lookup_run(&altered),
+                "changed Python bodies are not vetted"
+            );
+            let mut mutated = workflow.clone();
+            let mut changed = 0;
+            for (name, job) in mutated["jobs"].as_mapping_mut().expect("jobs map") {
+                if ci_stages::is_reusable_job(name, job) {
+                    continue;
+                }
+                for step in job["steps"].as_sequence_mut().expect("job steps") {
+                    if step["run"].as_str() == Some(block) {
+                        step["run"] = Value::String(altered.clone());
+                        changed += 1;
+                    }
+                }
+            }
+            assert!(
+                changed > 0,
+                "the control must mutate a shipped Python block"
+            );
+            assert!(
+                workflow_command_lookup_can_mask_failures(&mutated),
+                "changed receipt or aggregate bodies must be rejected"
+            );
+        }
+    }
+    let mut unknown = workflow.clone();
+    let mut interpreter_step = Mapping::new();
+    interpreter_step.insert(
+        Value::String("run".to_string()),
+        Value::String("python3 -c 'print(123)'".to_string()),
+    );
+    unknown["jobs"]["lint"]["steps"]
+        .as_sequence_mut()
+        .expect("lint steps")
+        .push(Value::Mapping(interpreter_step));
+    assert!(
+        workflow_command_lookup_can_mask_failures(&unknown),
+        "an unrelated interpreter step remains rejected"
+    );
+    let disk = VETTED_DISK_RECLAMATION_LINES.join("\n");
+    assert!(run_is_vetted_command_lookup_run(&disk));
+    assert!(!run_is_vetted_command_lookup_run(&format!(
+        "{disk}\npython3 -c 'print(123)'"
+    )));
+}
+
 fn run_is_vetted_command_lookup_run(run: &str) -> bool {
+    if ci_stages::exact_shared_command(run) {
+        return true;
+    }
+    if run == VETTED_JOB_RECEIPT_RUN || run == REQUIRED_PR_JOB_AGGREGATE_RUN {
+        return true;
+    }
     let lines = active_run_lines(run);
     lines == EXACT_CONTEXTDB_SHA_INPUT_VALIDATION_LINES
         || lines == EXACT_REVISION_VERIFIER_LINES
@@ -1459,6 +1726,8 @@ fn run_is_vetted_command_lookup_run(run: &str) -> bool {
         || lines == VETTED_OFFLINE_REAL_MODEL_PROOF_LINES
         || lines == VETTED_DOCUMENTATION_CLAIM_VALIDATION_LINES
         || lines == VETTED_GATE_WALL_CLOCK_BASELINE_DIRECTION_LINES
+        || lines == VETTED_GATE_WALL_CLOCK_MEASUREMENT_LINES
+        || lines == VETTED_DISK_RECLAMATION_LINES
 }
 
 fn job_runtime_can_mask_command_lookup(job: &Mapping) -> bool {
@@ -1492,13 +1761,14 @@ fn job_matrix_os_values_are_known_github_hosted(job: &Mapping) -> bool {
     let Some(matrix) = job_matrix(job) else {
         return false;
     };
-    mapping_get(matrix, "include").is_none()
-        && mapping_get(matrix, "exclude").is_none()
-        && job_matrix_values(job, "os").is_some_and(|values| {
-            values
-                .iter()
-                .all(|value| is_safe_github_hosted_runner(value))
-        })
+    ci_stages::exact_physical_matrix(matrix)
+        || (mapping_get(matrix, "include").is_none()
+            && mapping_get(matrix, "exclude").is_none()
+            && job_matrix_values(job, "os").is_some_and(|values| {
+                values
+                    .iter()
+                    .all(|value| is_safe_github_hosted_runner(value))
+            }))
 }
 
 fn job_matrix(job: &Mapping) -> Option<&Mapping> {
@@ -1571,6 +1841,7 @@ fn step_is_context_graph_checkout(workflow: &Value, job: &Mapping, step: &Mappin
 
 fn step_pins_stable_rust_toolchain(workflow: &Value, job: &Mapping, step: &Mapping) -> bool {
     step_uses(step) == Some("dtolnay/rust-toolchain@stable")
+        && step_with_field(step, "toolchain").and_then(yaml_string) == Some("1.94.1")
         && action_step_can_enforce_failure(workflow, job, step)
 }
 
@@ -1614,7 +1885,9 @@ fn prior_steps_prepare_audit_tools(
 }
 
 fn prior_step_can_precede_audit(workflow: &Value, job: &Mapping, step: &Mapping) -> bool {
-    step_is_exact_contextdb_sha_input_validation(step)
+    (step_run(step).is_some_and(|run| active_run_lines(run) == VETTED_DISK_RECLAMATION_LINES)
+        && mapping_get(step, "if").and_then(yaml_string) == Some("runner.os == 'Linux'"))
+        || step_is_exact_contextdb_sha_input_validation(step)
         || step_is_exact_revision_verification(step)
         || step_is_context_graph_checkout(workflow, job, step)
         || step_pins_stable_rust_toolchain(workflow, job, step)
@@ -1673,8 +1946,16 @@ fn oss_purity_no_embeddinggemma_symbol_leakage_in_main_crate() {
         which::which("cargo-expand").is_ok(),
         "install cargo-expand so this guard can inspect the expanded context-graph library"
     );
+    // The nested expansion inherits this test's Cargo environment. A build directory of its own
+    // keeps it from rerunning, under that environment, the build scripts the surrounding build
+    // and its compiler cache reuse.
+    let expand_target_dir = std::env::var_os("CARGO_TARGET_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| workspace_root().join("target"))
+        .join("expand-check");
     let output = Command::new("cargo")
-        .args(["expand", "--lib", "-p", "context-graph"])
+        .args(["expand", "--lib", "-p", "context-graph", "--target-dir"])
+        .arg(&expand_target_dir)
         .current_dir(workspace_root())
         .output()
         .expect("cargo expand starts");
@@ -1732,8 +2013,10 @@ fn ci_workflow_uses_dtolnay_rust_toolchain_stable_pin_parsed_yaml() {
     );
 }
 
+/// Every required job verifies the selected checkout and the locked dependency revision.
 #[test]
 fn ci_workflow_validates_and_verifies_the_exact_contextdb_revision() {
+    assert_selected_checkout_verification(&read_workflow_yaml());
     let yaml = read_workflow_yaml();
     let dispatch_inputs = value_mapping_get(&yaml, "on")
         .and_then(Value::as_mapping)
@@ -1907,6 +2190,16 @@ fn ci_workflow_uses_swatinem_rust_cache_v2_replacing_hand_rolled_actions_cache_v
 #[test]
 fn ci_workflow_model_cache_key_hashes_pinned_revision_constant_source_file_not_cargo_lock_parsed_yaml()
  {
+    // CI uses an explicit root; fallback pins still name the root the loader reads.
+    assert_eq!(
+        cg_catalog::DEFAULT_CACHE_ROOT_LINUX_MACOS,
+        "~/.cache/cg/models"
+    );
+    assert_eq!(
+        cg_catalog::DEFAULT_CACHE_ROOT_WINDOWS,
+        "%LOCALAPPDATA%\\cg\\models"
+    );
+
     let yaml = read_workflow_yaml();
     let model_cache_steps = workflow_steps(&yaml)
         .into_iter()
@@ -1916,8 +2209,8 @@ fn ci_workflow_model_cache_key_hashes_pinned_revision_constant_source_file_not_c
         })
         .collect::<Vec<_>>();
     assert!(
-        model_cache_steps.len() == 1,
-        "workflow should define exactly one model cache at CG_MODEL_CACHE_ROOT"
+        model_cache_steps.len() == 2,
+        "default and feature jobs each restore their declared production model cache"
     );
     for step in model_cache_steps {
         let key = step_with_field(step, "key").expect("model cache key");
@@ -1932,6 +2225,7 @@ fn ci_workflow_model_cache_key_hashes_pinned_revision_constant_source_file_not_c
     }
 }
 
+/// Only superseded PR-number runs are cancelled; manual qualification keeps its own run identity.
 #[test]
 fn ci_workflow_uses_concurrency_cancel_in_progress_at_workflow_level_parsed_yaml() {
     let yaml = read_workflow_yaml();
@@ -1946,16 +2240,41 @@ fn ci_workflow_uses_concurrency_cancel_in_progress_at_workflow_level_parsed_yaml
         group.is_some(),
         "workflow concurrency should name a stable group"
     );
-    assert_eq!(group, Some("ci-${{ github.ref }}"));
     assert_eq!(
-        mapping_get(concurrency, "cancel-in-progress").and_then(Value::as_bool),
-        Some(true)
+        group,
+        Some(
+            "ci-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.run_id }}"
+        )
+    );
+    assert_eq!(
+        mapping_get(concurrency, "cancel-in-progress").and_then(yaml_string),
+        Some("${{ github.event_name == 'pull_request' }}")
     );
 }
 
 #[test]
 fn deny_toml_exists_at_workspace_root_with_bans_licenses_advisories_sources_sections_covering_full_ban_list()
  {
+    assert!(run_invokes_deny_against_workspace_config(
+        "cargo deny --config deny.toml check"
+    ));
+    assert!(run_invokes_deny_against_workspace_config(
+        "cargo deny -c deny.toml check"
+    ));
+    for rejected in [
+        "cargo deny check --config deny.toml",
+        "cargo deny check -c deny.toml",
+        "cargo deny check",
+        "cargo deny --config other.toml check",
+        "cargo deny --config deny.toml check || true",
+        "cargo deny --config deny.toml check --exclude banned",
+    ] {
+        assert!(
+            !run_invokes_deny_against_workspace_config(rejected),
+            "the dependency audit must reject {rejected}"
+        );
+    }
+
     assert_no_cargo_audit_aliases();
     let deny = fs::read_to_string(workspace_root().join("deny.toml")).expect("deny.toml readable");
     let parsed: toml::Value = toml::from_str(&deny).expect("deny.toml parses");
@@ -2082,9 +2401,8 @@ fn deny_toml_exists_at_workspace_root_with_bans_licenses_advisories_sources_sect
         "ISC",
         "MIT",
         "Unicode-3.0",
-        // Public-domain-equivalent; entered the graph via the dial-by-key
-        // sync transport's wasm-target deps — never compiled for shipped
-        // targets.
+        // Public-domain-equivalent; reachable via the dial-by-key sync
+        // transport's wasm-target dependencies; never compiled for shipped targets.
         "Unlicense",
         "Zlib",
     ]
@@ -2167,7 +2485,7 @@ fn deny_toml_exists_at_workspace_root_with_bans_licenses_advisories_sources_sect
 
 #[test]
 fn bespoke_runtime_audit_shell_script_deleted_no_longer_referenced_by_ci_workflow() {
-    // Runtime audit coverage should live in durable Rust tests and CI steps, not the retired shell script.
+    // Runtime audit coverage lives in Rust tests and CI steps.
     let root = workspace_root();
     assert!(
         !root
@@ -2233,6 +2551,7 @@ fn vetted_audit_step_context(workflow: &Value) -> (&Mapping, &Mapping) {
 #[test]
 fn ci_command_lookup_audit_covers_a_mutation_inserted_after_the_audit_step_and_before_workspace_tests()
  {
+    assert_exact_python_blocks(&read_workflow_yaml());
     let mut workflow = read_workflow_yaml();
 
     // Panics unless the workflow carries the vetted dependency-audit run this proof injects around.
@@ -2272,14 +2591,10 @@ fn ci_command_lookup_audit_covers_a_mutation_inserted_after_the_audit_step_and_b
             let lint_index = steps.iter().position(|step| {
                 step.as_mapping().and_then(step_run).is_some_and(|run| {
                     run.trim()
-                        == "rustup run stable cargo clippy --workspace --all-targets -- -D warnings"
+                        == "rustup run 1.94.1 cargo clippy --workspace --all-targets -- -D warnings"
                 })
             });
-            let workspace_test_index = steps.iter().position(|step| {
-                step.as_mapping()
-                    .and_then(step_run)
-                    .is_some_and(|run| run.trim() == "rustup run stable cargo test --workspace")
-            });
+            let workspace_test_index = lint_index.map(|index| index + 1);
             let (Some(audit_index), Some(lint_index), Some(workspace_test_index)) =
                 (audit_index, lint_index, workspace_test_index)
             else {
@@ -2287,8 +2602,7 @@ fn ci_command_lookup_audit_covers_a_mutation_inserted_after_the_audit_step_and_b
             };
             assert!(
                 audit_index < lint_index && lint_index < workspace_test_index,
-                "the real workflow must place the dependency audit before lint and the workspace \
-                 tests, otherwise this proof is injecting the mutation somewhere it would already \
+                "the real workflow must place the dependency audit before clippy, otherwise this proof is injecting the mutation somewhere it would already \
                  be scanned"
             );
 
@@ -2301,7 +2615,7 @@ fn ci_command_lookup_audit_covers_a_mutation_inserted_after_the_audit_step_and_b
             assert_eq!(
                 steps[workspace_test_index].as_mapping().and_then(step_run),
                 Some(mutation_run),
-                "the mutation must sit immediately before cargo test --workspace"
+                "the mutation must sit immediately after clippy"
             );
             injected = true;
             break;
@@ -2309,15 +2623,277 @@ fn ci_command_lookup_audit_covers_a_mutation_inserted_after_the_audit_step_and_b
     }
     assert!(
         injected,
-        "the real workflow must expose one job containing the dependency audit, lint, and the \
-         workspace tests"
+        "the real workflow must expose the lint job containing the dependency audit and clippy"
     );
 
     assert!(
         workflow_command_lookup_can_mask_failures(&workflow),
         "the command-lookup audit must inspect the whole job and reject a GITHUB_PATH mutation \
-         inserted after the dependency audit and between lint and cargo test --workspace; an \
+         inserted after the dependency audit and clippy; an \
          audit that stops at the step it guards leaves format, lint and the workspace tests \
          resolvable through an attacker-supplied directory"
     );
+}
+
+/// A commit without a parent audits every documentation page and detects source crates without guides.
+#[test]
+fn doc_claim_check_audits_the_whole_tree_on_a_commit_with_no_parent() {
+    let repo = tempfile::tempdir().expect("temporary repository");
+    let pages = [
+        "README.md",
+        "crates/example/README.md",
+        "docs/usage.md",
+        "skills/example/SKILL.md",
+    ];
+    for page in pages {
+        let path = repo.path().join(page);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            path,
+            "# Usage\n\nThe command always returns stored conversation passages without modifying any captured source events.\n",
+        )
+        .unwrap();
+    }
+    let source = repo.path().join("crates/unguided/src/lib.rs");
+    std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+    std::fs::write(source, "pub fn value() -> u32 { 1 }\n").unwrap();
+    let scripts = repo.path().join("scripts");
+    std::fs::create_dir_all(&scripts).unwrap();
+    std::fs::copy(
+        workspace_root().join("scripts/validate-doc-coverage.py"),
+        scripts.join("validate-doc-coverage.py"),
+    )
+    .unwrap();
+
+    for args in [
+        vec!["init", "--quiet"],
+        vec!["add", "--", "."],
+        vec![
+            "-c",
+            "user.name=Test Author",
+            "-c",
+            "user.email=test@example.invalid",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--quiet",
+            "-m",
+            "docs: describe conversation retrieval",
+        ],
+    ] {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(repo.path())
+            .output()
+            .expect("prepare the parentless repository");
+        assert!(output.status.success(), "git setup failed: {output:?}");
+    }
+    let parents = std::process::Command::new("git")
+        .args(["rev-list", "--parents", "-n", "1", "HEAD"])
+        .current_dir(repo.path())
+        .output()
+        .unwrap();
+    assert!(parents.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&parents.stdout)
+            .split_whitespace()
+            .count(),
+        1
+    );
+
+    let root = workspace_root();
+    let workflow = read_workflow_yaml();
+    let ci_step = workflow["jobs"]["docs"]["steps"]
+        .as_sequence()
+        .expect("docs steps")
+        .iter()
+        .find(|step| {
+            step["name"]
+                .as_str()
+                .is_some_and(|name| name.starts_with("Documented behavior claims"))
+        })
+        .and_then(|step| step["run"].as_str())
+        .expect("effective CI documentation commands")
+        .to_string();
+    let gate = std::fs::read_to_string(root.join("scripts/gate.sh")).unwrap();
+    let gate_step = gate
+        .split("docs() {\n")
+        .nth(1)
+        .expect("gate documentation stage")
+        .split("\n}\n")
+        .next()
+        .unwrap();
+
+    for (entry, commands) in [("CI", ci_step.as_str()), ("gate", gate_step)] {
+        for base in [
+            "",
+            "0000000000000000000000000000000000000000",
+            "unknown-base",
+        ] {
+            let output = std::process::Command::new("bash")
+                .args(["-e", "-c", commands])
+                .current_dir(repo.path())
+                .env("DOCUMENTATION_BASE_SHA", base)
+                .env("GATE_BASE", base)
+                .output()
+                .expect("run the documentation entry point on a parentless repository");
+            let said = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                output.status.code() == Some(1)
+                    && pages.iter().all(|page| said.contains(&format!("{page}:3")))
+                    && said.contains("4 unbound claim(s)")
+                    && said.contains("carry no AGENTS.md: unguided")
+                    && said.contains("initial state, no comparison"),
+                "{entry} with base {base:?} must audit all four pages at file:line and disclose initial state; status {}:\n{said}",
+                output.status
+            );
+        }
+    }
+}
+
+// This proof executes the core Rust arm built by the workspace alongside this acceptance suite.
+fn compiled_test_estate_binary() -> std::path::PathBuf {
+    let deps = std::env::current_exe()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    fs::read_dir(deps)
+        .expect("workspace test binaries")
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("test_estate_audit-") && !name.contains('.'))
+        })
+        .max_by_key(|path| fs::metadata(path).unwrap().modified().unwrap())
+        .expect("build the workspace test estate binary before running the CI acceptance suite")
+}
+
+/// Suite duration overruns report the binary and seconds without failing either gate check.
+#[test]
+fn gate_wall_clock_overrun_is_reported_not_failed() {
+    let root = workspace_root();
+    let junit = root.join("crates/context-graph/tests/fixtures/gate_wall_clock_overrun.xml");
+    let baseline: toml::Value = toml::from_str(
+        &fs::read_to_string(
+            root.join("crates/context-graph/tests/fixtures/test_estate_baseline.toml"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let binary = "context-graph::test_estate_audit";
+    let measured: f64 = fs::read_to_string(&junit)
+        .unwrap()
+        .lines()
+        .filter(|line| line.trim_start().starts_with("<testcase "))
+        .map(|line| {
+            line.split("time=\"")
+                .nth(1)
+                .unwrap()
+                .split('"')
+                .next()
+                .unwrap()
+                .parse::<f64>()
+                .unwrap()
+        })
+        .sum();
+    let number = |value: &toml::Value| {
+        value
+            .as_float()
+            .unwrap_or_else(|| value.as_integer().unwrap() as f64)
+    };
+    let ceiling = number(&baseline["gate_wall_seconds"][binary])
+        * number(&baseline["gate_wall_seconds_policy"]["tolerance_factor"])
+        + number(&baseline["gate_wall_seconds_policy"]["slack_seconds"]);
+    assert!(measured > ceiling, "the fixture must overrun its ceiling");
+
+    let rust_arm = compiled_test_estate_binary();
+    let rust = Command::new(&rust_arm)
+        .args([
+            "gate_wall_seconds_never_exceed_the_frozen_baseline",
+            "--ignored",
+            "--exact",
+            "--nocapture",
+        ])
+        .env("CG_GATE_JUNIT", &junit)
+        .output()
+        .expect("run the gate's Rust wall-clock arm");
+    let python = std::process::Command::new("python3")
+        .arg(root.join("scripts/check-gate-wall-clock.py"))
+        .arg("--junit")
+        .arg(&junit)
+        .arg("--baseline")
+        .arg(root.join("crates/context-graph/tests/fixtures/test_estate_baseline.toml"))
+        .output()
+        .expect("run the gate's Python wall-clock check");
+    let results = [("Rust", rust), ("Python", python)];
+    let failures: Vec<String> = results
+        .iter()
+        .filter_map(|(surface, output)| {
+            let said = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let reports_seconds = said.lines().any(|line| {
+                line.contains(binary)
+                    && line.contains(&format!("{measured:.3}s"))
+                    && line.contains(&format!("{ceiling:.3}s"))
+            });
+            (!output.status.success() || !reports_seconds).then(|| {
+                format!("{surface}: status {}; expected success and {binary} with {measured:.3}s measured and {ceiling:.3}s ceiling:\n{said}", output.status)
+            })
+        })
+        .collect();
+    assert!(
+        failures.is_empty(),
+        "duration overruns must be reported without failing the gate:\n{}",
+        failures.join("\n")
+    );
+
+    let missing =
+        root.join("crates/context-graph/tests/fixtures/gate_wall_clock_missing_limit.xml");
+    let unbounded = "context-graph::without_recorded_limit";
+    assert!(
+        !baseline["gate_wall_seconds"]
+            .as_table()
+            .unwrap()
+            .contains_key(unbounded)
+    );
+    let rust = Command::new(&rust_arm)
+        .args([
+            "gate_wall_seconds_never_exceed_the_frozen_baseline",
+            "--ignored",
+            "--exact",
+            "--nocapture",
+        ])
+        .env("CG_GATE_JUNIT", &missing)
+        .output()
+        .expect("run the Rust wall-clock arm with a missing limit");
+    let python = std::process::Command::new("python3")
+        .arg(root.join("scripts/check-gate-wall-clock.py"))
+        .arg("--junit")
+        .arg(&missing)
+        .output()
+        .expect("run the Python wall-clock checker with a missing limit");
+    for (surface, output) in [("Rust", rust), ("Python", python)] {
+        let said = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            !output.status.success() && said.contains(unbounded),
+            "{surface} must fail and name the binary with no recorded limit; status {}:\n{said}",
+            output.status
+        );
+    }
 }

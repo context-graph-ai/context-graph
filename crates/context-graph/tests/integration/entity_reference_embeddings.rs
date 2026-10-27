@@ -47,7 +47,7 @@ fn fixture(name: &str) -> Fixture {
     let entity = store
         .create_entity(CreateEntity {
             entity_type: EntityType::Person,
-            name: "Kumar".to_string(),
+            name: "Alex".to_string(),
             properties: BTreeMap::new(),
             tags: Vec::new(),
             context_id: context.id,
@@ -107,6 +107,7 @@ fn has_embedding_shadow_key(value: &serde_json::Value) -> bool {
 
 #[test]
 fn entity_reference_embedding_single_shot_label_none() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let fixture = fixture("single-shot");
     let id = fixture.store.enroll_entity_reference(
         fixture.entity_id,
@@ -136,6 +137,7 @@ fn entity_reference_embedding_single_shot_label_none() {
 
 #[test]
 fn entity_reference_embedding_multi_shot_distinct_labels() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let fixture = fixture("multi-shot");
     let first = fixture.store.enroll_entity_reference(
         fixture.entity_id,
@@ -169,6 +171,7 @@ fn entity_reference_embedding_multi_shot_distinct_labels() {
 
 #[test]
 fn entity_reference_embedding_re_enrollment_under_same_label_idempotent_overwrite() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let fixture = fixture("reenroll");
     let first = fixture.store.enroll_entity_reference(
         fixture.entity_id,
@@ -212,6 +215,7 @@ fn entity_reference_embedding_re_enrollment_under_same_label_idempotent_overwrit
 
 #[test]
 fn entity_reference_embedding_query_path_uniform_across_shot_count() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let fixture = fixture("uniform-query");
     let single = fixture.store.enroll_entity_reference(
         fixture.entity_id,
@@ -224,7 +228,7 @@ fn entity_reference_embedding_query_path_uniform_across_shot_count() {
         .store
         .create_entity(CreateEntity {
             entity_type: EntityType::Person,
-            name: "Kumar alternate".to_string(),
+            name: "Alex alternate".to_string(),
             properties: BTreeMap::new(),
             tags: Vec::new(),
             context_id: fixture.context_id,
@@ -263,6 +267,7 @@ fn entity_reference_embedding_query_path_uniform_across_shot_count() {
 
 #[test]
 fn entity_reference_embedding_writes_to_dedicated_child_table_not_entities_table() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let fixture = fixture("child-table");
     let front_vector = vec![1.0; 512];
     let id = fixture.store.enroll_entity_reference(
@@ -336,6 +341,7 @@ fn entity_reference_embedding_writes_to_dedicated_child_table_not_entities_table
 #[cfg(context_graph_internal_test_support)]
 #[test]
 fn entity_reference_embedding_cross_space_query_refused_with_typed_error() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     use context_graph::{CgError, test_support::embedding::entity_reference_cosine_match};
 
     let fixture = fixture("cross-space-reference");

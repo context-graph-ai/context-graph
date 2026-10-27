@@ -6,12 +6,10 @@
 //! risk changing one — still has to answer "why did this happen?" and "what happened lately?".
 //! Those answers are graph reads: an audit trail, an observation and the observations around it,
 //! the decision that fired, the intention it served, the entity it was about, and the context all
-//! of it sits in. Today the only way to ask is a typed `&Store` method behind the WRITABLE open,
-//! and that open MUTATES the store file on every read. So the fallback either changes a store it
-//! was told not to touch, or it decodes the rows itself and drifts from what the writable path
-//! answers.
+//! of it sits in. A typed graph view reached from the read-only surface provides those answers
+//! without a writable open or consumer-owned decoding.
 //!
-//! This file pins the third answer: a typed graph view reached from the read-only
+//! This file pins the typed graph view reached from the read-only
 //! [`ConsumerReader`], carrying the same reads with the same answer types, over a store no writer
 //! is holding and no read may change.
 //!
@@ -264,7 +262,7 @@ fn seeded_fixture(directory: &Path) -> Fixture {
             observation_type: "detection".to_string(),
             source: "front-door".to_string(),
             observed_at: Utc::now(),
-            evidence: vec![text_evidence(detection_id, "vigil-edge://front-door/0001")],
+            evidence: vec![text_evidence(detection_id, "s3://front-door/0001")],
             observed_properties: BTreeMap::from([
                 ("class_name".to_string(), json!("person")),
                 ("confidence".to_string(), json!(0.91)),
@@ -325,10 +323,7 @@ fn seeded_fixture(directory: &Path) -> Fixture {
             observation_type: "recognition".to_string(),
             source: "front-door".to_string(),
             observed_at: Utc::now(),
-            evidence: vec![text_evidence(
-                recognition_id,
-                "vigil-edge://front-door/0002",
-            )],
+            evidence: vec![text_evidence(recognition_id, "s3://front-door/0002")],
             observed_properties: BTreeMap::from([
                 (
                     "anchored_detection_id".to_string(),
@@ -354,7 +349,7 @@ fn seeded_fixture(directory: &Path) -> Fixture {
             observation_type: "correction".to_string(),
             source: "operator".to_string(),
             observed_at: Utc::now(),
-            evidence: vec![text_evidence(correction_id, "vigil-edge://operator/0001")],
+            evidence: vec![text_evidence(correction_id, "s3://operator/0001")],
             observed_properties: BTreeMap::from([
                 ("correction_type".to_string(), json!("Enroll")),
                 ("label".to_string(), json!("courier")),
@@ -393,10 +388,7 @@ fn seeded_fixture(directory: &Path) -> Fixture {
             observation_type: "detection".to_string(),
             source: "garage".to_string(),
             observed_at: Utc::now(),
-            evidence: vec![text_evidence(
-                other_detection_id,
-                "vigil-edge://garage/0001",
-            )],
+            evidence: vec![text_evidence(other_detection_id, "s3://garage/0001")],
             observed_properties: BTreeMap::from([("class_name".to_string(), json!("car"))]),
             state_delta: BTreeMap::from([("last_seen_class".to_string(), Some(json!("car")))]),
             properties: BTreeMap::new(),

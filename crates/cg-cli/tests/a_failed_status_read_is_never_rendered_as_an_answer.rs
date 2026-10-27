@@ -38,9 +38,8 @@ const FAULT_ENV: &str = "CG_FAIL_STATUS_METRIC_READ";
 /// to be reached at all. Keeping the whole set here — rather than one test per branch — is what
 /// makes a NEW unguarded read visible: it will not be in this list, and the roster assertion below
 /// says so.
-// `retention` and `raw` are retired with the raw-retention setting (intent :301-302, :2380-2382);
-// `queue` and `fabric_jobs` are not reported by the read-only status until the engine exposes the
-// work ledger's job state to read-only clients (upstream-gaps.md gap 2).
+// Read-only status omits retention and raw metrics, and the engine does not expose queue or
+// fabric job-state rows to read-only clients.
 const REFUSABLE_READS: [&str; 3] = ["understanding_run", "fabric_membership", "counts"];
 
 /// The context label `cg` uses when none is named, so the fixture's captured rows are the ones a
@@ -138,7 +137,7 @@ fn data_root(captured: bool, fabric: bool) -> tempfile::TempDir {
                 chunk_window: window,
             },
         )
-        .expect("tier-0 capture into the default context");
+        .expect("model-free capture into the default context");
     }
     drop(store);
 

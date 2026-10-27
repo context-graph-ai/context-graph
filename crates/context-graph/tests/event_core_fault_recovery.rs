@@ -406,9 +406,7 @@ fn run_append_race(conflicts: usize) -> RaceObservation {
 
     for attempt in 1..=conflicts {
         assert_eq!(
-            arrived
-                .recv_timeout(Duration::from_secs(15))
-                .expect("target reaches real event insert"),
+            arrived.recv().expect("target reaches real event insert"),
             attempt,
             "the controller releases each target attempt only after its INSERT INTO events is staged"
         );

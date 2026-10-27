@@ -868,19 +868,19 @@ fn status_read_shows_active_connection_consent_state_and_which_model_a_context_r
         "runtime requests must resolve credentials from the model bound to the request context"
     );
 
-    let reviewer = Principal::Human("reviewer@example.com".to_string());
-    config.insert_secret(reviewer.clone(), "KEY_WORK", "reviewer-work-secret");
-    let reviewer_client = Arc::new(ConnectionRecordingClient::default());
-    let mut reviewer_runtime = UnderstandingRuntime::new(catalog.clone(), reviewer, config.clone())
-        .with_client("work-model", reviewer_client.clone());
-    reviewer_runtime
-        .understand(request(work_context, "reviewer work scoped request"))
-        .expect("reviewer work scoped understanding");
+    let reader = Principal::Human("reader@example.com".to_string());
+    config.insert_secret(reader.clone(), "KEY_WORK", "reader-work-secret");
+    let reader_client = Arc::new(ConnectionRecordingClient::default());
+    let mut reader_runtime = UnderstandingRuntime::new(catalog.clone(), reader, config.clone())
+        .with_client("work-model", reader_client.clone());
+    reader_runtime
+        .understand(request(work_context, "reader work scoped request"))
+        .expect("reader work scoped understanding");
     assert_eq!(
-        reviewer_client.observed(),
+        reader_client.observed(),
         vec![(
             Some("work".to_string()),
-            Some("reviewer-work-secret".to_string())
+            Some("reader-work-secret".to_string())
         )],
         "credential resolution must be scoped by principal as well as context"
     );

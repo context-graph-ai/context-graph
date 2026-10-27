@@ -70,6 +70,7 @@ fn count(db: &Database, sql: &str, params: HashMap<String, Value>) -> i64 {
 
 #[test]
 fn embedding_space_declaration_with_empty_string_id_refused_at_store_open() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let result = open_with(space("", vec![EvidenceKind::Text], None));
     assert!(matches!(
         result,
@@ -79,6 +80,7 @@ fn embedding_space_declaration_with_empty_string_id_refused_at_store_open() {
 
 #[test]
 fn embedding_space_id_with_whitespace_or_control_chars_refused_at_store_open() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let result = open_with(space("bad id\n", vec![EvidenceKind::Text], None));
     assert!(matches!(
         result,
@@ -90,6 +92,7 @@ fn embedding_space_id_with_whitespace_or_control_chars_refused_at_store_open() {
 
 #[test]
 fn embedding_space_id_exceeding_max_length_refused_at_store_open() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let result = open_with(space(&"x".repeat(300), vec![EvidenceKind::Text], None));
     assert!(matches!(
         result,
@@ -100,6 +103,7 @@ fn embedding_space_id_exceeding_max_length_refused_at_store_open() {
 #[test]
 fn embedding_space_default_for_evidence_kind_not_in_supported_evidence_kinds_refused_at_store_open()
 {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let result = open_with(space(
         "image_default",
         vec![EvidenceKind::ImageFrame],
@@ -114,6 +118,7 @@ fn embedding_space_default_for_evidence_kind_not_in_supported_evidence_kinds_ref
 
 #[test]
 fn embedder_with_empty_supported_inputs_refused_at_store_open() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let result = open_with(space("empty_supported_inputs", Vec::new(), None));
     assert!(matches!(
         result,
@@ -125,6 +130,7 @@ fn embedder_with_empty_supported_inputs_refused_at_store_open() {
 
 #[test]
 fn entity_reference_embeddings_per_dim_table_created_at_store_open_when_new_dimension_declared() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let dir = tempfile::tempdir().expect("tempdir");
     let db_path = dir.path().join("registry-dim-384.db");
     let opened = Store::open(StoreConfig {
@@ -153,12 +159,13 @@ fn entity_reference_embeddings_per_dim_table_created_at_store_open_when_new_dime
                         .any(|column| column.name == "produced_by")
             })
             && old_handle.is_none(),
-        "new dimension must create entity_reference_embeddings_384 and remove old polymorphic embedding_handles, opened_ok={opened_ok}, table={table:?}, old_handle={old_handle:?}"
+        "a registered dimension must create entity_reference_embeddings_384 and leave embedding_handles absent, opened_ok={opened_ok}, table={table:?}, old_handle={old_handle:?}"
     );
 }
 
 #[test]
 fn entity_reference_embeddings_per_dim_table_reused_when_existing_dimension_redeclared() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let dir = tempfile::tempdir().expect("tempdir");
     let db_path = dir.path().join("registry-dim-512.db");
     let first = Store::open(StoreConfig {

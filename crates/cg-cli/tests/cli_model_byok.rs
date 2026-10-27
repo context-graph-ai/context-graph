@@ -81,6 +81,7 @@ struct CapturedRequest {
 
 struct OpenAiStub {
     base_url: String,
+    address: std::net::SocketAddr,
     requests: Arc<Mutex<Vec<CapturedRequest>>>,
     shutdown: Option<mpsc::Sender<()>>,
     handle: Option<thread::JoinHandle<()>>,
@@ -106,30 +107,20 @@ impl OpenAiStub {
     fn new(status: u16, body: String) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind local HTTP stub");
         let addr = listener.local_addr().expect("local HTTP stub address");
-        listener
-            .set_nonblocking(true)
-            .expect("set local HTTP stub nonblocking");
         let requests = Arc::new(Mutex::new(Vec::new()));
         let thread_requests = Arc::clone(&requests);
         let (shutdown_tx, shutdown_rx) = mpsc::channel();
         let handle = thread::spawn(move || {
-            loop {
+            while let Ok((stream, _)) = listener.accept() {
                 if shutdown_rx.try_recv().is_ok() {
                     break;
                 }
-                match listener.accept() {
-                    Ok((stream, _)) => {
-                        handle_http_request(stream, Arc::clone(&thread_requests), status, &body);
-                    }
-                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(10));
-                    }
-                    Err(_) => break,
-                }
+                handle_http_request(stream, Arc::clone(&thread_requests), status, &body);
             }
         });
         Self {
             base_url: format!("http://{addr}/openai/v1"),
+            address: addr,
             requests,
             shutdown: Some(shutdown_tx),
             handle: Some(handle),
@@ -153,6 +144,7 @@ impl Drop for OpenAiStub {
     fn drop(&mut self) {
         if let Some(shutdown) = self.shutdown.take() {
             let _ = shutdown.send(());
+            let _ = TcpStream::connect(self.address);
         }
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();

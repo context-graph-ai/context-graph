@@ -1,9 +1,8 @@
-//! Fabric first-light — the frozen source rule: no transport name in ledger/payload/job/apply code.
+//! Fabric  — the frozen source rule: no transport name in ledger/payload/job/apply code.
 //!
 //! The ledger treats cg's payload as opaque and knows no transport. The authenticated endpoint
 //! belongs to the `[fabric]` config surface and the contextdb adapter — never to cg's submission,
-//! payload, job, apply, or sync-declaration sources. No removed transport may reappear anywhere in
-//! that path.
+//! payload, job, apply, or sync-declaration sources. That path contains no transport identifiers.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -294,7 +293,7 @@ fn context_graph_tables_declare_the_frozen_sync_contract() {
     );
 }
 
-/// Does production source actually use a removed sync-authority symbol?
+/// Does production source use an unsupported sync-authority symbol?
 ///
 /// Identifier-shaped entries count only on identifier boundaries, so they do not fire inside a
 /// larger identifier that merely ends in the same letters. Call-shaped entries

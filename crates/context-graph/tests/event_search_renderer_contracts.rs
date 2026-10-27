@@ -1113,9 +1113,7 @@ fn a_claims_passages_are_embedded_through_bounded_forward_calls_of_the_batch_ent
         0,
         "no passage is embedded through a one-document call"
     );
-    // One document per forward call for now: a sixteen-document padded forward pass through the
-    // debug-built Nomic model ran past the claim lease, so multi-document batches wait until that
-    // cost is understood. Every passage still goes through the batch entrypoint.
+    // Each passage uses a separate bounded forward call through the batch entrypoint.
     assert_eq!(
         *embedder.batches.lock().expect("batch log"),
         vec![1; 20],

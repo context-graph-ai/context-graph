@@ -1,5 +1,4 @@
-//! RED contract tests for the gold format and the scoring method. Authored and committed BEFORE
-//! implementation; the implementation commit may not touch this file.
+//! The gold format and scoring method preserve the benchmark contract.
 
 use cg_bench::gold::{
     MadeIn, OmissionTrainingPair, load_gold_str, omission_pair_from_json, omission_pair_to_json,
@@ -165,8 +164,8 @@ fn scoring_routes_gray_zone_out_instead_of_deciding() {
 #[test]
 fn scoring_dedupes_cross_chunk_duplicates_before_recall() {
     let gold = load_gold_str(GOLD_YAML).expect("gold YAML parses");
-    // The same decision extracted from two chunks in variant phrasings (the probe-1 observed
-    // failure): recall counts ONE hit, precision counts the group ONCE, duplication reported.
+    // Variant phrasings of one decision across chunks count once for recall and precision;
+    // duplication is reported separately.
     let extracted = ExtractedSession {
         intentions: vec![],
         decisions: vec![

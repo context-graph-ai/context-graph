@@ -1,7 +1,4 @@
-//! Fabric first-light (non-frozen) — `cg status` renders the per-job fabric state, and it passes an
-//! HONEST wall-clock: an expired lease reads as pending, never running. Before this, the library
-//! `fabric::job_statuses` was correct and tested but had no CLI caller, so `cg status` showed only the
-//! sharing line and never the job list.
+//! `cg status` renders per-job fabric state with expired leases shown as pending.
 
 mod support;
 
@@ -47,7 +44,7 @@ fn seed_expired_lease(root: &Path) {
         .job_id;
     let db = store.sync_database();
     let attempt = contextdb_engine::work_ledger::next_attempt(&db, &job_id).expect("next attempt");
-    // lease deadline 1_000 ms since epoch (1970) — expired against any honest wall-clock; now_ms 0.
+    // lease deadline 1_000 ms since epoch (1970) — expired by any honest wall-clock; now_ms 0.
     contextdb_engine::work_ledger::insert_claim(&db, &job_id, attempt, "stale-worker", 1_000, 0)
         .expect("insert expired claim");
 }
@@ -75,8 +72,8 @@ fn status_renders_expired_lease_job_as_pending_under_real_clock() {
     let status = harness.run(&["status", "--context", "loop", "--format", "json"]);
     let value: Value = serde_json::from_str(&status.stdout)
         .unwrap_or_else(|err| panic!("status json ({err}): {}", status.stdout));
-    // Job states are not reported by the read-only top-level status until the engine exposes
-    // them to read-only clients (upstream-gaps.md gap 2); the store still answers.
+    // Read-only top-level status omits job states because the engine does not expose those rows
+    // to read-only clients; the store still answers.
     assert_eq!(
         value.get("state").and_then(Value::as_str),
         Some("ok"),

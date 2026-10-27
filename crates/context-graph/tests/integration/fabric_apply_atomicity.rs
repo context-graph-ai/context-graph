@@ -1,7 +1,4 @@
-//! Fabric first-light — apply atomicity: the write-once completion marker commits in the SAME
-//! transaction as the structured graph it guards, so a crash between the graph write and the marker
-//! is impossible. Proven by a fault fired at the marker boundary rolling BOTH back — before the fix
-//! the graph committed on its own transaction, so it survived a fault at the marker step.
+//! The completion marker and structured graph commit or roll back together.
 
 use context_graph::fabric::{self, ApplyOutcome, FabricCapture};
 
@@ -13,13 +10,14 @@ const SESSION: &str = "User: Goal G1: resume across machines. Assistant: Decisio
 
 #[test]
 fn apply_fault_at_marker_rolls_back_graph_and_marker_together() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let node = FabricNode::open("apply_atomicity");
     fabric::capture(
         &node.store,
-        FabricCapture::new(tier0_request("daily-loop", "s1", SESSION)),
+        FabricCapture::new(tier0_request("capture", "s1", SESSION)),
     )
     .expect("capture");
-    let ctx = context_id(&node.store, "daily-loop").expect("context");
+    let ctx = context_id(&node.store, "capture").expect("context");
     assert_eq!(
         memory_total(&node.store, ctx),
         0,
@@ -36,9 +34,7 @@ fn apply_fault_at_marker_rolls_back_graph_and_marker_together() {
         "a fault at the completion-marker boundary aborts the apply"
     );
 
-    // Shared fate: the structured graph the apply staged is rolled back WITH the marker. Before the
-    // fix the graph committed on its own transaction, so it would have survived this fault and left a
-    // graph-without-marker — the exact split this test forbids.
+    // The staged graph rolls back with the completion marker; neither may survive the fault alone.
     assert_eq!(
         memory_total(&node.store, ctx),
         0,

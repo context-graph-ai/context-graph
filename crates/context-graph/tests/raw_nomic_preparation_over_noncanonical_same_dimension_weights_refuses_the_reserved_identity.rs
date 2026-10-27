@@ -1,22 +1,9 @@
-//! The reserved event-history encoding identity
-//! (`event_history_nomic_v1_5_document_query_v1_768`) must come from the canonical, verified
-//! Nomic weights — never merely from an embedder whose concrete type is the library's own
-//! `NomicTextEmbedder` and whose loaded dimension happens to match. `NomicTextEmbedder::over`
-//! (the `EventHistoryTextEmbedder` wrapper's constructor) already verifies the installed
-//! `REVISION` marker before granting that identity. Raw `NomicTextEmbedder::prepare_document` /
-//! `prepare_query` do not: `dyn Embedder::verify_event_history_authority`
-//! (`src/embedder.rs:741-773`) checks only the concrete type and the dimension, and
-//! `NomicTextEmbedder::load_model` (`src/embedder/nomic.rs`) skips the revision check entirely
-//! when `EmbedderConfig::pinned_revision` is `None` — exactly the shape of a `LocalPath` config
-//! with no pin.
+//! Raw Nomic preparation refuses the reserved event-history encoding identity when the installed
+//! weights have a noncanonical revision, even when the concrete type and dimension match.
 //!
-//! This test builds a raw `NomicTextEmbedder` from a `LocalPath` config, with no revision pin,
-//! over a copy of the canonical installed fixture whose `REVISION` marker has been rewritten to a
-//! noncanonical value at the same dimension (768). The required shape is: refuse with
-//! `EventSearchPreparationUnsupported`, never mint the reserved identity from dimension and
-//! concrete type alone. Today, raw preparation still succeeds and claims the reserved profile, so
-//! this test fails until preparation shares the same canonical admission
-//! `EventHistoryTextEmbedder::over` already enforces.
+//! This test loads an unpinned LocalPath copy of the canonical fixture with its REVISION marker
+//! rewritten to a noncanonical value at dimension 768. Both document and query preparation must
+//! return EventSearchPreparationUnsupported, preserving the canonical identity admission rule.
 
 use context_graph::embedder::nomic::NomicTextEmbedder;
 use context_graph::embedding_space::BuiltinSpaceRegistry;
@@ -60,8 +47,8 @@ fn raw_nomic_preparation_over_noncanonical_same_dimension_weights_refuses_the_re
     let model_dir = tmp.path().join(NOMIC_MODEL_ID);
     noncanonical_same_dimension_fixture(&model_dir);
 
-    // A LocalPath config with no revision pin: `load_model` skips `check_revision_marker`
-    // entirely in this shape, so nothing today stops these noncanonical weights from loading.
+    // A LocalPath config with no revision pin isolates canonical artifact admission from the optional
+    // caller-supplied revision check.
     let config = EmbedderConfig {
         source: ModelSource::LocalPath(model_dir),
         offline: true,

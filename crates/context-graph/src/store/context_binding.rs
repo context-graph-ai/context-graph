@@ -175,6 +175,10 @@ fn context_id_for_name_in_tx(store: &Store, tx: TxId, name: &str) -> Result<Opti
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "ContextDB keeps typed refusal details inline so error propagation needs no allocation."
+)]
 fn insert_binding_in_tx(
     store: &Store,
     tx: TxId,

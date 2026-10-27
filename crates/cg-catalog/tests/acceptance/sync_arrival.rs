@@ -7,7 +7,6 @@ use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
     mpsc,
 };
-use std::time::Duration;
 
 use crate::common::{
     CANONICAL_LICENSE_GATE_MESSAGE, GEMMA_ID, NOMIC_BYTES, NOMIC_ID, NOMIC_REVISION, catalog_at,
@@ -116,8 +115,11 @@ fn sync_fetch_child_if_requested() -> bool {
     if let Some(progress_file) = std::env::var_os("CG_CATALOG_SYNC_FETCH_PROGRESS_FILE") {
         let progress_file = std::path::PathBuf::from(progress_file);
         catalog = catalog.with_progress_observer(move |_| {
-            std::fs::write(&progress_file, b"fetch-starting")
-                .expect("sync fetch progress file written");
+            let mut stream = std::os::unix::net::UnixStream::connect(&progress_file)
+                .expect("sync fetch progress checkpoint");
+            stream
+                .write_all(&[1])
+                .expect("sync fetch progress announced");
         });
     }
     let result = catalog.resolve_for_sync_arrival(&store, model_id, OutputMode::Headless);
@@ -196,18 +198,22 @@ fn assert_child_success(child: Child, label: &str) {
     );
 }
 
-fn wait_for_child_progress_file(child: &mut Child, progress_file: &std::path::Path, label: &str) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
-    while !progress_file.exists() {
-        if let Some(status) = child.try_wait().expect("child status readable") {
-            panic!("{label} exited before reaching fetch progress path: {status}");
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "{label} did not reach fetch progress path before timeout"
-        );
-        std::thread::sleep(Duration::from_millis(5));
-    }
+fn wait_for_child_progress(
+    child: &mut Child,
+    listener: &std::os::unix::net::UnixListener,
+    label: &str,
+) {
+    use std::io::Read;
+    let (mut stream, _) = listener.accept().expect("child progress checkpoint");
+    let mut signal = [0];
+    stream
+        .read_exact(&mut signal)
+        .expect("child progress announcement");
+    assert_eq!(signal, [1]);
+    assert!(
+        child.try_wait().expect("child status readable").is_none(),
+        "{label} remains held by the winner's lock"
+    );
 }
 
 fn respond_with_nomic_fixture(request: tiny_http::Request) {
@@ -221,6 +227,7 @@ fn respond_with_nomic_fixture(request: tiny_http::Request) {
 }
 
 struct FirstResponseGatedNomicServer {
+    server: Arc<tiny_http::Server>,
     first_request_rx: mpsc::Receiver<()>,
     release_tx: mpsc::Sender<()>,
     shutdown: Arc<AtomicBool>,
@@ -230,6 +237,7 @@ struct FirstResponseGatedNomicServer {
 impl FirstResponseGatedNomicServer {
     fn stop_and_join(&mut self) -> std::thread::Result<()> {
         self.shutdown.store(true, Ordering::SeqCst);
+        self.server.unblock();
         let _ = self.release_tx.send(());
         match self.server_thread.take() {
             Some(server_thread) => server_thread.join(),
@@ -258,19 +266,19 @@ fn start_first_response_gated_nomic_server(
     let (release_tx, release_rx) = mpsc::channel();
     let shutdown = Arc::new(AtomicBool::new(false));
     let server_shutdown = Arc::clone(&shutdown);
+    let server = Arc::new(server);
+    let worker_server = Arc::clone(&server);
     let server_thread = std::thread::spawn(move || {
         let mut first_release = Some(release_rx);
         let mut responder_threads = Vec::new();
         while !server_shutdown.load(Ordering::SeqCst) {
-            match server.recv_timeout(Duration::from_millis(50)) {
-                Ok(Some(request)) => {
+            match worker_server.recv() {
+                Ok(request) => {
                     if let Some(release_rx) = first_release.take() {
                         let first_request_tx = first_request_tx.clone();
                         responder_threads.push(std::thread::spawn(move || {
                             first_request_tx.send(()).expect("first request signalled");
-                            release_rx
-                                .recv_timeout(Duration::from_secs(30))
-                                .expect("first response release signal");
+                            release_rx.recv().expect("first response release signal");
                             respond_with_nomic_fixture(request);
                         }));
                     } else {
@@ -279,7 +287,6 @@ fn start_first_response_gated_nomic_server(
                         }));
                     }
                 }
-                Ok(None) => {}
                 Err(_) => break,
             }
         }
@@ -290,6 +297,7 @@ fn start_first_response_gated_nomic_server(
         }
     });
     FirstResponseGatedNomicServer {
+        server,
         first_request_rx,
         release_tx,
         shutdown,
@@ -298,6 +306,7 @@ fn start_first_response_gated_nomic_server(
 }
 
 struct CountedNomicSourceOverride {
+    server: Arc<tiny_http::Server>,
     request_count: Arc<AtomicUsize>,
     shutdown: Arc<AtomicBool>,
     server_thread: std::thread::JoinHandle<()>,
@@ -306,6 +315,7 @@ struct CountedNomicSourceOverride {
 impl CountedNomicSourceOverride {
     fn shutdown_and_join(self) {
         self.shutdown.store(true, Ordering::SeqCst);
+        self.server.unblock();
         self.server_thread
             .join()
             .expect("counted source server joins");
@@ -322,19 +332,21 @@ fn start_counted_nomic_source_override(roots: &[&std::path::Path]) -> CountedNom
     let shutdown = Arc::new(AtomicBool::new(false));
     let counter = Arc::clone(&request_count);
     let server_shutdown = Arc::clone(&shutdown);
+    let server = Arc::new(server);
+    let worker_server = Arc::clone(&server);
     let server_thread = std::thread::spawn(move || {
         while !server_shutdown.load(Ordering::SeqCst) {
-            match server.recv_timeout(Duration::from_millis(50)) {
-                Ok(Some(request)) => {
+            match worker_server.recv() {
+                Ok(request) => {
                     counter.fetch_add(1, Ordering::SeqCst);
                     respond_with_nomic_fixture(request);
                 }
-                Ok(None) => {}
                 Err(_) => break,
             }
         }
     });
     CountedNomicSourceOverride {
+        server,
         request_count,
         shutdown,
         server_thread,
@@ -458,13 +470,13 @@ fn sync_arrival_headless_mode_produces_observation_identical_to_interactive_mode
         "Completed",
     );
     assert!(
-        gated_server
-            .first_request_rx
-            .recv_timeout(Duration::from_secs(30))
-            .is_ok(),
+        gated_server.first_request_rx.recv().is_ok(),
         "first headless resolver should reach the configured source before publishing artifacts"
     );
-    let blocked_progress_file = lock_temp.path().join(".blocked-sync-fetch-started");
+    let progress_dir = tempfile::tempdir_in("/tmp").expect("short socket directory");
+    let blocked_progress_file = progress_dir.path().join("progress.sock");
+    let progress_listener =
+        std::os::unix::net::UnixListener::bind(&blocked_progress_file).expect("progress listener");
     let mut blocked = spawn_sync_fetch_child_with_progress_file(
         "sync_arrival::sync_arrival_headless_mode_produces_observation_identical_to_interactive_mode_observation_single_producer_lockfile_serialises_writers",
         lock_temp.path(),
@@ -472,7 +484,7 @@ fn sync_arrival_headless_mode_produces_observation_identical_to_interactive_mode
         "AlreadyCachedByConcurrentWinner",
         &blocked_progress_file,
     );
-    wait_for_child_progress_file(&mut blocked, &blocked_progress_file, "blocked sync child");
+    wait_for_child_progress(&mut blocked, &progress_listener, "blocked sync child");
     assert!(
         blocked.try_wait().expect("child status readable").is_none(),
         "headless sync-arrival should block on the same per-model lockfile as interactive fetch"
@@ -501,12 +513,13 @@ fn sync_arrival_headless_for_license_gated_model_defers_at_receiver_emits_observ
     );
     let outbound_request_count = Arc::new(AtomicUsize::new(0));
     let counter = Arc::clone(&outbound_request_count);
-    let server_thread = std::thread::spawn(move || {
-        if let Ok(Some(request)) = server.recv_timeout(Duration::from_millis(250)) {
-            counter.fetch_add(1, Ordering::SeqCst);
-            let _ = request.respond(tiny_http::Response::from_string("unexpected gated fetch"));
-        }
-    });
+    let server_thread =
+        crate::common::FixtureServer::from_server(Arc::new(server), move |server| {
+            while let Ok(request) = server.recv() {
+                counter.fetch_add(1, Ordering::SeqCst);
+                let _ = request.respond(tiny_http::Response::from_string("unexpected gated fetch"));
+            }
+        });
     let (_store_temp, store) = separate_store();
     let result = catalog_at(temp.path(), "host-A").resolve_for_sync_arrival(
         &store,
@@ -557,12 +570,13 @@ fn sync_arrival_headless_for_apache_model_on_pre_populated_cache_returns_already
     write_source_override(temp.path(), NOMIC_ID, &base_url, NOMIC_REVISION);
     let outbound_request_count = Arc::new(AtomicUsize::new(0));
     let counter = Arc::clone(&outbound_request_count);
-    let server_thread = std::thread::spawn(move || {
-        if let Ok(Some(request)) = server.recv_timeout(Duration::from_millis(250)) {
-            counter.fetch_add(1, Ordering::SeqCst);
-            let _ = request.respond(tiny_http::Response::from_string("unexpected warm fetch"));
-        }
-    });
+    let server_thread =
+        crate::common::FixtureServer::from_server(Arc::new(server), move |server| {
+            while let Ok(request) = server.recv() {
+                counter.fetch_add(1, Ordering::SeqCst);
+                let _ = request.respond(tiny_http::Response::from_string("unexpected warm fetch"));
+            }
+        });
     let (_store_temp, store) = separate_store();
     let result = catalog_at(temp.path(), "host-A")
         .resolve_for_sync_arrival(&store, NOMIC_ID, OutputMode::Headless)
@@ -643,9 +657,9 @@ fn headless_mode_log_sink_receives_model_source_byte_size_payload_within_two_hun
         })
     });
     call_rx
-        .recv_timeout(Duration::from_secs(1))
+        .recv()
         .expect("fetch thread reaches resolve_for_sync_arrival call");
-    let line = line_rx.recv_timeout(Duration::from_millis(250));
+    let line = line_rx.recv();
     assert!(
         line.is_ok(),
         "headless tracing line should arrive before fetch completion"

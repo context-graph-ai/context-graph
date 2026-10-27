@@ -70,7 +70,7 @@ fn insert_generation(store: &Store, context_id: uuid::Uuid, id: uuid::Uuid) {
                 ("started_at".into(), Value::TxId(TxId(1))),
             ]),
         )
-        .expect("seed derived generation through the declared test SQL seam");
+        .expect("seed derived generation through the declaBehavior tests SQL seam");
 }
 
 fn insert_passage(
@@ -100,7 +100,7 @@ fn insert_passage(
                 ("created_at".into(), Value::TxId(TxId(1))),
             ]),
         )
-        .expect("seed derived passage through the declared test SQL seam");
+        .expect("seed derived passage through the declaBehavior tests SQL seam");
 }
 
 fn receipt_rows(columns: &[String], rows: &[Vec<Value>]) -> Vec<(u64, String)> {
@@ -198,19 +198,20 @@ fn receipt_fold_keeps_ordinal_hash_and_count_across_small_cursor_pages() {
     let mut cursor = session
         .open_cursor(RECEIPT_ORDER_PROBE_SQL, &params(generation_id))
         .expect("open equality-prefixed receipt order probe cursor");
-    let mut rows = receipt_rows(&cursor.first_page().columns(), &cursor.first_page().rows());
+    let mut rows = receipt_rows(cursor.first_page().columns(), cursor.first_page().rows());
     let mut more = cursor.first_page().has_more();
     while more {
         let page = cursor
             .fetch(NonZeroUsize::new(3))
             .expect("fetch bounded receipt cursor page");
         more = page.has_more();
-        rows.extend(receipt_rows(&page.columns(), &page.rows()));
+        rows.extend(receipt_rows(page.columns(), page.rows()));
     }
     cursor.close().expect("close receipt cursor");
 
     assert_eq!(
-        planned.trace().physical_plan, "IndexScan",
+        planned.trace().physical_plan,
+        "IndexScan",
         "{:#?}",
         planned.trace()
     );

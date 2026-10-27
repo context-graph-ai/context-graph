@@ -277,23 +277,7 @@ fn nomic_acceptance_cache_root() -> PathBuf {
     if let Some(path) = std::env::var_os("CG_NOMIC_TEST_CACHE") {
         return PathBuf::from(path);
     }
-    if cfg!(target_os = "windows") {
-        return std::env::var_os("LOCALAPPDATA")
-            .map(PathBuf::from)
-            .unwrap_or_else(std::env::temp_dir)
-            .join("cg")
-            .join("embedders");
-    }
-    std::env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME")
-                .map(PathBuf::from)
-                .map(|home| home.join(".cache"))
-        })
-        .unwrap_or_else(std::env::temp_dir)
-        .join("cg")
-        .join("embedders")
+    context_graph::embedder::nomic::default_cache_root()
 }
 
 fn nomic_live_config() -> EmbedderConfig {
@@ -485,7 +469,7 @@ fn freshly_initialized_store_with_default_storeconfig_seeds_text_default_nomic_v
         spaces
             .iter()
             .all(|space| space.embedding_space_id != EMBEDDINGGEMMA_TEXT_DEFAULT_ID),
-        "the previous bundled text space must not be seeded by default"
+        "the opt-in sibling text space must not be seeded by default"
     );
 }
 
@@ -747,7 +731,7 @@ fn nomic_bert_forward_pass_graph_shape_cache_contract_fixtures_match_main_crate(
 /// Every checked-in golden text in `tests/fixtures/text_default_space_goldens.json` is 11-15
 /// tokens, nowhere near the plain-embedding truncation ceiling, so that fixture alone cannot
 /// catch a change to the ceiling: lowering it would silently move every real Digest/Record/
-/// Evidence vector longer than the new ceiling while the golden suite stayed green. This pins
+/// Evidence vector longer than the ceiling without affecting the golden suite. This pins
 /// the private ceiling constant's value and proves the plain-text `forward()` path still spends
 /// it to truncate from the right before the tokens ever reach the model — a rename, a value
 /// change, or a path that stops truncating with this exact constant all fail here.
@@ -1186,10 +1170,11 @@ fn embedderconfig_cache_path_override_field_routes_weight_storage_to_supplied_pa
     );
 }
 
+/// The embedder guide discloses model artifacts, registration symbols and first-load requirements.
 #[test]
 fn cg_readme_choosing_an_embedder_section_discloses_nomic_artifact_huggingface_url_approx_548mb_size_and_approx_three_minutes_first_load_on_25mbps()
  {
-    let readme = read_crate_file("README.md");
+    let readme = read_workspace_file("docs/models-and-embedders.md");
 
     assert!(readme.to_lowercase().contains("choosing an embedder"));
     assert!(readme.contains("nomic-embed-text-v1.5"));
@@ -1200,7 +1185,7 @@ fn cg_readme_choosing_an_embedder_section_discloses_nomic_artifact_huggingface_u
         ["500MB", "547MB", "548MB", "549MB", "550MB", "600MB"]
             .iter()
             .any(|size| readme.contains(size)),
-        "README must disclose the approximate first-load artifact size"
+        "The embedder guide must disclose the approximate first-load artifact size"
     );
     assert!(readme.contains("three minutes"));
     assert!(readme.contains("25Mbps"));
@@ -1281,33 +1266,69 @@ fn vigil_pattern_extra_embedding_space_declares_face_reid_v1_under_dim_512_entit
 #[test]
 fn cg_github_actions_workflow_runs_on_matrix_of_macos_latest_ubuntu_latest_and_documents_the_deliberate_windows_exclusion()
  {
-    let workflow = read_workspace_file(".github/workflows/ci.yml");
-    assert!(
-        serde_yaml_ng::from_str::<serde_yaml_ng::Value>(&workflow).is_ok(),
-        "CI workflow must be valid YAML"
-    );
-    assert!(
-        workflow.contains("os: [macos-latest, ubuntu-latest]"),
-        "the CI matrix's os list must declare exactly macos-latest and ubuntu-latest, in that \
-         order, with no windows-latest leg"
-    );
-    assert!(
-        workflow.contains("windows-latest is intentionally excluded"),
-        "the workflow must document why windows-latest is excluded from the matrix"
-    );
-    assert!(workflow.contains("cargo test --workspace"));
+    for (filename, system, stage, aggregate) in [
+        (
+            "ci.yml",
+            "ubuntu-latest",
+            "shard-union-linux-isolated",
+            "required",
+        ),
+        (
+            "macos-advisory.yml",
+            "macos-latest",
+            "shard-union-macos-isolated",
+            "macos-advisory",
+        ),
+    ] {
+        let workflow = read_workspace_file(&format!(".github/workflows/{filename}"));
+        let yaml: serde_yaml_ng::Value = serde_yaml_ng::from_str(&workflow).expect("workflow YAML");
+        for job in ["lint", "controls"] {
+            assert_eq!(
+                yaml["jobs"][job]["strategy"]["matrix"]["os"],
+                serde_yaml_ng::to_value([system]).unwrap()
+            );
+        }
+        for job in ["test", "features"] {
+            let rows = yaml["jobs"][job]["strategy"]["matrix"]["include"]
+                .as_sequence()
+                .unwrap();
+            // Both platforms run each logical bundle as its own job.
+            let expected_bundles = vec!["acceptance", "import-and-cli", "integration-and-rest"];
+            let mut actual_bundles = rows
+                .iter()
+                .map(|row| row["bundle"].as_str().expect("matrix bundle"))
+                .collect::<Vec<_>>();
+            actual_bundles.sort_unstable();
+            assert_eq!(actual_bundles, expected_bundles);
+            assert!(rows.iter().all(|row| row["os"].as_str() == Some(system)));
+        }
+        assert!(workflow.contains("windows-latest is intentionally excluded"));
+        assert!(workflow.contains("python3 scripts/ci-test-shards.py bundle default"));
+        assert!(
+            yaml["jobs"][aggregate]["steps"]
+                .as_sequence()
+                .unwrap()
+                .iter()
+                .any(|step| step["run"].as_str() == Some(&format!("bash scripts/gate.sh {stage}")))
+        );
+    }
+    assert!(read_workspace_file("scripts/gate.sh").contains("cargo test --workspace"));
 }
 
+/// The contributor guide discloses CI platforms and the shared artifact-cache policy.
 #[test]
 fn cg_readme_ci_section_documents_two_runner_matrix_and_shared_model_cache_root_keyed_off_embedder_source()
  {
-    let readme = read_crate_file("README.md");
+    let readme = read_workspace_file("CONTRIBUTING.md");
     let lower = readme.to_lowercase();
 
     assert!(lower.contains("continuous integration") || lower.contains("## ci"));
-    assert!(readme.contains("on `macos-latest` and `ubuntu-latest`."));
+    assert!(readme.contains("Required PR test and feature jobs run on `ubuntu-latest`"));
+    assert!(readme.contains(
+        "separate `macOS CI (advisory)` workflow retains the same coverage on `macos-latest`"
+    ));
     assert!(readme.contains("`windows-latest` is excluded deliberately"));
-    assert!(readme.contains("CG_MODEL_CACHE_ROOT` at runner scratch space"));
+    assert!(readme.contains("CG_MODEL_CACHE_ROOT` at runner temporary space"));
     assert!(readme.contains("actions/cache"));
     assert!(readme.contains("falls back to `~/.cache/cg/models`"));
     assert!(readme.contains("$XDG_CACHE_HOME` replacing `~/.cache` when set"));
@@ -1319,8 +1340,8 @@ fn cg_readme_ci_section_documents_two_runner_matrix_and_shared_model_cache_root_
 }
 
 const EXPECTED_STORE_PUBLIC_METHODS: &[&str] = &[
-    // Event-history surface (cg-event-backed-import intent §8: event placement, adapter and
-    // import, event read, Context binding; §9 `cg import --dry-run` for the prefix check). The
+    // Event-history surface (event placement: event placement, adapter and
+    // import, event read, Context binding; dry-run `cg import --dry-run` for the prefix check). The
     // `_for_test` hooks are internal-support seams like the `admin_raw_*` ones.
     "add_relationship",
     "admin_overwrite_digest",
@@ -1361,7 +1382,7 @@ const EXPECTED_STORE_PUBLIC_METHODS: &[&str] = &[
     "decision_targets_entity",
     "decision_targets_intention",
     // Deliberate additive Store surface — the session-goal
-    // reconciliation writer/reader (a future server-side runner reuses the same seams).
+    // reconciliation writer/reader.
     "decisions_without_serves_in_context",
     "dereference_evidence",
     "diff",
@@ -1425,7 +1446,7 @@ const EXPECTED_STORE_PUBLIC_METHODS: &[&str] = &[
     "reindex_space",
     "remove_entity_references",
     "render_decision_producer_audit_paragraph",
-    "render_school_gate_message_body",
+    "render_entity_alert_message_body",
     "replay",
     "resolve_context_binding",
     "retire_event_context_counts_for_test",
@@ -1509,8 +1530,7 @@ impl EventSearchEmbedder for MyOwnEmbedder {}
          makes the exactly-one assertion in the public-surface guard fail instead of passing"
     );
 
-    // And both detectors read the shipped file as clean, so the guard's green is a real reading of
-    // real source, not an empty scan.
+    // Both detectors inspect the shipped source and must find the declared traits and blanket impl.
     let embedder_source = read_crate_file("src/embedder.rs");
     assert_eq!(declared_public_trait_names(&embedder_source).len(), 2);
     assert_eq!(blanket_extension_impl_count(&embedder_source), 1);
@@ -1575,13 +1595,12 @@ fn embedder_trait_and_storeconfig_public_surface_diff_keeps_surviving_signatures
 
     // The four checked event-search entrypoints must be callable on any embedder handle a caller
     // happens to be holding — an embedder's own concrete type included, not only through a
-    // `dyn Embedder` handle. So they move off an inherent `impl dyn Embedder` block — which no
-    // `Embedder` implementation could ever reach directly on its own concrete type — into a
-    // sealed extension trait with a single blanket impl. This pins the new shape and the retired
-    // one by exact source string, the same technique this test already uses throughout.
+    // `dyn Embedder` handle. A sealed extension trait with a single blanket impl makes the
+    // entrypoints reachable on concrete types; an inherent `impl dyn Embedder` block cannot.
+    // Exact source strings constrain both the required and forbidden declarations.
     assert!(
         !embedder_source.contains("impl dyn Embedder"),
-        "the four checked event-search entrypoints must no longer live in an inherent `impl dyn \
+        "the four checked event-search entrypoints must be absent from an inherent `impl dyn \
          Embedder` block — that shape is reachable only through a `dyn Embedder` handle, never \
          directly on an embedder's own concrete type"
     );
@@ -1609,8 +1628,7 @@ fn embedder_trait_and_storeconfig_public_surface_diff_keeps_surviving_signatures
     // The invariant `crates/context-graph/AGENTS.md` publishes is that `Embedder` is the only
     // embedding trait and `EventSearchEmbedder` its one sealed, library-owned extension — so this
     // asserts the exact set of `pub trait` declarations in the file, not merely that the two
-    // expected ones are present. Adding a third public trait here fails until either the trait is
-    // removed or the invariant is deliberately renegotiated.
+    // expected ones are present. A third public trait violates this exact-set contract.
     let declared_public_traits = declared_public_trait_names(&embedder_source);
     assert_eq!(
         declared_public_traits,
@@ -1620,12 +1638,7 @@ fn embedder_trait_and_storeconfig_public_surface_diff_keeps_surviving_signatures
          abstraction beside them is the defect this guard exists to catch; found {declared_public_traits:?}"
     );
 
-    // The public error documentation is the surface a consumer reads at the moment one of these
-    // refusals fires, so it has to name the receiver the caller actually needs. `&dyn Embedder` is
-    // the retired shape: the checked entrypoints moved onto the sealed extension trait, and a
-    // caller who coerces to a trait object without `use context_graph::EventSearchEmbedder;` still
-    // does not have them. Sending them to a coercion they do not need, and never naming the import
-    // they do, is what this pins.
+    // Error documentation names the sealed extension trait and the import needed to call it.
     assert!(
         !error_source.contains("&dyn Embedder"),
         "src/error.rs must not describe the checked event-search entrypoints as living on          `&dyn Embedder`: they are methods of the sealed `EventSearchEmbedder` extension trait,          reachable on any embedder handle once that trait is in scope"
@@ -1656,7 +1669,7 @@ fn embedder_trait_and_storeconfig_public_surface_diff_keeps_surviving_signatures
     );
 
     // `event_placement` is the event-placement surface's frozen `StoreConfig` field
-    // (cg-event-backed-import intent §8, "Event-placement surface").
+    // (event placement, "Event-placement surface").
     assert_eq!(
         vec![
             "db_path",

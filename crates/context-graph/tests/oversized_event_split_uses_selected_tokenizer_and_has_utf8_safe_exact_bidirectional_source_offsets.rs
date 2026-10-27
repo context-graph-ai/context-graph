@@ -254,10 +254,6 @@ fn oversized_event_split_uses_selected_tokenizer_and_has_utf8_safe_exact_bidirec
                 if *limit == max_sequence_length && *token_count == prepared_oversized.token_count()
         ),
         "embedding a still-oversized prepared document must be refused by exact token count \
-         against the embedder's declared maximum, never silently truncated; got {result:?} \
-         (rebound from the pre-existing CgError::TranscriptTooLargeForModel, which stays reserved \
-         for the unrelated legacy plain-embedding path, to the role-neutral \
-         CgError::PreparedInputExceedsModelLimit the checked entrypoints enforce for every \
-         embedder)"
+         against the embedder's declared maximum, never silently truncated; got {result:?}"
     );
 }

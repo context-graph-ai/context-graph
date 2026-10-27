@@ -36,6 +36,10 @@ pub(super) fn register_impact_analysis_trigger(db: &Database) -> Result<()> {
     Ok(())
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "ContextDB keeps typed refusal details inline so error propagation needs no allocation."
+)]
 fn run_impact_analysis(db: &Database, ctx: &TriggerContext) -> contextdb_core::Result<()> {
     let observation_id = required_uuid(&ctx.row_values, "id")?;
     let entity_id = required_uuid(&ctx.row_values, "entity_id")?;
@@ -168,6 +172,10 @@ impl<'a> ImpactReadCache<'a> {
         }
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "ContextDB keeps typed refusal details inline so error propagation needs no allocation."
+    )]
     fn preload_serves(&mut self, decision_ids: &[Uuid]) -> contextdb_core::Result<()> {
         let missing = sorted_unique(
             decision_ids
@@ -187,6 +195,10 @@ impl<'a> ImpactReadCache<'a> {
         Ok(())
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "ContextDB keeps typed refusal details inline so error propagation needs no allocation."
+    )]
     fn preload_active_servers(&mut self, intention_ids: &[Uuid]) -> contextdb_core::Result<()> {
         let missing = sorted_unique(
             intention_ids
@@ -209,6 +221,10 @@ impl<'a> ImpactReadCache<'a> {
         Ok(())
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "ContextDB keeps typed refusal details inline so error propagation needs no allocation."
+    )]
     fn serves_intentions(&mut self, decision_id: Uuid) -> contextdb_core::Result<Vec<Uuid>> {
         if let Some(intention_ids) = self.serves_by_decision.get(&decision_id) {
             return Ok(intention_ids.clone());
@@ -220,6 +236,10 @@ impl<'a> ImpactReadCache<'a> {
         Ok(intention_ids)
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "ContextDB keeps typed refusal details inline so error propagation needs no allocation."
+    )]
     fn active_servers(&mut self, intention_id: Uuid) -> contextdb_core::Result<Vec<ActiveServer>> {
         if let Some(servers) = self.active_servers_by_intention.get(&intention_id) {
             return Ok(servers.clone());
@@ -231,6 +251,10 @@ impl<'a> ImpactReadCache<'a> {
         Ok(servers)
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "ContextDB keeps typed refusal details inline so error propagation needs no allocation."
+    )]
     fn sibling_confidences(
         &mut self,
         decision_id: Uuid,
@@ -270,6 +294,10 @@ fn uuid_in_clause(
     format!("{column} IN ({placeholders})")
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "ContextDB keeps typed refusal details inline so error propagation needs no allocation."
+)]
 fn active_decision_details_by_id(
     db: &Database,
     tx: TxId,
@@ -302,6 +330,10 @@ fn active_decision_details_by_id(
     Ok(out)
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "ContextDB keeps typed refusal details inline so error propagation needs no allocation."
+)]
 fn active_based_on_decisions(
     db: &Database,
     tx: TxId,
@@ -354,6 +386,10 @@ fn active_based_on_decisions(
     Ok(out)
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "ContextDB keeps typed refusal details inline so error propagation needs no allocation."
+)]
 fn basis_snapshots_for_decision_entity_many(
     db: &Database,
     tx: TxId,
@@ -406,6 +442,10 @@ fn basis_snapshots_for_decision_entity_many(
     Ok(out)
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "ContextDB keeps typed refusal details inline so error propagation needs no allocation."
+)]
 fn entity_snapshots_by_id(
     db: &Database,
     tx: TxId,
@@ -493,6 +533,10 @@ fn diff_basis(
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "ContextDB keeps typed refusal details inline so error propagation needs no allocation."
+)]
 fn serves_intentions_uncached(
     db: &Database,
     tx: TxId,
@@ -504,6 +548,10 @@ fn serves_intentions_uncached(
         .unwrap_or_default())
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "ContextDB keeps typed refusal details inline so error propagation needs no allocation."
+)]
 fn serves_intentions_many(
     db: &Database,
     tx: TxId,
@@ -554,6 +602,10 @@ fn serves_intentions_many(
     Ok(out)
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "ContextDB keeps typed refusal details inline so error propagation needs no allocation."
+)]
 fn active_servers_for_intention_uncached(
     db: &Database,
     tx: TxId,
@@ -567,6 +619,10 @@ fn active_servers_for_intention_uncached(
     )
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "ContextDB keeps typed refusal details inline so error propagation needs no allocation."
+)]
 fn active_servers_for_intentions_many(
     db: &Database,
     tx: TxId,
@@ -627,6 +683,10 @@ fn active_servers_for_intentions_many(
     Ok(out)
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "ContextDB keeps typed refusal details inline so error propagation needs no allocation."
+)]
 pub(super) fn decision_invalidation_context(
     db: &Database,
     tx: TxId,
@@ -651,6 +711,10 @@ pub(super) fn decision_invalidation_context(
     })
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "ContextDB keeps typed refusal details inline so error propagation needs no allocation."
+)]
 fn intention_now_unserved(
     reads: &mut ImpactReadCache<'_>,
     decision_id: Uuid,
@@ -667,6 +731,10 @@ fn intention_now_unserved(
     Ok(false)
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "ContextDB keeps typed refusal details inline so error propagation needs no allocation."
+)]
 fn direct_severity(
     reads: &mut ImpactReadCache<'_>,
     decision_id: Uuid,
@@ -698,6 +766,10 @@ fn direct_severity(
     Ok(InvalidationSeverity::Warning)
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "ContextDB keeps typed refusal details inline so error propagation needs no allocation."
+)]
 fn append_cascade_rows(
     db: &Database,
     tx: TxId,
@@ -772,6 +844,10 @@ fn append_cascade_rows(
     Ok(())
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "ContextDB keeps typed refusal details inline so error propagation needs no allocation."
+)]
 fn active_cites_adjacency(
     db: &Database,
     tx: TxId,
@@ -812,6 +888,10 @@ fn active_cites_adjacency(
     Ok(adjacency)
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "ContextDB keeps typed refusal details inline so error propagation needs no allocation."
+)]
 fn cites_edges_by_target(
     db: &Database,
     tx: TxId,
@@ -850,6 +930,10 @@ fn cites_edges_by_target(
     Ok(out)
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "ContextDB keeps typed refusal details inline so error propagation needs no allocation."
+)]
 fn transition_decisions_to_invalidated(
     db: &Database,
     tx: TxId,
@@ -888,6 +972,10 @@ fn transition_decisions_to_invalidated(
     Ok(())
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "ContextDB keeps typed refusal details inline so error propagation needs no allocation."
+)]
 fn insert_invalidation_rows(
     db: &Database,
     tx: TxId,
@@ -999,6 +1087,10 @@ fn invalidation_severity_str(severity: InvalidationSeverity) -> &'static str {
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "ContextDB keeps typed refusal details inline so error propagation needs no allocation."
+)]
 fn required_uuid(values: &HashMap<String, Value>, name: &str) -> contextdb_core::Result<Uuid> {
     match values.get(name) {
         Some(Value::Uuid(value)) => Ok(*value),
@@ -1008,6 +1100,10 @@ fn required_uuid(values: &HashMap<String, Value>, name: &str) -> contextdb_core:
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "ContextDB keeps typed refusal details inline so error propagation needs no allocation."
+)]
 fn col(columns: &[String], name: &str) -> contextdb_core::Result<usize> {
     columns
         .iter()
@@ -1015,6 +1111,10 @@ fn col(columns: &[String], name: &str) -> contextdb_core::Result<usize> {
         .ok_or_else(|| EngineError::Other(format!("impact analysis missing column {name}").into()))
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "ContextDB keeps typed refusal details inline so error propagation needs no allocation."
+)]
 fn row_uuid(row: &[Value], columns: &[String], name: &str) -> contextdb_core::Result<Uuid> {
     match row.get(col(columns, name)?) {
         Some(Value::Uuid(value)) => Ok(*value),
@@ -1024,6 +1124,10 @@ fn row_uuid(row: &[Value], columns: &[String], name: &str) -> contextdb_core::Re
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "ContextDB keeps typed refusal details inline so error propagation needs no allocation."
+)]
 fn row_json(row: &[Value], columns: &[String], name: &str) -> contextdb_core::Result<JsonValue> {
     match row.get(col(columns, name)?) {
         Some(Value::Json(value)) => Ok(value.clone()),
@@ -1037,6 +1141,10 @@ fn row_json(row: &[Value], columns: &[String], name: &str) -> contextdb_core::Re
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "ContextDB keeps typed refusal details inline so error propagation needs no allocation."
+)]
 fn row_i64(row: &[Value], columns: &[String], name: &str) -> contextdb_core::Result<i64> {
     match row.get(col(columns, name)?) {
         Some(Value::Int64(value)) => Ok(*value),
@@ -1046,6 +1154,10 @@ fn row_i64(row: &[Value], columns: &[String], name: &str) -> contextdb_core::Res
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "ContextDB keeps typed refusal details inline so error propagation needs no allocation."
+)]
 fn ids_in_context(
     db: &Database,
     tx: TxId,
@@ -1079,6 +1191,10 @@ fn ids_in_context(
         .collect()
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "ContextDB keeps typed refusal details inline so error propagation needs no allocation."
+)]
 fn row_optional_float(
     row: &[Value],
     columns: &[String],

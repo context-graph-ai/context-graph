@@ -1,4 +1,5 @@
-use std::sync::{Arc, Mutex};
+use crate::common::{Collector, wait_for_len};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -81,8 +82,8 @@ fn text_default(config: &toml::Value) -> Option<&str> {
         .and_then(toml::Value::as_str)
 }
 
-fn collect_new_decisions(store: &Store) -> Arc<Mutex<Vec<Decision>>> {
-    let decisions = Arc::new(Mutex::new(Vec::new()));
+fn collect_new_decisions(store: &Store) -> Arc<Collector<Decision>> {
+    let decisions = Arc::new(Collector::new());
     let seen = Arc::clone(&decisions);
     store
         .with_system_principal()
@@ -96,18 +97,12 @@ fn collect_new_decisions(store: &Store) -> Arc<Mutex<Vec<Decision>>> {
     decisions
 }
 
-fn wait_for_decisions(decisions: &Arc<Mutex<Vec<Decision>>>, expected: usize) -> Vec<Decision> {
-    let deadline = Instant::now() + Duration::from_secs(2);
-    loop {
-        let snapshot = decisions.lock().expect("decision collector").clone();
-        if snapshot.len() >= expected || Instant::now() >= deadline {
-            return snapshot;
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
+fn wait_for_decisions(decisions: &Arc<Collector<Decision>>, expected: usize) -> Vec<Decision> {
+    wait_for_len(decisions, expected);
+    decisions.lock().expect("decision collector").clone()
 }
 
-fn assert_no_decisions(decisions: &Arc<Mutex<Vec<Decision>>>) {
+fn assert_no_decisions(decisions: &Arc<Collector<Decision>>) {
     let deadline = Instant::now() + Duration::from_millis(250);
     while Instant::now() < deadline {
         assert!(

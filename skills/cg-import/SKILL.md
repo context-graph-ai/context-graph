@@ -1,40 +1,25 @@
 ---
 name: cg-import
-description: Import a project's Claude Code conversation history into the local Context Graph store with `cg import`, and read its completion state. Use when an agent or operator wants past sessions captured and searchable.
+description: Capture Claude Code history.
 ---
-<!-- enforced by: `event_history_journey_with_real_nomic_imports_finds_shows_and_forgets` -->
 
-# Import Claude Code history with `cg import`
+# Import conversation history
 
-## Prerequisites and recipe
+## Prerequisite
 
-Install `cg` using the repository README's build instructions and put it on `PATH`. Have a Claude
-Code project history directory or an exact session JSONL file. Capture needs no model; search needs
-`cg model fetch --defaults` once. The example below also needs a POSIX shell and Python 3.<!-- enforced by: `explicit_context_import_defers_search_and_keeps_source_facts_out_of_its_receipt`, `missing_nomic_artifact_blocks_background_and_wait_without_download_while_defer_skips_preflight` -->
+Install `cg`.
 
-1. Choose the project directory, or an exact session file plus `--context NAME`.
-2. Choose `--search defer` for capture only, `background` to schedule, or `wait` to finish search.
-3. Run import, inspect `state`, and use the receipt's retry instructions when search is behind.
-4. Inspect `cg status --context NAME`; use `cg find` once the selected history is ready.<!-- enforced by: `event_history_journey_with_real_nomic_imports_finds_shows_and_forgets`, `explicit_context_import_defers_search_and_keeps_source_facts_out_of_its_receipt` -->
+Choose a Context name for the imported history.
 
-## Run it
+## Recipe
 
-```sh
-cd <project-directory>
-cg import . --context <name>          # non-interactive: always name the Context
-cg import . --search wait --context <name>   # return only when search is ready
-cg import . --search wait --embedding-workers 4 --context <name>  # choose passage-call parallelism
-cg import <session.jsonl> --context <name>   # one exact session file
-cg import . --dry-run --context <name>       # resolve sources and Context, verify, write nothing
-```
+1. Run `cg import <project-directory> --context <name> --search wait`.
 
-On a terminal, `cg import .` without `--context` asks once for the Context name and remembers it
-for the project and its sub-directories. An agent has no terminal: pass `--context`, or read the
-`suggested_context` and `retry` fields of a `context_binding_required` answer and run the retry.<!-- enforced by: `first_interactive_project_import_accepts_suggested_name_on_enter_descendant_reads_reuse_binding_and_noninteractive_import_returns_retry_without_writes`, `noninteractive_unbound_project_import_returns_the_retry_without_writing` -->
+2. Run `cg import <session.jsonl> --context <name> --search defer`.
 
-## Read the answer
+3. Inspect progress with `cg status --context <name>`.
 
-Common states (not exhaustive); also inspect capture progress and search status:
+## Installed-binary example
 
 | `state` | Exit | Do next |
 | --- | ---: | --- |
@@ -161,25 +146,33 @@ Run from a checkout of this repository with `cg` on `PATH`, a POSIX shell and Py
 its checked-in roundtrip fixture plus the same additional occurrence as the deferred-import guard;
 the isolated model cache is empty. The last command prints the asserted receipt fields.<!-- enforced by: `explicit_context_import_defers_search_and_keeps_source_facts_out_of_its_receipt` -->
 
+<!-- smoke: skill -->
 ```sh
 cg_example=$(mktemp -d)
-cp crates/cg-cli/tests/fixtures/event_import/roundtrip.jsonl "$cg_example/amber.jsonl"
-cat >> "$cg_example/amber.jsonl" <<'JSONL'
-{"type":"assistant","uuid":"00000000-0000-4000-8000-000000000012","sessionId":"synthetic-session-amber","timestamp":"2026-09-01T09:10:00Z","message":{"id":"runtime-varied-message","role":"assistant","content":"Runtime-varied retained source fact: defer-only-runtime-sentinel."}}
+export HOME="$cg_example/home"
+mkdir -p "$HOME"
+export CG_DATA_ROOT="$cg_example/data"
+cat > "$cg_example/session.jsonl" <<'JSONL'
+{"type":"user","uuid":"00000000-0000-4000-8000-000000000001","sessionId":"example-auth","timestamp":"2026-09-01T09:00:00Z","message":{"role":"user","content":"Where is the authentication module?"}}
+{"type":"assistant","uuid":"00000000-0000-4000-8000-000000000002","sessionId":"example-auth","timestamp":"2026-09-01T09:01:00Z","message":{"role":"assistant","content":"The authentication module moved from src/auth.py to src/authentication.py."}}
 JSONL
-CG_DATA_ROOT="$cg_example/data" CG_MODEL_CACHE_ROOT="$cg_example/empty-model-cache" cg import "$cg_example/amber.jsonl" --context amber-context --search defer --format json > "$cg_example/import.json"
-python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); print(r["state"], r["capture"]["events"]["inserted"])' "$cg_example/import.json"
+cg import "$cg_example/session.jsonl" --context example-auth --search defer --format json > "$cg_example/import.json"
+python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d["state"]); print("inserted:", d["capture"]["events"]["inserted"])' "$cg_example/import.json"
 ```
 
-Exact final stdout:
+### Example output
 
 ```text
-captured_search_deferred 8
+captured_search_deferred
+inserted: 2
 ```
 
-A replacement passage profile retains previously searchable history outside a narrowed session
-scope. Its accepted request freezes that retained history at its published source frontiers
-and every saved frontier of the actual running request that a differing profile may publish
-after the replacement is accepted. Same-profile requests keep their selected scope. Later deferred
-capture outside the selected scope remains deferred. An unchanged profile reuses
-those completed frontiers without embedding them again.<!-- enforced by: `profile_replacement_retains_published_frontiers_outside_the_newest_selection`, `profile_replacement_retains_an_earlier_queued_frontier_published_after_acceptance` -->
+## Failure to handle
+
+An exact-file import without `--context` exits 2. <!-- enforced by: `import_usage_errors_name_the_token_and_do_no_work` -->
+
+Missing local Nomic artifacts leave capture complete and search blocked. <!-- enforced by: `missing_nomic_artifact_blocks_background_and_wait_without_download_while_defer_skips_preflight` -->
+
+Run `cg model fetch --defaults`; retry import with `--search wait`.
+
+See [CLI reference](../../docs/cli.md) and [configuration](../../docs/configuration.md).

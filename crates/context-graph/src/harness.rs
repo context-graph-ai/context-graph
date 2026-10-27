@@ -110,9 +110,7 @@ pub fn default_capture_context(tenant_id: &str, _cwd: &str) -> String {
 // CaptureHarnessConfig
 // ---------------------------------------------------------------------------
 
-/// Per-chunk item caps rendered into the extraction prompt: configuration, not compile-time
-/// constants — a live recall clip when set too low
-/// (the hosted ceiling probe sat exactly at the old hardcoded decision cap).
+/// Per-chunk item caps rendered into the extraction prompt. Low caps limit recall.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ItemCaps {
     pub goals: usize,
@@ -167,11 +165,10 @@ pub struct CaptureHarnessConfig {
     /// Per-chunk item caps rendered into the prompt. When unset, `ItemCaps::default()`.
     pub item_caps: Option<ItemCaps>,
     /// USER-SUPPLIED entity vocabulary (user supplied, never in code). When unset, the 13 built-in types. Feeds schema + prompt + grounding from this
-    /// one source — the first slice of cg-open-entity-vocabulary.
+    /// one source.
     pub entity_vocabulary: Option<Vec<String>>,
     /// Staged extraction: run focused entities/decisions passes alongside the full pass
-    /// and merge deterministically. Opt-in config; the default is the shipped single pass —
-    /// the bench measures both as levers before any default flips.
+    /// and merge deterministically. Opt-in config; the default is a single pass.
     pub staged_extraction: bool,
     /// Session-level goal reconciliation after a drain: merges per-chunk duplicate goals
     /// into one canonical intention and flags unattached decisions. Default ON (additive,
@@ -265,7 +262,7 @@ impl CaptureHarnessConfig {
     }
 
     /// Pass-focused descriptor: the focused passes ask for a SUBSET of the ontology —
-    /// entities-only; decisions+goals (the trunk stays attachable) — never the full re-ask.
+    /// entities-only; decisions+goals (the goal linkage stays attachable) — never the full re-ask.
     pub fn schema_descriptor_for_pass(
         &self,
         pass: crate::ingest::ExtractionPass,
@@ -275,7 +272,7 @@ impl CaptureHarnessConfig {
         let keep: &[&str] = match pass {
             ExtractionPass::Full => return Some(descriptor),
             ExtractionPass::EntitiesOnly => &["entities"],
-            // Decisions attach to goals (the trunk) — the pass keeps goals attachable.
+            // Decisions attach to goals (the goal linkage) — the pass keeps goals attachable.
             ExtractionPass::DecisionsOnly => &["goals", "decisions"],
             ExtractionPass::SessionIntention => &["goals"],
         };
@@ -320,11 +317,9 @@ exhaustively; leave every other category out."
         )
     }
 
-    /// The ONE production prompt assembly: framing, tuned recipe, schema block,
-    /// caps, and shape guidance, rendered from this config. cg-cli and the bench both call THIS,
-    /// so they cannot drift. The tuned rules are the extraction recipe that probe 2 proved
-    /// recovers entities (0 → 15–16/chunk), plus the decision→goal attachment instruction
-    /// (the primary observed trunk failure), now production behavior instead of harness-only.
+    /// Shared prompt assembly for the CLI and bench: framing, extraction rules, schema,
+    /// caps, and shape guidance rendered from this config. The rules request entity extraction
+    /// and attachment of each decision to its goal.
     pub fn render_extraction_prompt(&self, inputs: &ExtractionPromptInputs<'_>) -> String {
         let descriptor = self
             .schema_descriptor()
@@ -420,7 +415,7 @@ impl CaptureHarnessConfig {
     /// The closed entity vocabulary. The schema descriptor's entity field reads this accessor;
     /// the grounding closed-vocabulary check and the cg-why legal-value list resolve to the same
     /// one canonical definition (`EntityType::ALL`). There is no second list — the vocabulary has
-    /// a single change point. (A per-tenant override field is a recorded follow-up.)
+    /// a single change point.
     pub fn allowed_entity_types(&self) -> Vec<crate::EntityType> {
         crate::EntityType::ALL.to_vec()
     }
@@ -865,7 +860,7 @@ pub enum DecisionRelation {
 // ---------------------------------------------------------------------------
 
 /// The structured receipt returned alongside a capture. Sections are ordered with intentions
-/// first (the trunk the user organizes around), then decisions, entities, observations,
+/// first (the goal linkage the user organizes around), then decisions, entities, observations,
 /// outcomes, and any flagged items.
 #[derive(Debug, Clone, Default)]
 pub struct CaptureReceiptContent {
@@ -935,10 +930,8 @@ pub fn run_capture(
     run_capture_into_digest(store, request, extractor, config, None)
 }
 
-/// Deterministic staged-harvest merge: focused-pass items JOIN the full pass's
-/// harvest (deduped by normalized text/name); nothing is ever removed, so a lazy-empty focused
-/// pass cannot erase full-pass findings — the probe-2 relocated-lazy-empty failure is
-/// structurally impossible here.
+/// Deterministic staged-harvest merge: focused-pass items join the full pass harvest,
+/// deduplicated by normalized text/name. An empty focused pass preserves full-pass findings.
 fn merge_staged_harvests(
     full: &mut crate::ingest::StructuredHarvest,
     entities_pass: crate::ingest::StructuredHarvest,
@@ -965,7 +958,7 @@ fn merge_staged_harvests(
 
 /// Run the same terminal capture path as [`run_capture`], but anchor the structured graph onto an
 /// existing digest (`reuse_digest`) instead of minting a new one. The understanding-queue drainer
-/// passes the id of the tier-0 digest it is understanding, so a chunk yields exactly ONE digest
+/// passes the id of the model-free digest it is understanding, so a chunk yields exactly ONE digest
 /// that transitions verbatim -> structured (no duplicate digest, no retrieval double-count). With
 /// `None` this is identical to [`run_capture`].
 pub fn run_capture_into_digest(
@@ -1069,11 +1062,9 @@ pub fn run_capture_into_digest_with_completion(
         );
     }
 
-    // Goal-key backfill (silent-loss fix): the capture writer SKIPS a decision that resolves
-    // to no goal — on this harness path a goal-less decision in a goal-less chunk was silently
-    // DROPPED (the legacy record path already backfilled; this path did not). Backfill attaches
-    // it to the synthetic fallback goal so it is stored and retrievable; the session
-    // reconciliation pass then surfaces synthetic-only attachments for review.
+    // Goal-key backfill attaches a goal-less decision to a synthetic fallback goal so the
+    // capture writer stores it and it remains retrievable. Session reconciliation surfaces
+    // synthetic-only attachments for review.
     crate::ingest::ensure_goal_keys_for_decisions(&mut harvest, &request.context_label);
 
     // Resolve any raw model-emitted entity-type strings to their typed variant before grounding,

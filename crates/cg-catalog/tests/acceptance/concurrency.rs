@@ -1,11 +1,9 @@
+use crate::common::{
+    FixtureServer, LockCheckpoint, catalog_with_child_lock_checkpoint, release_lock_checkpoint,
+};
 use std::fs;
 use std::process::{Command, Stdio};
-use std::sync::{
-    Arc, Barrier, Condvar, Mutex,
-    atomic::{AtomicBool, Ordering},
-    mpsc,
-};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Barrier, Condvar, Mutex, atomic::Ordering, mpsc};
 
 use cg_catalog::{FetchResult, OutputMode};
 use context_graph::{Principal, TxId};
@@ -24,7 +22,7 @@ fn child_fetch_if_requested() -> bool {
     };
     let root = std::path::PathBuf::from(root);
     let model_id = std::env::var("CG_CATALOG_CONCURRENCY_FETCH_MODEL").expect("model env");
-    let catalog = catalog_at(root, "host-A");
+    let catalog = catalog_with_child_lock_checkpoint(catalog_at(root, "host-A"));
     let result = catalog.fetch(None, &model_id, OutputMode::Interactive);
     match result {
         Ok(result) => {
@@ -63,30 +61,32 @@ fn spawn_fetch_child(
 fn spawn_race_child(
     test_name: &str,
     root: &std::path::Path,
-) -> (std::process::Child, std::path::PathBuf) {
+) -> (std::process::Child, std::path::PathBuf, LockCheckpoint) {
+    static NEXT_RESULT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let result_file = root.join(format!(
-        ".race-result-{:?}-{}.txt",
-        std::thread::current().id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system time after epoch")
-            .as_nanos()
+        ".race-result-{}.txt",
+        NEXT_RESULT.fetch_add(1, Ordering::SeqCst)
     ));
+    let checkpoint = LockCheckpoint::new();
     let child = Command::new(std::env::current_exe().expect("current test binary"))
         .arg("--exact")
         .arg(test_name)
         .env("CG_CATALOG_CONCURRENCY_FETCH_ROOT", root)
         .env("CG_CATALOG_CONCURRENCY_FETCH_MODEL", NOMIC_ID)
         .env("CG_CATALOG_CONCURRENCY_RESULT_FILE", &result_file)
+        .env("CG_CATALOG_TEST_LOCK_CHECKPOINT", checkpoint.path())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .expect("race child starts");
-    (child, result_file)
+    (child, result_file, checkpoint)
 }
 
-fn wait_for_fetch_result(child: (std::process::Child, std::path::PathBuf), label: &str) -> String {
-    let (child, result_file) = child;
+fn wait_for_fetch_result(
+    child: (std::process::Child, std::path::PathBuf, LockCheckpoint),
+    label: &str,
+) -> String {
+    let (child, result_file, _checkpoint) = child;
     let output = child.wait_with_output().expect("child output collected");
     assert!(
         output.status.success(),
@@ -118,12 +118,17 @@ fn accepted_by_human(record: &toml::Value) -> Option<&str> {
         .and_then(toml::Value::as_str)
 }
 
-fn assert_child_blocked(child: &mut std::process::Child, label: &str) {
-    std::thread::sleep(Duration::from_millis(200));
+fn assert_child_blocked(
+    child: &mut std::process::Child,
+    label: &str,
+    checkpoint: &LockCheckpoint,
+) -> std::os::unix::net::UnixStream {
+    let held = checkpoint.entered();
     assert!(
         child.try_wait().expect("child status readable").is_none(),
         "{label} should still be blocked on the per-model lockfile"
     );
+    held
 }
 
 fn respond_with_nomic_fixture(request: tiny_http::Request) {
@@ -162,26 +167,24 @@ fn start_first_response_gated_nomic_server(
     mpsc::Receiver<()>,
     mpsc::Sender<()>,
     Arc<std::sync::atomic::AtomicUsize>,
-    std::thread::JoinHandle<()>,
+    FixtureServer,
 ) {
-    let server = tiny_http::Server::http("127.0.0.1:0").expect("stub server");
+    let server = Arc::new(tiny_http::Server::http("127.0.0.1:0").expect("stub server"));
     let base_url = stub_base_url(&server);
     write_source_override(root, NOMIC_ID, &base_url, NOMIC_REVISION);
     let request_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let counter = Arc::clone(&request_count);
     let (first_request_tx, first_request_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
-    let server_thread = std::thread::spawn(move || {
+    let server_thread = FixtureServer::from_server(server, move |server| {
         let mut first_release = Some(release_rx);
-        while let Ok(Some(request)) = server.recv_timeout(Duration::from_secs(5)) {
+        while let Ok(request) = server.recv() {
             counter.fetch_add(1, Ordering::SeqCst);
             if let Some(release_rx) = first_release.take() {
                 let first_request_tx = first_request_tx.clone();
                 std::thread::spawn(move || {
                     first_request_tx.send(()).expect("first request signalled");
-                    release_rx
-                        .recv_timeout(Duration::from_secs(3))
-                        .expect("first response release signal");
+                    release_rx.recv().expect("first response release signal");
                     respond_with_nomic_fixture(request);
                 });
             } else {
@@ -196,7 +199,7 @@ struct OverlapSourceProbe {
     nomic_model_requests: Arc<std::sync::atomic::AtomicUsize>,
     gemma_model_requests: Arc<std::sync::atomic::AtomicUsize>,
     overlap_gate: Arc<(Mutex<ModelRequestOverlapState>, Condvar)>,
-    server_thread: std::thread::JoinHandle<()>,
+    server_thread: FixtureServer,
 }
 
 #[derive(Default)]
@@ -204,7 +207,6 @@ struct ModelRequestOverlapState {
     active: usize,
     max_active: usize,
     overlap_observed: bool,
-    timed_out_waiting_for_overlap: bool,
 }
 
 fn wait_for_model_request_overlap(gate: &Arc<(Mutex<ModelRequestOverlapState>, Condvar)>) {
@@ -216,29 +218,15 @@ fn wait_for_model_request_overlap(gate: &Arc<(Mutex<ModelRequestOverlapState>, C
         state.overlap_observed = true;
         cvar.notify_all();
     }
-    let deadline = Instant::now() + Duration::from_secs(10);
     while !state.overlap_observed {
-        let now = Instant::now();
-        if now >= deadline {
-            state.timed_out_waiting_for_overlap = true;
-            break;
-        }
-        let remaining = deadline.saturating_duration_since(now);
-        let (next, wait_result) = cvar
-            .wait_timeout(state, remaining)
-            .expect("overlap cvar wait");
-        state = next;
-        if wait_result.timed_out() && !state.overlap_observed {
-            state.timed_out_waiting_for_overlap = true;
-            break;
-        }
+        state = cvar.wait(state).expect("overlap cvar wait");
     }
     state.active -= 1;
     cvar.notify_all();
 }
 
 fn start_overlap_gated_nomic_and_gemma_source_server(root: &std::path::Path) -> OverlapSourceProbe {
-    let server = tiny_http::Server::http("127.0.0.1:0").expect("stub server");
+    let server = Arc::new(tiny_http::Server::http("127.0.0.1:0").expect("stub server"));
     let base_url = stub_base_url(&server);
     let (gemma_source_dir, _unique_token) =
         write_valid_mini_gemma_cache(&root.join(".valid-gemma-source"));
@@ -264,8 +252,8 @@ fn start_overlap_gated_nomic_and_gemma_source_server(root: &std::path::Path) -> 
     let nomic_counter = Arc::clone(&nomic_model_requests);
     let gemma_counter = Arc::clone(&gemma_model_requests);
     let server_overlap_gate = Arc::clone(&overlap_gate);
-    let server_thread = std::thread::spawn(move || {
-        while let Ok(Some(request)) = server.recv_timeout(Duration::from_secs(5)) {
+    let server_thread = FixtureServer::from_server(server, move |server| {
+        while let Ok(request) = server.recv() {
             let url = request.url().to_string();
             let is_model = url.ends_with("model.safetensors");
             if url.contains(GEMMA_ID) {
@@ -340,48 +328,21 @@ fn concurrent_writers_to_same_model_dir_via_lockfile_serialize_one_winner_other_
         let (first_request_rx, release_tx, request_count, server_thread) =
             start_first_response_gated_nomic_server(&race_root);
         let held_lock = hold_model_lock(&race_root, NOMIC_ID);
-        let barrier = Arc::new(Barrier::new(2));
-        let first_delay = if iteration % 2 == 0 {
-            Duration::from_millis(0)
+        let mut first = spawn_race_child(test_name, &race_root);
+        let mut second = spawn_race_child(test_name, &race_root);
+        let first_held = assert_child_blocked(&mut first.0, "first writer", &first.2);
+        let second_held = assert_child_blocked(&mut second.0, "second writer", &second.2);
+        let (winner, loser) = if iteration % 2 == 0 {
+            (first_held, second_held)
         } else {
-            Duration::from_millis(30)
+            (second_held, first_held)
         };
-        let second_delay = if iteration % 2 == 0 {
-            Duration::from_millis(30)
-        } else {
-            Duration::from_millis(0)
-        };
-        let first_barrier = Arc::clone(&barrier);
-        let first_root = race_root.clone();
-        let first_handle = std::thread::spawn(move || {
-            first_barrier.wait();
-            std::thread::sleep(first_delay);
-            spawn_race_child(test_name, &first_root)
-        });
-        let second_barrier = Arc::clone(&barrier);
-        let second_root = race_root.clone();
-        let second_handle = std::thread::spawn(move || {
-            second_barrier.wait();
-            std::thread::sleep(second_delay);
-            spawn_race_child(test_name, &second_root)
-        });
-        let mut first = first_handle.join().expect("first race child spawned");
-        let mut second = second_handle.join().expect("second race child spawned");
-        assert_child_blocked(
-            &mut first.0,
-            "first same-model writer before parent release",
-        );
-        assert_child_blocked(
-            &mut second.0,
-            "second same-model writer before parent release",
-        );
+        release_lock_checkpoint(winner);
         drop(held_lock);
-        assert!(
-            first_request_rx
-                .recv_timeout(Duration::from_millis(700))
-                .is_ok(),
-            "one writer should reach the configured source before publishing artifacts"
-        );
+        first_request_rx
+            .recv()
+            .expect("selected winner enters its critical section");
+        release_lock_checkpoint(loser);
         assert!(
             !race_root.join(NOMIC_ID).join("catalog.toml").exists(),
             "a writer blocked inside its first source response must not publish a manifest"
@@ -488,10 +449,6 @@ fn concurrent_writers_to_different_model_dirs_do_not_block_each_other() {
         overlap_state.max_active, 2,
         "parallel two-model fetch should put both model.safetensors requests in flight together"
     );
-    assert!(
-        !overlap_state.timed_out_waiting_for_overlap,
-        "one model.safetensors request waited without observing the other model in flight"
-    );
     assert_eq!(
         parallel_probe.nomic_model_requests.load(Ordering::SeqCst),
         1,
@@ -527,9 +484,7 @@ fn concurrent_writer_crash_mid_write_leaves_lockfile_releasable_for_next_writer(
         "Completed",
     );
     assert!(
-        first_request_rx
-            .recv_timeout(Duration::from_millis(700))
-            .is_ok(),
+        first_request_rx.recv().is_ok(),
         "crashing writer should reach the configured source through the real fetch path"
     );
     assert!(
@@ -575,7 +530,7 @@ fn concurrent_acceptance_record_writes_serialize_via_lockfile_no_lost_writes_str
         record.artifact_sha = fixture_sha(&root.join(GEMMA_ID).join("model.safetensors"));
         record.accepted_at = if scope == "host-A" { TxId(1) } else { TxId(2) };
         record.accepted_by = Principal::Human(format!("{scope}@example.test"));
-        catalog_at(root, &scope)
+        catalog_with_child_lock_checkpoint(catalog_at(root, &scope))
             .record_acceptance(GEMMA_ID, record)
             .expect("child acceptance returns");
         return;
@@ -583,11 +538,14 @@ fn concurrent_acceptance_record_writes_serialize_via_lockfile_no_lost_writes_str
     let temp = tempfile::tempdir().expect("tempdir");
     write_valid_mini_gemma_acceptance(temp.path(), "host-A");
     let held_lock = hold_model_lock(temp.path(), GEMMA_ID);
+    let first_checkpoint = LockCheckpoint::new();
+    let second_checkpoint = LockCheckpoint::new();
     let mut first = Command::new(std::env::current_exe().expect("current test binary"))
         .arg("--exact")
         .arg("concurrency::concurrent_acceptance_record_writes_serialize_via_lockfile_no_lost_writes_strict_monotonic_accepted_at")
         .env("CG_CATALOG_ACCEPTANCE_CHILD_ROOT", temp.path())
         .env("CG_CATALOG_ACCEPTANCE_CHILD_SCOPE", "host-A")
+        .env("CG_CATALOG_TEST_LOCK_CHECKPOINT", first_checkpoint.path())
         .spawn()
         .expect("first acceptance child starts");
     let mut second = Command::new(std::env::current_exe().expect("current test binary"))
@@ -595,10 +553,14 @@ fn concurrent_acceptance_record_writes_serialize_via_lockfile_no_lost_writes_str
         .arg("concurrency::concurrent_acceptance_record_writes_serialize_via_lockfile_no_lost_writes_strict_monotonic_accepted_at")
         .env("CG_CATALOG_ACCEPTANCE_CHILD_ROOT", temp.path())
         .env("CG_CATALOG_ACCEPTANCE_CHILD_SCOPE", "host-B")
+        .env("CG_CATALOG_TEST_LOCK_CHECKPOINT", second_checkpoint.path())
         .spawn()
         .expect("second acceptance child starts");
-    assert_child_blocked(&mut first, "first acceptance writer");
-    assert_child_blocked(&mut second, "second acceptance writer");
+    let first_held = assert_child_blocked(&mut first, "first acceptance writer", &first_checkpoint);
+    let second_held =
+        assert_child_blocked(&mut second, "second acceptance writer", &second_checkpoint);
+    release_lock_checkpoint(first_held);
+    release_lock_checkpoint(second_held);
     drop(held_lock);
     assert!(first.wait().expect("first child waits").success());
     assert!(second.wait().expect("second child waits").success());
@@ -655,29 +617,28 @@ fn concurrent_read_during_write_observes_either_pre_write_state_or_post_write_st
     let (first_request_rx, release_tx, _request_count, server_thread) =
         start_first_response_gated_nomic_server(temp.path());
     let seen = Arc::clone(&observations);
-    let done = Arc::new(AtomicBool::new(false));
-    let done_reader = Arc::clone(&done);
+    let (waiting_tx, waiting_rx) = mpsc::channel();
+    let (sample_tx, sample_rx) = mpsc::channel();
     let reader = std::thread::spawn(move || {
-        loop {
-            let catalog = catalog_at(&root, "reader");
-            let status = catalog
-                .list()
-                .expect("reader list returns")
-                .into_iter()
-                .find(|entry| entry.id == NOMIC_ID)
-                .map(|entry| format!("{:?}", entry.cache_status))
-                .unwrap_or_else(|| "Missing".to_string());
-            let artifact = root.join(NOMIC_ID).join("model.safetensors");
-            let sha_ok =
-                artifact.exists() && fixture_sha(&artifact) == FIXTURE_NOMIC_MODEL_SAFETENSORS_SHA;
-            seen.lock()
-                .expect("reader observations")
-                .push((status, sha_ok));
-            if done_reader.load(Ordering::SeqCst) {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
+        sample_rx
+            .recv()
+            .expect("writer entered its critical section");
+        let catalog = catalog_at(&root, "reader").with_lock_wait_observer_for_test(move || {
+            waiting_tx.send(()).expect("reader reports lock contention");
+        });
+        let status = catalog
+            .list()
+            .expect("reader list returns")
+            .into_iter()
+            .find(|entry| entry.id == NOMIC_ID)
+            .map(|entry| format!("{:?}", entry.cache_status))
+            .unwrap_or_else(|| "Missing".to_string());
+        let artifact = root.join(NOMIC_ID).join("model.safetensors");
+        let sha_ok =
+            artifact.exists() && fixture_sha(&artifact) == FIXTURE_NOMIC_MODEL_SAFETENSORS_SHA;
+        seen.lock()
+            .expect("reader observations")
+            .push((status, sha_ok));
     });
     let mut writer = spawn_fetch_child(
         "concurrency::concurrent_read_during_write_observes_either_pre_write_state_or_post_write_state_never_torn",
@@ -686,15 +647,15 @@ fn concurrent_read_during_write_observes_either_pre_write_state_or_post_write_st
         "Completed",
     );
     assert!(
-        first_request_rx
-            .recv_timeout(Duration::from_millis(700))
-            .is_ok(),
+        first_request_rx.recv().is_ok(),
         "writer should enter source fetch before reader samples"
     );
-    std::thread::sleep(Duration::from_millis(250));
+    sample_tx.send(()).expect("start snapshot read");
+    waiting_rx
+        .recv()
+        .expect("reader reached the writer-held snapshot lock");
     release_tx.send(()).expect("release first source response");
     assert!(writer.wait().expect("writer child waits").success());
-    done.store(true, Ordering::SeqCst);
     reader.join().expect("reader joins");
     server_thread.join().expect("server thread joins");
     let observations = observations.lock().expect("reader observations");

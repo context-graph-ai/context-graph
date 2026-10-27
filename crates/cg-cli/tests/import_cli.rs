@@ -179,10 +179,8 @@ fn persisted_text_values(path: Option<&std::path::Path>, table: &str, column: &s
     values
 }
 
-// EXPECTATION CHANGE (2026-07-04, tool-output preservation, same rationale as the
-// import_parser change): tool events now leave a one-line prose HEADER (tool name + sanitized
-// artifact target only — free-content keys like this fixture's decoy `query` are never
-// rendered, preserving the decoy contract). The old constant pinned "vanish without trace".
+// Tool events retain a one-line header with tool name and sanitized artifact target.
+// Free-content keys such as the decoy `query` are excluded.
 
 #[test]
 fn cli_record_auth_replacement_uses_extractor_not_record_shorthand() {

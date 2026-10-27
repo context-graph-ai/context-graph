@@ -12,20 +12,20 @@ members = [
     "crates/cg-connector-claude-code",
 ]
 
+exclude = ["vendor/candle-core", "vendor/candle-nn", "vendor/candle-transformers"]
+
 [workspace.package]
+keywords = ["agent-memory", "knowledge-graph", "embeddings", "claude-code", "local-first"]
+categories = ["database", "command-line-utilities"]
 version = "0.1.0"
 authors = ["John Cyriac <lucidprogrammer@hotmail.com>"]
 license = "Apache-2.0"
 repository = "https://github.com/context-graph-ai/context-graph"
 description = "Agentic memory graph — Intention-centric ontology, contextdb-backed"
 
-# CI's dev/test builds link a single huge dependency graph (contextdb-engine,
-# iroh, candle, tokenizers) into each test/bench binary; full debug info on
-# every crate in that graph (the cargo default) has been observed to exhaust
-# ubuntu-latest GitHub Actions runner disk mid-link, crashing the linker with
-# SIGBUS ("ld terminated with signal 7"). line-tables-only keeps file:line
-# backtraces while dropping the bulky per-generic-instantiation type debug
-# info that dominates the size of this workspace's debug builds.
+# Dev/test builds link contextdb-engine, iroh, candle and tokenizers into each
+# test/bench binary. line-tables-only keeps file:line backtraces while limiting
+# per-generic-instantiation debug info to fit CI runner disk capacity.
 [profile.dev]
 debug = "line-tables-only"
 
@@ -40,15 +40,15 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 strum = { version = "0.28.0", features = ["derive"] }
 chrono = { version = "0.4.44", features = ["serde"] }
-candle-core = "0.10.2"
-candle-nn = "0.10.2"
-candle-transformers = "0.10.2"
+candle-core = { path = "vendor/candle-core", version = "=0.10.2" }
+candle-nn = { path = "vendor/candle-nn", version = "=0.10.2" }
+candle-transformers = { path = "vendor/candle-transformers", version = "=0.10.2" }
 criterion = { version = "0.8", features = ["html_reports"] }
-contextdb-core = { git = "https://github.com/context-graph-ai/contextdb", rev = "6a0d4b42222f3f3063e74d16d780a3e94a87163e" }
-contextdb-engine = { git = "https://github.com/context-graph-ai/contextdb", rev = "6a0d4b42222f3f3063e74d16d780a3e94a87163e" }
-contextdb-parser = { git = "https://github.com/context-graph-ai/contextdb", rev = "6a0d4b42222f3f3063e74d16d780a3e94a87163e" }
-contextdb-tx = { git = "https://github.com/context-graph-ai/contextdb", rev = "6a0d4b42222f3f3063e74d16d780a3e94a87163e" }
-contextdb-vector = { git = "https://github.com/context-graph-ai/contextdb", rev = "6a0d4b42222f3f3063e74d16d780a3e94a87163e" }
+contextdb-core = { git = "https://github.com/context-graph-ai/contextdb", rev = "56dccfdc905653370a7a6775d0998b1053e5926a" }
+contextdb-engine = { git = "https://github.com/context-graph-ai/contextdb", rev = "56dccfdc905653370a7a6775d0998b1053e5926a" }
+contextdb-parser = { git = "https://github.com/context-graph-ai/contextdb", rev = "56dccfdc905653370a7a6775d0998b1053e5926a" }
+contextdb-tx = { git = "https://github.com/context-graph-ai/contextdb", rev = "56dccfdc905653370a7a6775d0998b1053e5926a" }
+contextdb-vector = { git = "https://github.com/context-graph-ai/contextdb", rev = "56dccfdc905653370a7a6775d0998b1053e5926a" }
 safetensors = "0.7.0"
 sha2 = { version = "0.10.9", features = ["compress"] }
 tempfile = "3.23.0"

@@ -1,15 +1,7 @@
-//! `NomicTextEmbedder::event_history_artifact()` decides Canonical/Absent/Noncanonical once, into
-//! an `Arc<OnceLock<EventHistoryArtifact>>` shared for the life of the handle and every clone of
-//! it. An unpinned `LocalPath` config that first sees an empty directory caches `Absent` — but
-//! `Absent` under a non-fetching config is deliberately ADMITTED by
-//! `NomicTextEmbedder::artifact_admits_event_search` (nothing installed yet is not the same as
-//! "wrong encoding"), so once cached it never re-evaluates what is really on disk. Two distinct
-//! bugs fall out of that: (a) `EventHistoryTextEmbedder::over`/`registration` still answers as if
-//! nothing is installed even after the canonical model is fetched onto the very same handle, and
-//! (b) because the stale `Absent` decision keeps admitting the artifact and the unpinned config
-//! skips `check_revision_marker` entirely (`nomic.rs` `load_model` only checks a revision when the
-//! caller pinned one), a LATER noncanonical install after that same initial miss is silently
-//! accepted and stamped with the reserved event-history identity instead of being refused.
+//! `NomicTextEmbedder::event_history_artifact()` caches canonical and noncanonical verdicts for
+//! present installations, shared across clones of a handle. An absent installation is checked
+//! again on later calls, so a long-lived handle can accept a canonical model installed after its
+//! first miss while refusing a noncanonical installation under the reserved event-history identity.
 //!
 //! Case (a): `EventHistoryTextEmbedder::registration` must accept the now-installed canonical
 //! model on the same handle rather than continuing to answer as if nothing were installed. Case

@@ -4,7 +4,7 @@
 //!
 //! Capture is the hot path: every event a user imports goes through one append. Whatever this
 //! schema declares elsewhere — the graph-memory totals `cg status` reports, the coverage-gap
-//! total, the raw-chunk footprint — the per-event append writes what it wrote before.
+//! total, the raw-chunk footprint — the per-event append writes only its declared capture tables.
 //!
 //! ## Why this is measured and not reasoned about
 //!

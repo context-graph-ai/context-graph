@@ -308,6 +308,7 @@ fn hit_contains_id(db: &Database, table: &str, hits: &[(RowId, f32)], id: uuid::
 
 #[test]
 fn ingest_observation_with_precomputed_embedding() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let fixture = fixture();
     let evidence_id = EvidenceId::new_v7();
     let embedding_id = EmbeddingId::new_v7();
@@ -364,6 +365,7 @@ fn ingest_observation_with_precomputed_embedding() {
 
 #[test]
 fn ingest_observation_rejects_dimension_mismatch_for_known_space() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let fixture = fixture();
     let evidence_id = EvidenceId::new_v7();
     let embedding_id = EmbeddingId::new_v7();
@@ -396,6 +398,7 @@ fn ingest_observation_rejects_dimension_mismatch_for_known_space() {
 
 #[test]
 fn precomputed_embedding_dimension_validated_at_record_observation_before_db_write() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let fixture = fixture();
     let before_observations = 0;
 
@@ -433,6 +436,7 @@ fn precomputed_embedding_dimension_validated_at_record_observation_before_db_wri
 
 #[test]
 fn precomputed_embedding_unknown_space_rejected_at_record_observation() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let fixture = fixture();
     let result = fixture.store.record_observation(observation(
         &fixture,
@@ -451,6 +455,7 @@ fn precomputed_embedding_unknown_space_rejected_at_record_observation() {
 #[cfg(context_graph_internal_test_support)]
 #[test]
 fn precomputed_embedding_atomic_with_observation_partial_failure_rolls_back_all() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let fixture = fixture();
     let Fixture {
         _dir,

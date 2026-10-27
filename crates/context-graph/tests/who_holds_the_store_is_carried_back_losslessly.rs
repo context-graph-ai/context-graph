@@ -43,7 +43,11 @@ fn store_config(db_path: PathBuf) -> StoreConfig {
 #[test]
 fn a_second_open_beside_a_live_writer_names_the_holder_it_found() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let db_path = dir.path().join("held.db");
+    let db_path = dir
+        .path()
+        .canonicalize()
+        .expect("canonicalize the fixture directory")
+        .join("held.db");
 
     let holder = Store::open(store_config(db_path.clone())).expect("a writer takes the store");
     holder

@@ -1,4 +1,4 @@
-//! Fabric first-light — apply for a since-forgotten digest, and per-node input retention.
+//! Fabric  — apply for a since-forgotten digest, and per-node input retention.
 //!
 //! Apply is anchor-checked: a result whose anchor digest is absent writes nothing and resurrects
 //! nothing. Retention is the ledger's only delete — terminal jobs past grace — and it is
@@ -19,16 +19,17 @@ const SESSION: &str = "User: Goal G1: keep memory anchored. Assistant: Decision 
 
 #[test]
 fn result_for_forgotten_digest_is_dropped_not_resurrected() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let node = FabricNode::open("forgotten_dropped");
     let extractor = CountingExtractor::new();
 
     // Control: a well-formed result applies onto a PRESENT anchor and becomes memory.
     let report = fabric::capture(
         &node.store,
-        FabricCapture::new(tier0_request("daily-loop", "s1", SESSION)),
+        FabricCapture::new(tier0_request("capture", "s1", SESSION)),
     )
     .expect("capture");
-    let ctx = context_id(&node.store, "daily-loop").expect("context");
+    let ctx = context_id(&node.store, "capture").expect("context");
     let present_digest = *report.digest_ids.first().expect("one digest");
     let present_job = fabric::job_id_for_digest(present_digest);
     let control =
@@ -59,16 +60,17 @@ fn result_for_forgotten_digest_is_dropped_not_resurrected() {
 
 #[test]
 fn apply_checks_anchor_digest_exists_before_writing_memory() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let node = FabricNode::open("anchor_checked");
     let extractor = CountingExtractor::new();
 
     // Control: apply onto a present anchor writes memory.
     let report = fabric::capture(
         &node.store,
-        FabricCapture::new(tier0_request("daily-loop", "s1", SESSION)),
+        FabricCapture::new(tier0_request("capture", "s1", SESSION)),
     )
     .expect("capture");
-    let ctx = context_id(&node.store, "daily-loop").expect("context");
+    let ctx = context_id(&node.store, "capture").expect("context");
     let job = fabric::job_id_for_digest(*report.digest_ids.first().expect("digest"));
     let applied = fabric::apply_result(&node.store, &job, &extractor).expect("apply present");
     assert!(
@@ -94,13 +96,14 @@ fn apply_checks_anchor_digest_exists_before_writing_memory() {
 
 #[test]
 fn retention_delete_of_input_copies_does_not_change_job_state() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let node = FabricNode::open("retention_state");
     fabric::capture(
         &node.store,
-        FabricCapture::new(tier0_request("daily-loop", "s1", SESSION)),
+        FabricCapture::new(tier0_request("capture", "s1", SESSION)),
     )
     .expect("capture");
-    let ctx = context_id(&node.store, "daily-loop").expect("context");
+    let ctx = context_id(&node.store, "capture").expect("context");
     let extractor = CountingExtractor::new();
     fabric::drain_local_worker(&node.store, &extractor, "local-node", None).expect("drain");
 
@@ -139,10 +142,11 @@ fn retention_delete_of_input_copies_does_not_change_job_state() {
 
 #[test]
 fn input_copies_deleted_after_result_lands_plus_grace() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let node = FabricNode::open("retention_submitter");
     fabric::capture(
         &node.store,
-        FabricCapture::new(tier0_request("daily-loop", "s1", SESSION)),
+        FabricCapture::new(tier0_request("capture", "s1", SESSION)),
     )
     .expect("capture");
     let extractor = CountingExtractor::new();
@@ -164,12 +168,13 @@ fn input_copies_deleted_after_result_lands_plus_grace() {
 }
 
 #[tokio::test]
-#[ignore = "hangs rather than fails: the test never returns, so the runner stops it at its terminate-after; quarantined under DL-CG-17"]
+#[ignore = "hangs rather than fails: the test never returns, so the runner stops it at its terminate-after; tracked in the project issue list"]
 async fn input_copies_deleted_on_executor_after_result_lands_plus_grace() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let fixture = fabric_fixture("retention_executor").await;
     fabric::capture(
         &fixture.edge1.store,
-        FabricCapture::new(tier0_request("daily-loop", "s1", SESSION)),
+        FabricCapture::new(tier0_request("capture", "s1", SESSION)),
     )
     .expect("capture on submitter");
     push_then_pull(&fixture.edge1_client, &fixture.edge2_client).await;

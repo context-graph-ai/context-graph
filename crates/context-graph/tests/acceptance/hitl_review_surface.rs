@@ -1,19 +1,5 @@
-// HITL review surface (8 acceptance tests).
-//
-// Pure-logic tests (no store): assert function/struct contract.
-//   - five_message_kinds: placeholder returns 4 (missing DriftAlert)
-//   - capture_receipt_leads_with_intention: placeholder prefixes "Decisions:"
-//   - six_verbs_are_the_whole_action_surface: placeholder accepts unknown verbs
-//
-// Store-state tests: pending-item persistence, sync-policy. Visibility is act-on-based
-// (`cg_pending_review_items` + `act_on_item`); the cursor advance API this file used to exercise
-// (`advance_cursor`/`maybe_advance_cursor`/`is_cursor_local`) was dead — it mutated an in-memory
-// `ReviewCursor` built fresh and dropped every `cg review` call, read by nothing — and was deleted.
-//   - pending_item_persists_in_every_window_until_acted_on: placeholder returns empty
-//   - pending_item_persists_through_an_intervening_confident_capture: placeholder clears on advance
-//   - review_cursor_is_not_synced: placeholder policy is Both
-//   - cg_review_surfaces_three_single_edge_categories_currency_flips_structurally_empty: placeholder omits category
-//   - cg_review_summary_reports_true_per_category_counts: placeholder reports capped length
+// Library review contracts cover receipt ordering, persistent pending items,
+// local review policy, category visibility and uncapped per-category counts.
 
 use context_graph::ingest::{CaptureRequest, record_conversation_with_extractor};
 use context_graph::review_surface::{
@@ -23,8 +9,8 @@ use context_graph::review_surface::{
 use context_graph::skill_store::REVIEW_CURSOR_TABLE;
 use context_graph::{Store, StoreConfig};
 
+use super::action_test_extractors::SpanFaithfulExtractor;
 use super::fake_extractor::open_store_with_lexical_embedder;
-use super::refactor_extractor::SpanFaithfulExtractor;
 
 fn fresh_store(name: &str) -> (tempfile::TempDir, Store) {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -45,14 +31,9 @@ fn make_review_item(id: &str, category: ReviewCategory) -> ReviewItem {
     }
 }
 
-// NOTE: `five_message_kinds_emitted_at_one_library_seam_cli_only_renders` and
-// `six_verbs_are_the_whole_action_surface` moved to `crates/cg-cli/tests/llm_client_refactor_cli.rs`
-// — the strengthened contract requires invoking the ACTUAL `cg` binary and comparing it to the
-// library seam, which is only reachable from the cg-cli crate (CARGO_BIN_EXE_cg + FakeProviderRig).
-// The remaining tests here stay library-only.
+// CLI message kinds and action parsing are exercised through the binary in
+// crates/cg-cli/tests/understanding_actions_cli.rs.
 
-// (library-only): placeholder emit_capture_receipt prefixes content with "Decisions:"
-// instead of "Intentions:". Test fails on the starts_with("Intentions") assertion.
 #[test]
 fn capture_receipt_leads_with_intention() {
     let msg = emit_capture_receipt("test-report");
@@ -63,18 +44,12 @@ fn capture_receipt_leads_with_intention() {
     );
     assert!(
         msg.content.starts_with("Intentions"),
-        "capture receipt must lead with 'Intentions'; wrong stub starts with 'Decisions:' (got {:?})",
+        "capture receipt must lead with 'Intentions' (got {:?})",
         msg.content
     );
 }
 
-// (`six_verbs_are_the_whole_action_surface` moved to cg-cli/tests/llm_client_refactor_cli.rs — see
-// the note above; it now drives the real `cg` binary against the library action seam.)
-
-// (library-only): placeholder
-// build_review_summary_with_currency_category delegates to build_review_summary which ignores
-// CurrencyFlips items, leaving currency_flips_count=0 even when a CurrencyFlips item was seeded.
-// Test fails because currency_flips_count must equal the number of CurrencyFlips items passed in.
+// The library summary counts CurrencyFlips items alongside the single-edge categories.
 #[test]
 fn cg_review_surfaces_three_single_edge_categories_currency_flips_structurally_empty() {
     // Seed one item per single-edge category, plus one CurrencyFlips placeholder.
@@ -94,12 +69,9 @@ fn cg_review_surfaces_three_single_edge_categories_currency_flips_structurally_e
     assert_eq!(summary.grouping_count, 1, "grouping_count must be 1");
     assert_eq!(summary.drift_count, 1, "drift_count must be 1");
 
-    // The currency-flips category must count the CurrencyFlips item.
-    // Placeholder: delegates to build_review_summary which ignores CurrencyFlips items
-    // (no filter for that category), so currency_flips_count stays 0.
     assert_eq!(
         summary.currency_flips_count, 1,
-        "currency_flips_count must count CurrencyFlips items; wrong stub returns 0 (drops category)"
+        "currency_flips_count must count CurrencyFlips items rather than a constant zero"
     );
 
     // Category membership: items must land under their correct categories.
@@ -120,7 +92,7 @@ fn cg_review_surfaces_three_single_edge_categories_currency_flips_structurally_e
 // LIVE PATH: `cg review` summarizes STORE state (library `gather_review_summary` over store-gathered
 // items), not a caller-supplied list. A REAL capture-produced flagged item lands in the UNCERTAIN
 // category, and the per-category counts are the TRUE store totals (the display list may be capped).
-// HEAD's gather returns an empty summary → the capture flag is absent and counts are 0 → RED.
+// an incorrect implementation's gather returns an empty summary → the capture flag is absent and counts are 0 → regression.
 #[test]
 fn cg_review_summary_reports_true_per_category_counts() {
     let (_dir, store) = fresh_store("k_review_summary_store");
@@ -134,7 +106,7 @@ fn cg_review_summary_reports_true_per_category_counts() {
             transcript: "the team discussed only routine maintenance".to_string(),
             model_available: true,
         },
-        &super::refactor_extractor::HighConfidenceFabricatedSpanExtractor,
+        &super::action_test_extractors::HighConfidenceFabricatedSpanExtractor,
     )
     .expect("capture producing a flagged item");
     assert!(
@@ -151,10 +123,10 @@ fn cg_review_summary_reports_true_per_category_counts() {
     let summary = gather_review_summary(&store, &cursor).expect("read succeeds");
 
     // The capture-produced flagged item must appear under UNCERTAIN, and the uncertain count must
-    // reflect the store (≥ 1). HEAD's gather returns empty → both fail.
+    // reflect the store (≥ 1). an incorrect implementation's gather returns empty → both fail.
     assert!(
         summary.uncertain_count >= 1,
-        "uncertain_count must reflect the store's capture-produced flagged item (≥1); HEAD's \
+        "uncertain_count must reflect the store's capture-produced flagged item (≥1); an incorrect implementation's \
          store-gather returns an empty summary (0)"
     );
     assert!(
@@ -163,7 +135,7 @@ fn cg_review_summary_reports_true_per_category_counts() {
             .iter()
             .any(|i| i.id == flagged_key || i.content.contains(&flagged_key)),
         "the capture-produced flagged item ('{flagged_key}') must appear under the UNCERTAIN \
-         category in the store-gathered review summary; HEAD gathers nothing. uncertain_items: {:?}",
+         category in the store-gathered review summary; observed uncertain_items: {:?}",
         summary.uncertain_items
     );
     // The display list may be capped, but the count is the true magnitude (never the capped length).
@@ -173,10 +145,7 @@ fn cg_review_summary_reports_true_per_category_counts() {
     );
 }
 
-// LIVE PATH: a flagged item produced by a REAL capture persists across review windows (gathered
-// from the STORE each time) until acted on — never ages out, and is NOT registered only on first
-// query. HEAD's store-gather returns empty (the capture flag is never registered as pending store
-// state) → the persistence assertions fail (RED).
+// A capture-produced flagged item persists in store-backed review windows until acted on.
 #[test]
 fn pending_item_persists_in_every_window_until_acted_on() {
     let (_dir, store) = fresh_store("k_pending_persists");
@@ -189,7 +158,7 @@ fn pending_item_persists_in_every_window_until_acted_on() {
             transcript: "the team discussed only routine maintenance".to_string(),
             model_available: true,
         },
-        &super::refactor_extractor::HighConfidenceFabricatedSpanExtractor,
+        &super::action_test_extractors::HighConfidenceFabricatedSpanExtractor,
     )
     .expect("capture producing a flagged item");
     assert!(
@@ -203,8 +172,7 @@ fn pending_item_persists_in_every_window_until_acted_on() {
         is_local: true,
     };
 
-    // Gather review TWICE WITHOUT acting — the item must appear each window, gathered from store
-    // state (not registered-on-first-query). HEAD gathers empty → fails.
+    // Both review windows gather the pending item from stored state without acting on it.
     for window in 0..2 {
         let summary = gather_review_summary(&store, &cursor).expect("read succeeds");
         assert!(
@@ -213,7 +181,7 @@ fn pending_item_persists_in_every_window_until_acted_on() {
                 .iter()
                 .any(|i| i.id == item_id || i.content.contains(&item_id)),
             "window {window}: the capture-produced flagged item ('{item_id}') must persist in the \
-             store-gathered review summary until acted on; HEAD gathers nothing. uncertain_items: {:?}",
+             store-gathered review summary until acted on; observed uncertain_items: {:?}",
             summary.uncertain_items
         );
     }
@@ -232,7 +200,7 @@ fn pending_item_persists_in_every_window_until_acted_on() {
 
 // LIVE PATH: a pending flagged item from a REAL capture survives an intervening fully-confident
 // (silent) capture that advances the cursor — `cg review` (store-gathered) still surfaces it until
-// acted on. HEAD's store-gather returns empty → fails (RED).
+// acted on. an incorrect implementation's store-gather returns empty → fails .
 #[test]
 fn pending_item_persists_through_an_intervening_confident_capture() {
     let (_dir, store) = fresh_store("k_pending_through_capture");
@@ -245,7 +213,7 @@ fn pending_item_persists_through_an_intervening_confident_capture() {
             transcript: "the team discussed only routine maintenance".to_string(),
             model_available: true,
         },
-        &super::refactor_extractor::HighConfidenceFabricatedSpanExtractor,
+        &super::action_test_extractors::HighConfidenceFabricatedSpanExtractor,
     )
     .expect("capture producing flagged item X");
     assert!(!report.flagged_items.is_empty(), "capture must flag item X");
@@ -268,8 +236,7 @@ fn pending_item_persists_through_an_intervening_confident_capture() {
     )
     .expect("confident capture must succeed");
 
-    // X must STILL be surfaced by the store-gathered review (the confident capture did not age it
-    // out). HEAD gathers empty → fails.
+    // The pending item remains in the store-backed review after a confident capture.
     let summary = gather_review_summary(&store, &cursor).expect("read succeeds");
     assert!(
         summary
@@ -277,7 +244,7 @@ fn pending_item_persists_through_an_intervening_confident_capture() {
             .iter()
             .any(|i| i.id == item_id || i.content.contains(&item_id)),
         "the pending flagged item ('{item_id}') must survive an intervening confident capture in the \
-         store-gathered review summary; HEAD gathers nothing. uncertain_items: {:?}",
+         store-gathered review summary; observed uncertain_items: {:?}",
         summary.uncertain_items
     );
 

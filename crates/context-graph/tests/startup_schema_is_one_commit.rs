@@ -1,8 +1,6 @@
 //! A fresh Store authors its whole startup schema as one schema commit.
 //!
-//! A peer replays each schema commit it receives over its whole schema, so a startup schema
-//! authored one statement per commit made a new node's first push and pull cost the square of the
-//! schema size. Every startup declaration -- the plain tables, the tables carrying a vector column,
+//! A peer replays each schema commit over its whole schema. Every startup declaration -- the plain tables, the tables carrying a vector column,
 //! a rank policy or DAG edges, every index, the subscription event types and the store's triggers
 //! -- becomes visible together or not at all, and survives a restart.
 //!

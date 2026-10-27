@@ -1,8 +1,7 @@
-//! RED contract tests for library-owned prompt assembly and operator config: the extraction prompt is
+//! regression contract tests for library-owned prompt assembly and operator config: the extraction prompt is
 //! assembled by the LIBRARY from `CaptureHarnessConfig` (no CLI-resident framing), and every
 //! recipe knob — item caps, prompt override, tier, chunk window/overlap, entity vocabulary — is
-//! operator-reachable configuration. Authored and committed BEFORE implementation; implementation
-//! commits may not touch this file.
+//! operator-reachable configuration.
 //!
 //! These are reachability/plumbing assertions (config → rendered prompt), never content
 //! assertions on prompt wording — recipe CONTENT is measured by the bench against gold, per the
@@ -21,6 +20,7 @@ fn inputs<'a>(transcript: &'a str) -> ExtractionPromptInputs<'a> {
 
 #[test]
 fn extraction_prompt_assembly_honors_caps_override_and_vocabulary() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let default_config = CaptureHarnessConfig::default();
     let default_prompt = default_config.render_extraction_prompt(&inputs("hello transcript"));
     // The transcript rides inside the assembly, delimited (capture keys on the markers).
@@ -60,9 +60,9 @@ fn extraction_prompt_assembly_honors_caps_override_and_vocabulary() {
 
 #[test]
 fn custom_entity_vocabulary_reaches_schema_values() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     // The entity noun list is USER-SUPPLIED configuration, never
-    // hardcoded ("user supplied, never in code, can be a yaml"). First slice of
-    // cg-open-entity-vocabulary: the configured list feeds schema + prompt from ONE source.
+    // hardcoded: the configured list feeds schema + prompt from ONE source.
     let custom = CaptureHarnessConfig {
         entity_vocabulary: Some(vec!["vehicle".to_string(), "lead".to_string()]),
         ..CaptureHarnessConfig::default()
@@ -83,16 +83,14 @@ fn custom_entity_vocabulary_reaches_schema_values() {
 
 #[test]
 fn default_vocabulary_unchanged_thirteen_types() {
-    // UPDATED (own commit, 2026-07-04): the vigil-recognition lane grew the built-in enum to 15
-    // (two vision kinds) mid-run, upstream on dev. The pin's PURPOSE is unchanged — the default
-    // vocabulary is exactly the built-in enum, no silent shrink/growth from THIS run's config
-    // work — so the pin now derives from the enum itself instead of a literal count.
+    let _alongside = crate::runs_alone::alongside_siblings();
+    // The default vocabulary matches every label in the built-in enum.
     let config = CaptureHarnessConfig::default();
     let values = config.allowed_entity_type_schema_values();
     assert_eq!(
         values.len(),
         context_graph::EntityType::ALL.len(),
-        "default stays exactly the built-in enum — no regression from config work"
+        "the default vocabulary must contain exactly the built-in entity-type count"
     );
     assert!(values.contains(&"repository".to_string()));
     assert!(values.contains(&"file".to_string()));
@@ -100,6 +98,7 @@ fn default_vocabulary_unchanged_thirteen_types() {
 
 #[test]
 fn capture_config_parses_from_operator_toml() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let toml_text = r#"
 [capture]
 tier = "haiku"

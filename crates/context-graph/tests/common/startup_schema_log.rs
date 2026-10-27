@@ -18,8 +18,8 @@ use contextdb_engine::sync_types::DdlChange;
 /// Every schema commit a fresh store's open authors, including the engine's work-ledger schema.
 pub const STORE_OPEN_SCHEMA_COMMITS: usize = 1;
 
-/// The startup tables the engine once refused to stage in a transaction: a vector column, a rank
-/// policy or DAG edges. They now join the one startup commit like every other declaration.
+/// Startup schema operations include vector columns, rank indexes, composite foreign keys,
+/// and immutable table declarations.
 pub const TABLES_WITH_VECTOR_RANK_OR_DAG_DECLARATIONS: &[&str] = &[
     "evidence",
     "entity_reference_embeddings_128",

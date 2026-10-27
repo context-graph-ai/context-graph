@@ -13,3 +13,11 @@ slow-timeout = { period = "60s", terminate-after = 10 }
 
 [profile.gate.junit]
 path = "junit.xml"
+
+# Reserve the entire actual nextest pool for this case: its read budget requires no sibling
+# tests to overlap its 24 writers within this invocation. Unrelated processes are not excluded.
+# Other cases retain normal parallelism. Plain cargo test uses the integration binary's
+# process-local lock instead. Default overrides also apply to gate.
+[[profile.default.overrides]]
+filter = 'binary_id(context-graph::integration) & test(=reindex::reindex_concurrent_writes_during_reindex_window_land_in_target_space_deterministically)'
+threads-required = "num-test-threads"

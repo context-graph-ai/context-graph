@@ -1,0 +1,20 @@
+[package]
+name = "cg-gate-wall-audit"
+version = "0.0.0"
+edition = "2024"
+publish = false
+autotests = false
+autobins = false
+
+[workspace]
+resolver = "2"
+
+[dependencies]
+toml = "=0.9.12"
+
+[profile.dev]
+debug = "line-tables-only"
+
+[[test]]
+name = "test_estate_audit"
+path = "../../crates/context-graph/tests/test_estate_audit.rs"

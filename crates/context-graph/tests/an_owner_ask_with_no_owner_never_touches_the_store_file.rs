@@ -14,8 +14,8 @@
 //!   `owner_absent()` is true on it — that is what a caller with its own fallback branches on.
 //! - The answer does not depend on the file: a path whose store file was written and then given up
 //!   and a path that never had a store at all get the SAME typed answer, because the route decides
-//!   before the file is looked at. A route that consulted the file could not answer both alike —
-//!   today the second one is told there is no store, which is knowledge only a look could give.
+//!   before the file is looked at. A file-absence diagnosis would disclose a file inspection and
+//!   violate this owner-only query contract.
 //! - Nothing on disk moves: the store file is byte-for-byte what it was, and the directory holding
 //!   it gains and loses no entry across the ask.
 //!

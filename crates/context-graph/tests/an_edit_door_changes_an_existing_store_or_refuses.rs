@@ -17,8 +17,8 @@
 //! every refusal leaves the store, its companion and the directory holding them byte-for-byte as
 //! they were found.
 //!
-//! The door is ADDITIVE: it takes the same consumer declaration and scope labels the other openers
-//! take, and every existing opener keeps creating an absent store exactly as it always has.
+//! The door takes the same consumer declaration and scope labels as create-capable openers,
+//! which create an absent store.
 //!
 //! Every assertion below is about a typed value, a row, or a pathname. Nothing sleeps.
 
@@ -103,6 +103,10 @@ fn scratch_root(directory: &tempfile::TempDir) -> PathBuf {
     std::fs::canonicalize(directory.path()).expect("resolve the scratch directory")
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "ContextDB keeps typed refusal details inline so error propagation needs no allocation."
+)]
 fn write_setting(store: &Store, name: &str, scope: &str) -> Result<(), EngineError> {
     store
         .sync_database()
@@ -160,9 +164,14 @@ fn an_existing_store_opens_for_change_and_the_write_lands() {
     let root = scratch_root(&directory);
     let path = seeded_store(&root);
 
-    let store =
-        Store::open_existing_for_change(config(&path), Vec::new(), unrestricted_declaration())
-            .expect("a store the consumer already has opens for change");
+    let store = Store::open_existing_for_change(
+        config(&path),
+        Vec::new(),
+        unrestricted_declaration(),
+        None,
+        None,
+    )
+    .expect("a store the consumer already has opens for change");
 
     write_setting(&store, "detector_confidence_threshold", "edge")
         .expect("the door opened the store writable, so the write lands");
@@ -186,7 +195,13 @@ fn an_absent_store_is_refused_by_the_edit_door_and_nothing_is_created() {
     let before = directory_image(&root);
 
     let refusal = expect_refusal(
-        Store::open_existing_for_change(config(&absent), Vec::new(), unrestricted_declaration()),
+        Store::open_existing_for_change(
+            config(&absent),
+            Vec::new(),
+            unrestricted_declaration(),
+            None,
+            None,
+        ),
         "absent store",
     );
 
@@ -221,7 +236,13 @@ fn a_dangling_link_is_refused_by_the_edit_door_and_never_created_through() {
     let before = directory_image(&root);
 
     let refusal = expect_refusal(
-        Store::open_existing_for_change(config(&link), Vec::new(), unrestricted_declaration()),
+        Store::open_existing_for_change(
+            config(&link),
+            Vec::new(),
+            unrestricted_declaration(),
+            None,
+            None,
+        ),
         "dangling link",
     );
 
@@ -264,9 +285,14 @@ fn a_store_this_process_cannot_look_at_is_refused_as_unreadable_by_the_edit_door
 
     std::fs::set_permissions(&vault, std::fs::Permissions::from_mode(0o000))
         .expect("seal the directory the store lives in");
-    let sealed_answer =
-        Store::open_existing_for_change(config(&path), Vec::new(), unrestricted_declaration())
-            .err();
+    let sealed_answer = Store::open_existing_for_change(
+        config(&path),
+        Vec::new(),
+        unrestricted_declaration(),
+        None,
+        None,
+    )
+    .err();
     std::fs::set_permissions(&vault, std::fs::Permissions::from_mode(0o700))
         .expect("unseal the directory so the rest of the journey can look at it");
 
@@ -290,8 +316,7 @@ fn a_store_this_process_cannot_look_at_is_refused_as_unreadable_by_the_edit_door
     );
 }
 
-// The door is additive: it refuses the absent store the ordinary opener still creates, so nothing
-// about the openers a consumer already ships changes.
+// The edit door refuses the absent store that the ordinary opener creates.
 #[test]
 fn the_edit_door_refuses_the_absent_store_the_ordinary_opener_still_creates() {
     let directory = tempfile::tempdir().expect("scratch directory");
@@ -299,7 +324,13 @@ fn the_edit_door_refuses_the_absent_store_the_ordinary_opener_still_creates() {
     let path = root.join("first-run.db");
 
     let refusal = expect_refusal(
-        Store::open_existing_for_change(config(&path), Vec::new(), unrestricted_declaration()),
+        Store::open_existing_for_change(
+            config(&path),
+            Vec::new(),
+            unrestricted_declaration(),
+            None,
+            None,
+        ),
         "absent store at the edit door",
     );
     assert!(
@@ -309,7 +340,7 @@ fn the_edit_door_refuses_the_absent_store_the_ordinary_opener_still_creates() {
     assert!(!path.exists(), "the refused door created nothing");
 
     let store = Store::open_with_consumer_schema(config(&path), Vec::new(), declared_schema())
-        .expect("the ordinary opener still creates an absent store, exactly as it always has");
+        .expect("the ordinary opener creates an absent store");
     write_setting(&store, "detector_sample_frames", "edge").expect("the first run owns the write");
     assert_eq!(
         vec!["detector_sample_frames".to_string()],
@@ -325,8 +356,9 @@ fn the_edit_door_holds_an_edge_consumer_to_the_role_its_declaration_wrote_down()
     let root = scratch_root(&directory);
     let path = seeded_store(&root);
 
-    let store = Store::open_existing_for_change(config(&path), Vec::new(), edge_declaration())
-        .expect("the edge opens the store it already has");
+    let store =
+        Store::open_existing_for_change(config(&path), Vec::new(), edge_declaration(), None, None)
+            .expect("the edge opens the store it already has");
 
     let refusal = write_setting(&store, "hub_only_setting", "server")
         .expect_err("an edge must not write a row its own declaration reserves for the hub");
@@ -354,5 +386,98 @@ fn the_edit_door_holds_an_edge_consumer_to_the_role_its_declaration_wrote_down()
         ],
         setting_names(&store),
         "only the row the edge owns landed",
+    );
+}
+
+#[test]
+fn an_edit_open_passes_the_callers_deadline_and_stop_without_retrying() {
+    use contextdb_core::read_contract::{HeldByReadersDetail, ReadFailure};
+    use contextdb_engine::database::DatabaseOpenInterceptor;
+    use contextdb_engine::{
+        Database, DatabaseOpenOptions, OwnerReadCancellation, ReaderWaitDeadline,
+    };
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    struct Observe {
+        calls: Arc<AtomicUsize>,
+        clock: Arc<dyn contextdb_core::read_contract::DeadlineClock>,
+        deadline_ms: u64,
+    }
+    impl DatabaseOpenInterceptor for Observe {
+        fn intercept(
+            &self,
+            _path: &Path,
+            options: &DatabaseOpenOptions,
+        ) -> contextdb_core::Result<Database> {
+            assert_eq!(
+                self.calls.fetch_add(1, Ordering::SeqCst),
+                0,
+                "one engine open; no consumer retry"
+            );
+            let deadline = options
+                .reader_wait_deadline
+                .as_ref()
+                .expect("caller deadline reached engine");
+            assert_eq!(deadline.deadline_ms, self.deadline_ms);
+            assert!(
+                Arc::ptr_eq(&deadline.clock, &self.clock),
+                "caller clock identity retained"
+            );
+            let stop = options
+                .reader_wait_stop
+                .as_ref()
+                .expect("caller stop reached engine");
+            assert!(!stop.is_cancelled());
+            stop.cancel();
+            Err(EngineError::ReadFailure(
+                ReadFailure::held_by_readers(HeldByReadersDetail {
+                    observed_direct_readers: 1,
+                    verified_readers: vec![],
+                })
+                .expect("valid typed held-by-readers refusal"),
+            ))
+        }
+    }
+    let directory = tempfile::tempdir().expect("scratch directory");
+    let path = directory.path().join("existing.db");
+    let before = directory_image(directory.path());
+    let deadline = ReaderWaitDeadline::after(std::time::Duration::ZERO);
+    let stop = OwnerReadCancellation::new();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observer = Arc::new(Observe {
+        calls: calls.clone(),
+        clock: deadline.clock.clone(),
+        deadline_ms: deadline.deadline_ms,
+    });
+    let result = Database::with_common_open_interceptor_for_test(observer, || {
+        Store::open_existing_for_change(
+            config(&path),
+            Vec::new(),
+            unrestricted_declaration(),
+            Some(deadline),
+            Some(stop.clone()),
+        )
+    });
+    assert!(
+        matches!(
+            result,
+            Err(CgError::StoreHeldByReaders {
+                observed_direct_readers: 1,
+                ..
+            })
+        ),
+        "typed contention remains typed"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert!(
+        stop.is_cancelled(),
+        "the engine received the caller's cancellation identity"
+    );
+    assert_eq!(
+        directory_image(directory.path()),
+        before,
+        "refusal changed no store bytes"
     );
 }

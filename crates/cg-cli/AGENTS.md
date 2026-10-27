@@ -1,28 +1,25 @@
-# `cg-cli` — package `context-graph-cli`, binary `cg`
+# cg-cli — package `context-graph-cli`, binary `cg`
 
-Purpose: parse commands and render the library's typed answers and refusals for operators.
+Purpose: parse commands and render typed library answers for operators.
+Owns arguments, help, output envelopes, typed exit mapping, root resolution,
+configuration plumbing and detached search worker process lifecycle.
+Must not own event identity, Claude JSON decoding, SQL, ranking, embedding preparation,
+storage policy or a second cache-root rule.
 
-**Owns:** arguments, help, JSON/text envelopes, typed exit mapping, data-root resolution,
-configuration plumbing and the detached search worker's process lifecycle.
-**Must not own:** event identity, Claude JSON decoding, SQL, ranking, passage rendering,
-embedding preparation, storage policy or a second model-cache-root rule.
+## Seams and where a change lives
 
-## Seams and routing
-
-| Change | Owner / entry point |
+| Change | Entry point |
 |---|---|
-| Dispatch, help, condition-to-exit mapping | `src/main.rs`; `map_store_open_err`, `memory_error` match typed variants |
-| Import/forget prompts and receipts | `src/history/import.rs`, `src/history/forget.rs` |
-| Find/show/status and selection | `src/history/read.rs`, `src/history/mod.rs` |
-| Worker wake, foreground turn, bounded request ceilings and memory refusals | `src/history/worker.rs`; filesystem primitives from `cg-node-fs` |
-| Read budget | `src/read_config.rs`; positive `[read].memory_limit_bytes` and `[read].active_time_ms` reach every reader |
-| Writer resolution/admission | `src/write_config.rs`; switch, config, then core-derived policy |
-| Data root / model cache | `data_root` in `src/main.rs` resolves `CG_DATA_ROOT` else `$HOME/.cg`; cache rule delegated to `cg-catalog` |
+| Dispatch, help and exits | `src/main.rs`; match typed conditions |
+| Capture and forgetting | `src/history/import.rs`, `src/history/forget.rs` |
+| Find, show, status and Context selection | `src/history/read.rs`, `src/history/mod.rs` |
+| Detached work, saved selections and retry accounting | `src/history/worker.rs` |
+| Reader budgets | `src/read_config.rs` |
+| Writer admission | `src/write_config.rs` |
 
-`open_reader` uses `ConsumerReader::open_with_read_limits` and the core's event-history
-reader declaration. ContextDB selects the idle-file/live-owner read route. Status/find/show never
-open a writable Store. Capture uses `Store`; the connector implements `EventImportAdapter`;
-search uses the core's `Embedder`/sealed `EventSearchEmbedder`, never a CLI abstraction.
+Read commands use core `ConsumerReader`; capture uses `Store` and the Claude connector.
+Node locks and bounded request IO come from `cg-node-fs`; model cache resolution delegates
+to `cg-catalog`. Search consumes core `Embedder` and sealed `EventSearchEmbedder`.
 
 The schema-version probe in `src/main.rs` borrows the engine answer through `rows()`. Shared
 read decoders consume the core library’s application aggregate and page accessors; the CLI does
@@ -30,8 +27,7 @@ not construct or mutate engine result storage.
 
 ## Invariants and guards
 
-- Session-import and search worker operations rely on `event_search_passages` declaring `HISTORY CURRENT ONLY`, allowing repeated tail replacements and session publications to reclaim superseded versions while preserving immutable captured events and their session identities:
-  `crates/context-graph/tests/event_search_projection_correctness.rs::old_conversations_remain_searchable_after_superseded_passage_reclaim`.
+Ownership boundaries above are review-only architectural constraints unless a guard below covers them.
 
 - Read commands change no bytes even with a writer present:
   `tests/a_read_only_command_answers_a_store_a_writer_is_holding.rs::the_read_only_commands_answer_an_idle_store_and_a_held_one_without_changing_a_byte`.
@@ -149,6 +145,35 @@ not construct or mutate engine result storage.
   `tests/a_busy_store_is_told_to_the_operator.rs::a_command_refused_by_a_writer_held_store_keeps_its_typed_answer`
   and `a_command_refused_by_a_reader_held_store_names_the_readers_it_waits_on` in that file.
 
-Fast check: `cargo test -p context-graph-cli --test read_memory_policy --test write_memory_policy`.
-Worker lifecycle proof: `cargo nextest run -p context-graph-cli --features event-search-test-support`.
-Full gate: `scripts/gate.sh`. Update operator docs and relevant `skills/` recipes with behavior.
+- Read commands never open a writable Store: `tests/a_read_only_command_answers_a_store_a_writer_is_holding.rs`,
+  `the_read_only_commands_answer_an_idle_store_and_a_held_one_without_changing_a_byte`.
+- Validate budgets before store access: `tests/read_memory_policy.rs`,
+  `invalid_read_config_is_a_config_error_before_status_can_open_or_write_the_store`.
+- Worker requests retain selected session identities, capture frontiers, budgets and bounded retry
+  allowances through restart. Completion acknowledges only verified request identities; later capture
+  never extends an accepted frontier. Guards (feature-gated: they compile only with
+  `--features event-search-test-support`, which the gate's `features` stage and CI's `features` job
+  run; a default `cargo test` skips them): `tests/import_embedding_workers.rs`, especially
+  `selected_session_ceiling_survives_restart_before_the_first_claim` and
+  `older_completed_import_acknowledges_only_observed_refusal_identities`.
+- Typed time/coordination refusals preserve committed coverage, permit independent work and remain
+  inspectable until their own frontiers complete. Guard (same feature gate as above):
+  `tests/import_embedding_workers.rs`:
+  `consecutive_typed_coordination_refusals_exhaust_one_selected_request_allowance`.
+- Busy stores use core `StoreBusy`, exit 4; reader-held conditions have no dedicated exit contract.
+  Guards: `tests/a_busy_store_is_told_to_the_operator.rs`:
+  `a_command_refused_by_a_writer_held_store_keeps_its_typed_answer` and
+  `a_command_refused_by_a_reader_held_store_names_the_readers_it_waits_on`.
+  Review-only: reader-held conditions have no dedicated numeric exit contract.
+- Presented help is the public command list; guard
+  `tests/help_presents_exactly_the_public_command_list.rs`: `help_presents_exactly_the_public_command_list`.
+
+Worker fixtures use feature-gated Unix socket notifications in `tests/event_support/mod.rs`
+and explicit release events from `cg-node-fs`. Always reread authoritative request state after
+a notification. Worker-lock release precedes queue acknowledgment: await acknowledgment before
+asserting queue membership. The reader-held-store refusal test enables the existing zero-allowance
+test seam through development dependencies; ordinary CLI builds retain their configured allowance.
+
+Fast check: `cargo test -p context-graph-cli --test read_memory_policy`.
+Lifecycle proofs: `cargo nextest run -p context-graph-cli --features event-search-test-support`.
+Full gate: `scripts/gate.sh`; public operator contracts: [CLI reference](../../docs/cli.md).

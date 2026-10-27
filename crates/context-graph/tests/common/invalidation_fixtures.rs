@@ -137,7 +137,7 @@ pub struct DirectSeedOptions {
     pub intention_now_un_served: bool,
     pub cascade_from: Option<DecisionId>,
     pub reason: Option<String>,
-    pub mode_two_decision: bool,
+    pub system_decision: bool,
 }
 
 struct SeedBase {
@@ -167,7 +167,7 @@ fn create_seed_base(store: &Store, label: &str, options: DirectSeedOptions) -> S
         entity.id,
         intention.id,
         label,
-        options.mode_two_decision,
+        options.system_decision,
     );
     let threatened = options
         .threatened_intention_ids
@@ -272,7 +272,7 @@ pub fn create_decision(
     entity_id: EntityId,
     intention_id: IntentionId,
     label: &str,
-    mode_two_decision: bool,
+    system_decision: bool,
 ) -> Decision {
     store
         .create_decision(CreateDecision {
@@ -286,7 +286,7 @@ pub fn create_decision(
                 vec!["path".to_string(), "owner".to_string()],
             )])),
             context_id,
-            agent_id: mode_two_decision.then(|| "system".to_string()),
+            agent_id: system_decision.then(|| "system".to_string()),
             ..Default::default()
         })
         .expect("create decision")
@@ -534,6 +534,10 @@ pub fn set_decision_status(config: &StoreConfig, id: DecisionId, status: Decisio
     .expect("update decision status");
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "ContextDB keeps typed refusal details inline so error propagation needs no allocation."
+)]
 fn open_raw_database(path: impl AsRef<std::path::Path>) -> Database {
     let db = Database::open(path).expect("raw database open");
     let registered = db.registered_trigger_callbacks();

@@ -2248,8 +2248,8 @@ mod event_search_space_isolation_tests {
             BuiltinSpaceRegistry::TEXT_DEFAULT_DIMENSION
         );
 
-        // The event-history space registers with no table binding at all (proved above), so
-        // isolation is proved through the Store-independent comparability seam
+        // The event-history space binds only passage vectors. Isolation is proved through the
+        // Store-independent comparability seam
         // (`compare_embedding_targets_across_spaces`) as well as through `vector_search` against
         // a store that has both spaces registered — both must refuse by exact id and dimension,
         // never by coincidence of a shared table.
@@ -2311,8 +2311,8 @@ mod event_search_space_isolation_tests {
 
         // SMOKE, not a proof: `compare_embedding_targets_across_spaces` returns the refusal
         // unconditionally for every input it is given, so this call cannot distinguish a working
-        // isolation rule from a broken one. It stays only to keep the seam's error shape wired up
-        // until it computes an answer; the two arms above are what prove the promise.
+        // isolation rule from a broken one. This checks only the seam's error shape; the two arms
+        // above prove isolation through vector search.
         let store_independent_result = compare_embedding_targets_across_spaces(
             &store,
             EmbeddingTarget::Evidence(EvidenceId::from(uuid::Uuid::nil())),
@@ -2327,14 +2327,14 @@ mod event_search_space_isolation_tests {
                 &store_independent_result,
                 Err(CgError::CrossSpaceQueryRefused { .. })
             ),
-            "the not-yet-computing comparability seam must still answer with the cross-space \
+            "the unconditional comparability seam must answer with the cross-space \
              refusal shape, got {store_independent_result:?}"
         );
     }
 
     /// A second, non-default owner of `evidence.vector_text` is refused at store open — the
-    /// existing owner guard the canonical event-history declaration above deliberately never
-    /// triggers because it carries no bindings at all.
+    /// owner guard the canonical event-history declaration never triggers because its sole
+    /// binding is the passage vector.
     #[test]
     fn second_owner_of_evidence_vector_text_is_refused() {
         let dir = tempfile::tempdir().expect("store dir");

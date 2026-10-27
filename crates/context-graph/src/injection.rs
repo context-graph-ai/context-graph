@@ -1,7 +1,7 @@
 //! Invalidation-aware injection index: turn digest retrieval hits into a small, budgeted,
 //! staleness-honest memory index that a working session can read.
 //!
-//! This is the library half of the daily-loop injection surface (the CLI `cg hook claude-code`
+//! This is the library half of the capture injection surface (the CLI `cg hook claude-code`
 //! is a thin caller). The rules it encodes are product contract, not CLI detail, so they live
 //! here where a direct consumer (vigil, enterprise) inherits them:
 //!
@@ -15,7 +15,7 @@
 //!   it for structured memory.
 //! - **Staleness is surfaced, never hidden.** A superseded or invalidated decision is NEVER presented
 //!   as current — its status is shown ("SUPERSEDED", "INVALIDATED — its basis changed") so the
-//!   reader consults it as history, which is the moat moment when the prompt contradicts stored basis.
+//!   reader consults it as history, including when the prompt contradicts the stored basis.
 //! - **Small fixed budget.** The whole index fits under [`INJECTION_TOKEN_BUDGET`]; lines are added
 //!   in priority order and any that would overflow are dropped.
 //!

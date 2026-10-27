@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::net::TcpListener;
+use std::sync::Arc;
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -64,29 +65,21 @@ struct StubServer {
     base_url: String,
     received: mpsc::Receiver<Option<RecordedRequest>>,
     handle: thread::JoinHandle<()>,
-    join_timeout: Duration,
+    server: Arc<tiny_http::Server>,
+    release: mpsc::Sender<()>,
 }
 
 impl StubServer {
     fn join(self) -> Option<RecordedRequest> {
-        let recorded = self
-            .received
-            .recv_timeout(self.join_timeout)
-            .unwrap_or(None);
+        self.server.unblock();
+        let _ = self.release.send(());
+        let recorded = self.received.recv().unwrap_or(None);
         self.handle.join().expect("stub server thread joins");
         recorded
     }
 
     fn receive_without_joining(self) -> Option<RecordedRequest> {
-        let StubServer {
-            received,
-            handle,
-            join_timeout,
-            ..
-        } = self;
-        let recorded = received.recv_timeout(join_timeout).unwrap_or(None);
-        drop(handle);
-        recorded
+        self.join()
     }
 }
 
@@ -94,57 +87,36 @@ struct SequenceStubServer {
     base_url: String,
     received: mpsc::Receiver<Vec<RecordedRequest>>,
     handle: thread::JoinHandle<()>,
-    join_timeout: Duration,
 }
 
 impl SequenceStubServer {
     fn join(self) -> Vec<RecordedRequest> {
-        let recorded = self
-            .received
-            .recv_timeout(self.join_timeout)
-            .unwrap_or_default();
+        let recorded = self.received.recv().unwrap_or_default();
         self.handle.join().expect("stub server thread joins");
         recorded
     }
 }
 
 fn stub_server(status: u16, response_body: Value) -> StubServer {
-    stub_server_with_delay_and_wait(
-        status,
-        Some(response_body.to_string()),
-        Duration::ZERO,
-        Duration::from_secs(2),
-    )
+    stub_server_with_held_response(status, Some(response_body.to_string()), false)
 }
 
 fn stub_server_with_raw_body(status: u16, response_body: &'static str) -> StubServer {
-    stub_server_with_delay_and_wait(
-        status,
-        Some(response_body.to_string()),
-        Duration::ZERO,
-        Duration::from_secs(2),
-    )
+    stub_server_with_held_response(status, Some(response_body.to_string()), false)
 }
 
 fn stub_server_expecting_no_request(status: u16, response_body: Value) -> StubServer {
-    stub_server_with_delay_and_wait(
-        status,
-        Some(response_body.to_string()),
-        Duration::ZERO,
-        Duration::from_millis(250),
-    )
+    stub_server_with_held_response(status, Some(response_body.to_string()), false)
 }
 
 fn stub_server_sequence(response_bodies: Vec<Value>) -> SequenceStubServer {
     let server = tiny_http::Server::http("127.0.0.1:0").expect("stub server starts");
     let base_url = crate::common::stub_base_url(&server);
-    let expected_requests = response_bodies.len();
     let (sender, received) = mpsc::channel();
     let handle = thread::spawn(move || {
         let mut recorded = Vec::new();
         for response_body in response_bodies {
-            let Some(mut request) = server.recv_timeout(Duration::from_secs(2)).ok().flatten()
-            else {
+            let Some(mut request) = server.recv().ok() else {
                 break;
             };
             recorded.push(capture_request(&mut request));
@@ -163,32 +135,33 @@ fn stub_server_sequence(response_bodies: Vec<Value>) -> SequenceStubServer {
         base_url,
         received,
         handle,
-        join_timeout: Duration::from_secs((expected_requests as u64 * 3).max(3)),
     }
 }
 
 fn silent_timeout_stub_server() -> StubServer {
-    stub_server_with_delay_and_wait(200, None, Duration::from_secs(30), Duration::from_secs(2))
+    stub_server_with_held_response(200, None, true)
 }
 
-fn stub_server_with_delay_and_wait(
+fn stub_server_with_held_response(
     status: u16,
     response_body: Option<String>,
-    response_delay: Duration,
-    request_wait: Duration,
+    hold_response: bool,
 ) -> StubServer {
-    let server = tiny_http::Server::http("127.0.0.1:0").expect("stub server starts");
+    let server = Arc::new(tiny_http::Server::http("127.0.0.1:0").expect("stub server starts"));
     let base_url = crate::common::stub_base_url(&server);
     let (sender, received) = mpsc::channel();
+    let (release, held) = mpsc::channel();
+    let worker_server = Arc::clone(&server);
     let handle = thread::spawn(move || {
-        let Some(mut request) = server.recv_timeout(request_wait).ok().flatten() else {
+        let Some(mut request) = worker_server.recv().ok() else {
             let _ = sender.send(None);
             return;
         };
         let recorded = capture_request(&mut request);
         let _ = sender.send(Some(recorded));
-        if !response_delay.is_zero() {
-            thread::sleep(response_delay);
+        if hold_response {
+            held.recv()
+                .expect("parent finishes its hosted call before releasing the silent response");
         }
         if let Some(response_body) = response_body {
             let content_type =
@@ -205,7 +178,8 @@ fn stub_server_with_delay_and_wait(
         base_url,
         received,
         handle,
-        join_timeout: request_wait + Duration::from_secs(1),
+        server,
+        release,
     }
 }
 

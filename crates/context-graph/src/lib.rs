@@ -1,3 +1,12 @@
+//! Durable structured memory and event-history search for agents and applications.
+//!
+//! [`Store`] provides writable memory operations; [`consumer_read`] provides bounded reads.
+//! Embedding implementations share the [`Embedder`] trait and explicit embedding spaces.
+//! The bundled default text embedder is enabled by the `nomic-embedder` feature.
+//! Disable default features for a core without bundled model fetching.
+//!
+//! See the repository's library quickstart and library API guides for application examples.
+
 // The README's example is compiled by the doctest harness. An example nothing builds drifts
 // silently: the symbols it names are renamed or moved by ordinary work, and the first person to
 // find out is a reader who copied it.
@@ -99,6 +108,7 @@ pub mod test_support {
         after_next_event_search_membership_read_page_for_test,
         before_next_event_search_batch_commit_for_test,
         observe_event_search_batch_admission_for_test,
+        set_event_search_projection_read_clock_for_test,
         set_event_search_projection_read_deadline_ms_for_test,
     };
     pub use crate::store::event_search_projection_correctness::{

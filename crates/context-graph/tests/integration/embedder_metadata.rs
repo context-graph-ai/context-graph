@@ -662,6 +662,7 @@ fn count(db: &Database, sql: &str, params: &HashMap<String, Value>) -> i64 {
 
 #[test]
 fn embedding_metadata_includes_space_id() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let fixture = fixture("metadata-space");
     let embedding_id = record(&fixture, "customer", "1", 0);
     let db = raw_db(&fixture.db_path, fixture.store);
@@ -682,6 +683,7 @@ fn embedding_metadata_includes_space_id() {
 
 #[test]
 fn embedder_metadata_distinguishes_internal_vs_external() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let embedder = MockEmbedder::new(TEXT_SPACE, 768);
     let expected_internal = embedder.producer.clone();
     let fixture = fixture_with_registered_embedder("metadata-discriminant", embedder);
@@ -728,6 +730,7 @@ fn embedder_metadata_distinguishes_internal_vs_external() {
 
 #[test]
 fn producer_metadata_first_party_vs_third_party_distinguishable() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let internal = producer(CG_EDGE_SYSTEM_TAG, "1").to_string();
     let external = producer("customer", "1").to_string();
     assert!(
@@ -740,6 +743,7 @@ fn producer_metadata_first_party_vs_third_party_distinguishable() {
 
 #[test]
 fn producer_metadata_serializes_to_human_readable_string() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let rendered = producer("customer", "2").to_string();
     assert!(
         rendered == "audit-encoder 2 (pipeline pipeline-7) - consumer-claimed",
@@ -749,6 +753,7 @@ fn producer_metadata_serializes_to_human_readable_string() {
 
 #[test]
 fn producer_metadata_uniform_schema_across_three_ingest_paths() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let one_tensor_dir = tempfile::tempdir().expect("one tensor dir");
     let one_tensor_model = stage_one_tensor_embeddinggemma_cache(one_tensor_dir.path());
     let one_tensor_config = StoreConfig {

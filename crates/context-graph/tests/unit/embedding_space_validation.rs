@@ -79,6 +79,10 @@ fn embedding_space_row_count(db_path: &Path, space_id: &str) -> i64 {
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "ContextDB keeps typed refusal details inline so error propagation needs no allocation."
+)]
 fn embedding_space_created_at(
     db_path: &Path,
     space_id: &str,

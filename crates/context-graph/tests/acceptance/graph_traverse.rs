@@ -136,7 +136,7 @@ fn traverse_bfs_four_hop_after_reopen() {
     assert_eq!(actual_set, expected_set);
 }
 
-// Use case: An incident reviewer at client-acme asks the engine for just the hard DEPENDS_ON chain out of a flapping service — not the broader RELATES_TO neighbours. Engine-side edge-type filter means no out-of-filter rows leave the store.
+// Use case: An incident reader at client-acme asks the engine for just the hard DEPENDS_ON chain out of a flapping service — not the broader RELATES_TO neighbours. Engine-side edge-type filter means no out-of-filter rows leave the store.
 #[test]
 fn traverse_with_relationship_filter() {
     let (_tempdir, db_path, store) = fixture();
