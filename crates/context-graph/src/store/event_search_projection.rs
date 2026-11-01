@@ -1725,11 +1725,14 @@ fn run_with_store(
     })
 }
 
-/// Build the search index for every completed passage before reporting the import ready. Each cycle
-/// is finite work; a partition stays remaining until its index is built and calibrated, so an import
-/// that stopped once its vectors were merely covered would leave every later find scoring all of them.
+/// Publish durable graph coverage for every completed passage. The finite
+/// maintenance scheduler owns queued replacement work after import readiness.
 fn maintain_passage_vectors(store: &Store) -> Result<()> {
     loop {
+        let before = store
+            .db
+            .persist_import_vector_tails()
+            .map_err(map_engine_err)?;
         let vector = store
             .db
             .run_maintenance_cycle()
@@ -1741,8 +1744,20 @@ fn maintain_passage_vectors(store: &Store) -> Result<()> {
                 vector.remaining_partitions
             )));
         }
-        if vector.remaining_partitions == 0 {
+        // A replacement can publish during this finite wake. Validate and
+        // cover that committed catalog before reporting the import ready.
+        let after = store
+            .db
+            .persist_import_vector_tails()
+            .map_err(map_engine_err)?;
+        if after || vector.remaining_partitions == 0 {
             return Ok(());
+        }
+        if before && vector.built_partitions == 0 {
+            return Err(CgError::Engine(format!(
+                "durable passage graph coverage was lost while maintenance remained queued for {} partitions",
+                vector.remaining_partitions
+            )));
         }
     }
 }
