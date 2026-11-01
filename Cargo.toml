@@ -44,11 +44,11 @@ candle-core = { path = "vendor/candle-core", version = "=0.10.2" }
 candle-nn = { path = "vendor/candle-nn", version = "=0.10.2" }
 candle-transformers = { path = "vendor/candle-transformers", version = "=0.10.2" }
 criterion = { version = "0.8", features = ["html_reports"] }
-contextdb-core = { git = "https://github.com/context-graph-ai/contextdb", rev = "e941b457c0aa4ac348e8c312e58bcf7c61f861f0" }
-contextdb-engine = { git = "https://github.com/context-graph-ai/contextdb", rev = "e941b457c0aa4ac348e8c312e58bcf7c61f861f0" }
-contextdb-parser = { git = "https://github.com/context-graph-ai/contextdb", rev = "e941b457c0aa4ac348e8c312e58bcf7c61f861f0" }
-contextdb-tx = { git = "https://github.com/context-graph-ai/contextdb", rev = "e941b457c0aa4ac348e8c312e58bcf7c61f861f0" }
-contextdb-vector = { git = "https://github.com/context-graph-ai/contextdb", rev = "e941b457c0aa4ac348e8c312e58bcf7c61f861f0" }
+contextdb-core = { git = "https://github.com/context-graph-ai/contextdb", rev = "8144a012e02b1b3db4fb1023b1ac5b279036de3c" }
+contextdb-engine = { git = "https://github.com/context-graph-ai/contextdb", rev = "8144a012e02b1b3db4fb1023b1ac5b279036de3c" }
+contextdb-parser = { git = "https://github.com/context-graph-ai/contextdb", rev = "8144a012e02b1b3db4fb1023b1ac5b279036de3c" }
+contextdb-tx = { git = "https://github.com/context-graph-ai/contextdb", rev = "8144a012e02b1b3db4fb1023b1ac5b279036de3c" }
+contextdb-vector = { git = "https://github.com/context-graph-ai/contextdb", rev = "8144a012e02b1b3db4fb1023b1ac5b279036de3c" }
 safetensors = "0.7.0"
 sha2 = { version = "0.10.9", features = ["compress"] }
 tempfile = "3.23.0"
