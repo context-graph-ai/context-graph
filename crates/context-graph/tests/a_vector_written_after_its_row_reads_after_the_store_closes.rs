@@ -1,17 +1,20 @@
 //! A vector context-graph attaches to a row it has just inserted must read back through a read-only
 //! session once the writer has closed. Digests, observation evidence and entity references all
 //! insert the row and then attach its vector, so each is written here through its public door.
+//! Reindexing attaches a new vector to a row committed earlier, in a transaction of its own.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use chrono::Utc;
+use context_graph::embedder::{Embedder, EmbeddingInput, EmbeddingOutput};
 use context_graph::owner_control::context_graph_read_session_options;
 use context_graph::{
     ContextId, CreateContext, CreateDigest, CreateEntity, DigestId, DistanceMetric, EmbedderConfig,
-    EmbeddingId, EmbeddingSpaceDecl, EmbeddingTarget, EntityId, EntityType, EvidenceId,
-    EvidenceKind, EvidenceProducer, EvidenceRef, ObservationId, PrecomputedEmbedding,
-    RecordObservation, RetentionStatus, Store, StoreConfig,
+    EmbedderRegistration, EmbeddingId, EmbeddingSpaceBinding, EmbeddingSpaceDecl, EmbeddingTarget,
+    EntityId, EntityType, EvidenceId, EvidenceKind, EvidenceProducer, EvidenceRef, ObservationId,
+    PrecomputedEmbedding, RecordObservation, ReindexOptions, RetentionStatus, Store, StoreConfig,
 };
 use contextdb_core::Value;
 use contextdb_engine::read_session::ReadSession;
@@ -224,4 +227,107 @@ fn an_entity_reference_vector_reads_through_a_read_only_session_after_the_store_
         ),
         vector
     );
+}
+
+struct ReplacementEmbedder;
+
+fn text_space() -> EmbeddingSpaceDecl {
+    EmbeddingSpaceDecl {
+        embedding_space_id: TEXT_SPACE.to_string(),
+        dimension: TEXT_DIMENSION,
+        metric: DistanceMetric::Cosine,
+        model_family: "text".to_string(),
+        model_name: "fixture".to_string(),
+        model_version: "1".to_string(),
+        supported_evidence_kinds: vec![EvidenceKind::Text],
+        default_for_evidence_kind: Some(EvidenceKind::Text),
+        bindings: vec![EmbeddingSpaceBinding {
+            embedding_space_id: TEXT_SPACE.to_string(),
+            table_name: "digests".to_string(),
+            vector_column: "vector_text".to_string(),
+        }],
+    }
+}
+
+fn replacement_vector() -> Vec<f32> {
+    axis(TEXT_DIMENSION, 11)
+}
+
+impl Embedder for ReplacementEmbedder {
+    fn embed(&self, input: EmbeddingInput) -> context_graph::Result<EmbeddingOutput> {
+        assert!(
+            matches!(input, EmbeddingInput::Text(_)),
+            "a digest reindexes from its summary text"
+        );
+        Ok(EmbeddingOutput {
+            embedding_space_id: TEXT_SPACE.to_string(),
+            dimension: TEXT_DIMENSION,
+            producer: producer(),
+            vector: replacement_vector(),
+        })
+    }
+
+    fn supported_inputs(&self) -> Vec<EvidenceKind> {
+        vec![EvidenceKind::Text]
+    }
+
+    fn embedding_space(&self) -> EmbeddingSpaceDecl {
+        text_space()
+    }
+}
+
+// The row is committed first. Reindexing then attaches its vector in a later transaction, the one
+// production door where those two steps are separate.
+#[test]
+fn a_reindexed_digest_vector_reads_through_a_read_only_session_after_the_store_closes() {
+    let dir = tempfile::tempdir().expect("a directory for the store");
+    let path = dir.path().join("context-graph.db");
+    let store = Store::open_with_embedder_registrations(
+        StoreConfig {
+            db_path: path.clone(),
+            ..Default::default()
+        },
+        vec![EmbedderRegistration {
+            space: text_space(),
+            embedder: Arc::new(ReplacementEmbedder),
+        }],
+    )
+    .expect("a writable store with a registered text embedder");
+    let context = store
+        .create_context(CreateContext {
+            name: "vector-reread-reindex".to_string(),
+            labels: Vec::new(),
+            properties: BTreeMap::new(),
+        })
+        .expect("a context");
+    let digest_id = DigestId::new_v7();
+    let original = axis(TEXT_DIMENSION, 3);
+    store
+        .create_digest(CreateDigest {
+            id: digest_id,
+            source: "vector-reread".to_string(),
+            session_ref: Some("session".to_string()),
+            summary: "a digest whose vector is replaced by reindexing".to_string(),
+            kind: EvidenceKind::Text,
+            embedding: PrecomputedEmbedding {
+                id: EmbeddingId::new_v7(),
+                embedding_space_id: TEXT_SPACE.to_string(),
+                vector: original.clone(),
+                target: EmbeddingTarget::Digest(digest_id),
+                produced_by: producer(),
+            },
+            context_id: context.id,
+            properties: BTreeMap::new(),
+        })
+        .expect("a digest committed before the reindex");
+    store
+        .reindex_space(TEXT_SPACE, ReindexOptions::default())
+        .expect("reindexing replaces the digest vector");
+    drop(store);
+    let reread = read_vector_after_close(&path, "digests", "vector_text", digest_id.as_uuid());
+    assert_ne!(
+        reread, original,
+        "the reindex must have replaced the vector"
+    );
+    assert_eq!(reread, replacement_vector());
 }
