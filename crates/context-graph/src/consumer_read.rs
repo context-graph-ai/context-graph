@@ -162,7 +162,7 @@ fn open_through_owner_transitions(
     }
 }
 
-/// The path a caller may hand either door meaning "no file at all".
+/// The path a caller may hand either door that names no committed store file.
 const IN_MEMORY_PATH: &str = ":memory:";
 
 /// Everything a consumer is entitled to see inside the store context-graph opens.
@@ -307,8 +307,8 @@ impl ConsumerReader {
     /// the fix is a mount or a permission, and "it needs recovering" is the only one of the three
     /// a consumer may answer by opening the store writable.
     ///
-    /// The surface is file-backed only. `:memory:` has no committed file to read and is refused by
-    /// type, before any engine call.
+    /// The surface reads a store's committed file. A path that names no file, `:memory:`, is
+    /// refused by type, before any engine call.
     pub fn open(path: impl AsRef<Path>, declaration: ConsumerDeclaration) -> Result<Self> {
         Self::open_with_memory_limit(path, declaration, default_read_memory_limit_bytes())
     }
@@ -920,7 +920,9 @@ fn admit(gate: &ReaderGate, sql: &str, params: &HashMap<String, Value>) -> Resul
         // One row per table carrying a vector index, keyed by the table's own name — including
         // context-graph's own embedding tables, which a consumer that declared neither must not
         // learn the names of.
-        ParsedStatement::ShowVectorIndexes => Ok(AnswerShape::TableKeyed(ShowRowKey::FirstColumn)),
+        ParsedStatement::ShowVectorIndexes | ParsedStatement::ShowVectorPartitions { .. } => {
+            Ok(AnswerShape::TableKeyed(ShowRowKey::FirstColumn))
+        }
         // One `<table>=<policy>` row per table that declared an arbitration, and context-graph's
         // own schema declares dozens of them, plus the store's own default row.
         ParsedStatement::ShowSyncConflictPolicy => {

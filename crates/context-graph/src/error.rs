@@ -617,9 +617,9 @@ pub enum CgError {
         path: std::path::PathBuf,
         reason: String,
     },
-    /// A `:memory:` store was asked for a read-only reading surface. There is no committed file to
-    /// read, so the request is refused by type before any engine call; `requested` repeats what
-    /// the caller asked for.
+    /// A read-only reading surface was asked for a path that names no file, `:memory:`. There is
+    /// no committed file to read, so the request is refused by type before any engine call;
+    /// `requested` repeats what the caller asked for.
     InMemoryStoreHasNoReadSurface {
         requested: String,
     },

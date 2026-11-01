@@ -201,24 +201,24 @@ fn try_release_claim_in(store: &Store, held: &HeldClaim) -> Result<()> {
 }
 
 /// An unexpired lease blocks another worker only while its process still holds presence.
-/// Memory stores and platforms without holder locks retain the lease's existing TTL contract.
+/// Platforms without holder locks retain the lease's existing TTL contract.
 fn claim_owner_live(store: &Store, owner: &str, expires_at: i64, now: i64) -> Result<bool> {
     if expires_at <= now {
         return Ok(false);
     }
     #[cfg(target_os = "linux")]
-    if store.db_path() != std::path::Path::new(":memory:") {
+    {
         let token = uuid::Uuid::parse_str(owner)
             .map_err(|_| CgError::Engine("invalid event-search claim owner token".into()))?;
-        return contextdb_engine::persistence::holder_presence::probe(
-            store.db_path(),
-            *token.as_bytes(),
-        )
-        .map(|holder| holder == contextdb_engine::persistence::holder_presence::Holder::Present)
-        .map_err(map_engine_err);
+        contextdb_engine::persistence::holder_presence::probe(store.db_path(), *token.as_bytes())
+            .map(|holder| holder == contextdb_engine::persistence::holder_presence::Holder::Present)
+            .map_err(map_engine_err)
     }
-    let _ = (store, owner);
-    Ok(true)
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (store, owner);
+        Ok(true)
+    }
 }
 
 fn release_claim_presence(store_path: &std::path::Path, owner: &str) {
@@ -7458,17 +7458,10 @@ fn claim_pending_batch(
     // Acquire presence before publishing the lease. The kept guard spans Store closes and
     // unwinding inside this still-live process; SIGKILL releases it in the kernel.
     #[cfg(target_os = "linux")]
-    let presence = if store.db_path() == std::path::Path::new(":memory:") {
-        None
-    } else {
-        Some(
-            contextdb_engine::persistence::holder_presence::hold(
-                store.db_path(),
-                *owner.as_bytes(),
-            )
+    let presence = Some(
+        contextdb_engine::persistence::holder_presence::hold(store.db_path(), *owner.as_bytes())
             .map_err(map_engine_err)?,
-        )
-    };
+    );
     let now = now_millis()?;
     let expires_at = now
         .checked_add(

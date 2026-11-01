@@ -988,7 +988,9 @@ mod the_event_tables_declare_the_counts_their_reads_ask_for {
     }
 
     pub(super) fn stored_meta(ddl: &str, table: &str) -> contextdb_core::TableMeta {
-        let db = Database::open(":memory:").expect("a scratch store to install the table in");
+        let scratch = tempfile::tempdir().expect("a directory for the scratch store");
+        let db = Database::open(scratch.path().join("scratch.db"))
+            .expect("a scratch store to install the table in");
         let empty = std::collections::HashMap::new();
         let parents = [
             ("contexts", shipped_ddl("contexts")),
