@@ -1120,8 +1120,7 @@ fn vector_hits_contain_id(
 }
 
 #[test]
-fn record_observation_text_evidence_lands_in_vector_text_hnsw_index_queryable_via_engine_no_json_shim()
- {
+fn record_observation_text_evidence_lands_in_vector_text_index_queryable_via_engine_no_json_shim() {
     let (_dir, store) = fresh_store();
     let observation_id = ObservationId::new_v7();
     let evidence_id = EvidenceId::new_v7();
@@ -1145,7 +1144,7 @@ fn record_observation_text_evidence_lands_in_vector_text_hnsw_index_queryable_vi
 }
 
 #[test]
-fn record_observation_image_evidence_lands_in_vector_vision_hnsw_index_queryable_via_engine_no_json_shim()
+fn record_observation_image_evidence_lands_in_vector_vision_index_queryable_via_engine_no_json_shim()
  {
     let dir = tempfile::tempdir().expect("tempdir");
     let config = StoreConfig {
@@ -5326,7 +5325,7 @@ fn create_digest_with_non_text_evidence_kind_rejected_with_unsupported_evidence_
 }
 
 #[test]
-fn create_digest_with_text_evidence_kind_lands_in_digests_vector_text_hnsw_index_queryable_via_engine_no_json_shim()
+fn create_digest_with_text_evidence_kind_lands_in_digests_vector_text_index_queryable_via_engine_no_json_shim()
  {
     let (_dir, store) = fresh_store();
     let digest_id = DigestId::new_v7();

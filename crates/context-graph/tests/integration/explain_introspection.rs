@@ -9,7 +9,7 @@ use context_graph::{
     EntityType, EvidenceId, EvidenceKind, EvidenceProducer, EvidenceRef, PrecomputedEmbedding,
     RecordObservation, RetentionStatus, Store, StoreConfig,
 };
-use contextdb_core::{Value, VectorIndexRef};
+use contextdb_core::Value;
 use contextdb_engine::Database;
 
 const TEXT_SPACE: &str = "text_default_nomic_v1_5_768";
@@ -200,15 +200,6 @@ fn vector_search_with_context_id_in_filter_explain_uses_indexed_scan_filter_inte
             _ => None,
         })
         .collect::<Vec<_>>();
-    let hnsw_stats =
-        raw_db.__debug_vector_hnsw_stats(VectorIndexRef::new("evidence", "vector_text"));
-    let raw_hnsw_rows = raw_db
-        .__debug_vector_hnsw_raw_search_for_test(
-            VectorIndexRef::new("evidence", "vector_text"),
-            &vector(7),
-            8,
-        )
-        .unwrap_or_default();
     let expected_row_id = raw_db
         .scan("evidence", raw_db.snapshot())
         .expect("scan evidence")
@@ -259,7 +250,7 @@ fn vector_search_with_context_id_in_filter_explain_uses_indexed_scan_filter_inte
                     expected_fifth
                 ]
             && raw_vector_query.trace().physical_plan == "IndexScan -> VectorSearch",
-        "vector search must preserve indexed context prefiltering and the exact route for five admitted vectors; first={first:?}, hits={hits:?}, hit_ids={hit_ids:?}, raw_ids={raw_ids:?}, expected_row_id={expected_row_id:?}, raw_hnsw_rows={raw_hnsw_rows:?}, hnsw_stats={hnsw_stats:?}, raw_explain={raw_explain:?}, raw_trace={:?}",
+        "vector search must preserve indexed context prefiltering and the exact route for five admitted vectors; first={first:?}, hits={hits:?}, hit_ids={hit_ids:?}, raw_ids={raw_ids:?}, expected_row_id={expected_row_id:?}, raw_explain={raw_explain:?}, raw_trace={:?}",
         raw_vector_query.trace()
     );
 }

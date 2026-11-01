@@ -688,7 +688,7 @@ fn find_via_digests_uses_contextdb_vector_index_and_graph_traversal_not_local_sc
         raw_ids == vec![target_digest.id, near_decoy.id]
             && indexed_vectors >= 1010
             && raw_trace.contains("resolved_mode: Indexed")
-            && (raw_trace.contains("HNSWSearch") || raw_trace.contains("route: Some(Exact)"))
+            && (raw_trace.contains("VectorSearch") || raw_trace.contains("route: Some(Exact)"))
             && raw_graph_trace.contains("AdjacencyProbe")
             && raw_graph_source_ids == expected_graph_source_ids
             && hits.iter().map(|hit| hit.digest_id).collect::<Vec<_>>() == raw_ids

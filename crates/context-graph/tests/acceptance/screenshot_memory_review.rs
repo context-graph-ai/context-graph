@@ -1741,10 +1741,7 @@ fn dedup_source_forbidden_vector_bypass_markers() -> Vec<String> {
             .then_some(label.to_string())
     })
     .collect::<Vec<_>>();
-    for (label, needle) in [
-        ("fabricated VectorSearch planner trace", "vectorsearch"),
-        ("fabricated HNSWSearch planner trace", "hnswsearch"),
-    ] {
+    for (label, needle) in [("fabricated VectorSearch planner trace", "vectorsearch")] {
         if source_contains_string_literal(&dedup_source, needle) {
             markers.push(label.to_string());
         }
@@ -1999,7 +1996,7 @@ fn assert_same_space_dedup_results(
 }
 
 fn dedup_engine_vector_trace(trace: &str) -> bool {
-    trace.contains("VectorSearch") || trace.contains("HNSWSearch")
+    trace.contains("VectorSearch")
 }
 
 #[cfg(context_graph_internal_test_support)]

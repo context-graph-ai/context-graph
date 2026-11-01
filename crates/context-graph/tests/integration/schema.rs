@@ -4041,7 +4041,7 @@ fn combination_invalidate_decision_observation_atomic_visibility_no_torn_reader(
 }
 
 #[test]
-fn combination_record_observation_text_evidence_vector_text_hnsw_atomic_with_row_insert_rollback_reverts_index()
+fn combination_record_observation_text_evidence_vector_text_atomic_with_row_insert_rollback_reverts_index()
  {
     let _alongside = crate::runs_alone::alongside_siblings();
     let db = fresh_db();

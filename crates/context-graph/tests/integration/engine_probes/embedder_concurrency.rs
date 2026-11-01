@@ -1,7 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::mpsc::{self, TryRecvError};
 use std::sync::{Arc, Barrier, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -15,18 +14,13 @@ use context_graph::{
 };
 use contextdb_core::{Error as EngineError, RowId, TxId, Value, VectorIndexRef};
 use contextdb_engine::Database;
-use contextdb_engine::memory_accounting::MemoryAccountant;
 use contextdb_engine::plugin::{CommitSource, DatabasePlugin};
 use contextdb_tx::WriteSet;
-use contextdb_vector::test_seam::PauseWindow;
 use serde_json::json;
 
 const TEXT_SPACE: &str = "text_default_nomic_v1_5_768";
 const VISION_SPACE: &str = "vigil_face_reid_v1";
 const FACE_REFERENCE_SPACE: &str = "face_reference_v1";
-const ENGINE_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
-const ENGINE_PROBE_HNSW_COMPLETION_TIMEOUT: Duration = Duration::from_secs(60);
-const HNSW_PADDING_ROWS: usize = 1000;
 
 struct ProbeFixture {
     _dir: tempfile::TempDir,
@@ -420,12 +414,6 @@ fn producer(label: &str) -> EvidenceProducer {
     }
 }
 
-fn vector(axis: usize) -> Vec<f32> {
-    let mut value = vec![0.0; 512];
-    value[axis % 512] = 1.0;
-    value
-}
-
 fn text_vector(axis: usize) -> Vec<f32> {
     let mut value = vec![0.0; 768];
     value[axis % 768] = 1.0;
@@ -434,10 +422,6 @@ fn text_vector(axis: usize) -> Vec<f32> {
 
 fn text_index() -> VectorIndexRef {
     VectorIndexRef::new("evidence", "vector_text")
-}
-
-fn vision_index() -> VectorIndexRef {
-    VectorIndexRef::new("evidence", "vector_vision")
 }
 
 fn params(pairs: Vec<(&str, Value)>) -> HashMap<String, Value> {
@@ -911,172 +895,6 @@ fn replace_vector(
         return Err(err);
     }
     db.commit(tx)
-}
-
-fn seed_hnsw_padding(
-    db: &Database,
-    context_id: ContextId,
-    observation_id: uuid::Uuid,
-) -> Result<(), String> {
-    for i in 0..HNSW_PADDING_ROWS {
-        db.execute(
-            "INSERT INTO evidence (id, observation_id, context_id, kind, source_ref, retention_status, supply_order, vector_text, vector_vision) VALUES ($id, $observation_id, $context_id, $kind, $source_ref, $retention_status, $supply_order, $text, $vision)",
-            &params(vec![
-                ("id", Value::Uuid(uuid::Uuid::now_v7())),
-                ("observation_id", Value::Uuid(observation_id)),
-                ("context_id", Value::Uuid(context_id.as_uuid())),
-                ("kind", Value::Text("text".to_string())),
-                ("source_ref", Value::Text(format!("cas://sha256:{i:064x}"))),
-                ("retention_status", Value::Text("retained_external".to_string())),
-                ("supply_order", Value::Int64(10_000 + i as i64)),
-                ("text", Value::Vector(text_vector(100))),
-                ("vision", Value::Vector(vector(100))),
-            ]),
-        )
-        .map_err(|err| format!("{err:?}"))?;
-    }
-    Ok(())
-}
-
-#[test]
-fn engine_probe_named_vector_index_concurrent_writes_distinct_index_refs_serialize_per_index() {
-    let _alongside = crate::runs_alone::alongside_siblings();
-    let fixture = fixture("distinct-indexes");
-    let text_evidence = EvidenceId::new_v7();
-    let vision_evidence = EvidenceId::new_v7();
-    let text_seed = record_embedding(
-        fixture.store.clone(),
-        fixture.context_id,
-        fixture.entity_id,
-        EvidenceWrite {
-            evidence_id: text_evidence,
-            embedding_id: EmbeddingId::new_v7(),
-            kind: EvidenceKind::Text,
-            embedding_space_id: TEXT_SPACE,
-            vector: text_vector(7),
-        },
-    );
-    let vision_seed = record_embedding(
-        fixture.store.clone(),
-        fixture.context_id,
-        fixture.entity_id,
-        EvidenceWrite {
-            evidence_id: vision_evidence,
-            embedding_id: EmbeddingId::new_v7(),
-            kind: EvidenceKind::ImageFrame,
-            embedding_space_id: VISION_SPACE,
-            vector: vector(3),
-        },
-    );
-    let db_path = fixture.db_path.clone();
-    let context_id = fixture.context_id;
-    drop(fixture.store);
-    let db = Arc::new(Database::open(&db_path).expect("open raw contextdb"));
-    let vision_row_id = evidence_row_id(&db, vision_evidence);
-    let padding_seed = match text_seed.as_ref() {
-        Ok(result) => seed_hnsw_padding(&db, context_id, result.observation_id.as_uuid()),
-        Err(err) => Err(format!("text seed failed: {err:?}")),
-    };
-
-    let vector_store = db.vector_store_for_test();
-    let text_pause = vector_store.arm_maintenance_pause_for_test(&text_index(), PauseWindow::Build);
-    let vision_pause =
-        vector_store.arm_maintenance_pause_for_test(&vision_index(), PauseWindow::Build);
-
-    let (text_done_tx, text_done_rx) = mpsc::channel();
-    let text_db = Arc::clone(&db);
-    let text_store = vector_store.clone();
-    thread::spawn(move || {
-        let result = text_store
-            .run_hnsw_maintenance_for_index_for_test(
-                &text_index(),
-                Arc::new(MemoryAccountant::no_limit()),
-            )
-            .map_err(|error| format!("{error:?}"))
-            .and_then(|_| {
-                first_hit_id(&text_db, text_index(), text_vector(7))
-                    .ok_or_else(|| "missing text hit".to_string())
-            });
-        text_done_tx.send(result).expect("send text result");
-    });
-    let text_reached = text_pause.wait_until_reached(ENGINE_PROBE_TIMEOUT);
-
-    let (vision_done_tx, vision_done_rx) = mpsc::channel();
-    let vision_db = Arc::clone(&db);
-    let vision_store = vector_store.clone();
-    let vision_row_for_thread = vision_row_id;
-    thread::spawn(move || {
-        let result = vision_row_for_thread
-            .ok_or_else(|| "missing vision evidence row".to_string())
-            .and_then(|row_id| {
-                replace_vector(Arc::clone(&vision_db), vision_index(), row_id, vector(4))
-                    .map_err(|err| format!("{err:?}"))
-            })
-            .and_then(|()| {
-                vision_store
-                    .run_hnsw_maintenance_for_index_for_test(
-                        &vision_index(),
-                        Arc::new(MemoryAccountant::no_limit()),
-                    )
-                    .map_err(|error| format!("{error:?}"))?;
-                first_hit_id(&vision_db, vision_index(), vector(4))
-                    .ok_or_else(|| "missing vision hit".to_string())
-            });
-        vision_done_tx.send(result).expect("send vision result");
-    });
-    let vision_reached_before_text_release = vision_pause.wait_until_reached(ENGINE_PROBE_TIMEOUT);
-    let text_done_before_release = text_done_rx.try_recv();
-    if vision_reached_before_text_release {
-        vision_pause.release();
-    }
-    let vision_done_before_release = vision_done_rx.recv_timeout(ENGINE_PROBE_TIMEOUT);
-    let text_done_before_release_debug = format!("{text_done_before_release:?}");
-    let vision_done_before_release_debug = format!("{vision_done_before_release:?}");
-    let text_blocked_before_release = matches!(text_done_before_release, Err(TryRecvError::Empty));
-    let vision_completed_before_text_release = vision_done_before_release.is_ok();
-
-    if !vision_reached_before_text_release {
-        text_pause.release();
-        let _ = vision_pause.wait_until_reached(ENGINE_PROBE_TIMEOUT);
-        vision_pause.release();
-    } else {
-        text_pause.release();
-    }
-
-    let text_result = match text_done_before_release {
-        Ok(result) => Some(result),
-        Err(TryRecvError::Empty) => text_done_rx
-            .recv_timeout(ENGINE_PROBE_HNSW_COMPLETION_TIMEOUT)
-            .ok(),
-        Err(TryRecvError::Disconnected) => None,
-    };
-    let vision_result = match vision_done_before_release {
-        Ok(result) => Some(result),
-        Err(_) => vision_done_rx.recv_timeout(ENGINE_PROBE_TIMEOUT).ok(),
-    };
-
-    let text_hit = first_hit_id(&db, text_index(), text_vector(7));
-    let vision_hit = first_hit_id(&db, vision_index(), vector(4));
-    let text_rejects_vision_dim = db.query_vector(text_index(), &vector(3), 1, None, db.snapshot());
-    let vision_rejects_text_dim =
-        db.query_vector(vision_index(), &text_vector(7), 1, None, db.snapshot());
-
-    assert!(
-        text_seed.is_ok()
-            && vision_seed.is_ok()
-            && padding_seed.is_ok()
-            && text_reached
-            && vision_reached_before_text_release
-            && text_blocked_before_release
-            && vision_completed_before_text_release
-            && matches!(text_result.as_ref(), Some(Ok(id)) if *id == text_evidence.as_uuid())
-            && matches!(vision_result.as_ref(), Some(Ok(id)) if *id == vision_evidence.as_uuid())
-            && text_hit == Some(text_evidence.as_uuid())
-            && vision_hit == Some(vision_evidence.as_uuid())
-            && text_rejects_vision_dim.is_err()
-            && vision_rejects_text_dim.is_err(),
-        "distinct VectorIndexRef maintenance must let vision update/search complete while text build is paused, and routing must remain disjoint, text_seed={text_seed:?}, vision_seed={vision_seed:?}, padding_seed={padding_seed:?}, vision_row_id={vision_row_id:?}, text_reached={text_reached}, vision_reached_before_text_release={vision_reached_before_text_release}, text_done_before_release={text_done_before_release_debug}, vision_done_before_release={vision_done_before_release_debug}, text_result={text_result:?}, vision_result={vision_result:?}, text_hit={text_hit:?}, vision_hit={vision_hit:?}, text_rejects_vision_dim={text_rejects_vision_dim:?}, vision_rejects_text_dim={vision_rejects_text_dim:?}"
-    );
 }
 
 #[test]

@@ -13,7 +13,7 @@ use context_graph::{
     EmbeddingSpaceBinding, EmbeddingTarget, EntityType, EvidenceId, EvidenceKind, EvidenceProducer,
     EvidenceRef, PrecomputedEmbedding, RecordObservation, RetentionStatus, Store, StoreConfig,
 };
-use contextdb_core::{Value, VectorIndexRef};
+use contextdb_core::Value;
 use contextdb_engine::{
     Database,
     plugin::{DatabasePlugin, QueryOutcome},
@@ -537,7 +537,7 @@ fn vector_search_with_empty_context_id_filter_returns_empty_not_unfiltered() {
 }
 
 #[test]
-fn vector_search_top_k_ordering_matches_hnsw_documented_ranking() {
+fn vector_search_top_k_ordering_matches_vector_index_documented_ranking() {
     let _alongside = crate::runs_alone::alongside_siblings();
     let query_counter = Arc::new(QueryCountingPlugin::default());
     let store = store_with_query_counter(query_counter.clone());
@@ -619,8 +619,6 @@ fn vector_search_top_k_ordering_matches_hnsw_documented_ranking() {
             _ => None,
         })
         .collect::<Vec<_>>();
-    let hnsw_stats =
-        raw_db.__debug_vector_hnsw_stats(VectorIndexRef::new("evidence", "vector_text"));
     let raw_trace = format!("{:?}", raw_vector_query.trace());
 
     assert!(
@@ -642,13 +640,13 @@ fn vector_search_top_k_ordering_matches_hnsw_documented_ranking() {
                 .iter()
                 .all(|hit| hit.index_ref == "evidence.vector_text"
                     && hit.planner_trace.as_str() == raw_trace.as_str()
-                    && hit.planner_trace.contains("HNSWSearch"))
+                    && hit.planner_trace.contains("VectorSearch"))
             && raw_targets == targets
-            && raw_trace.contains("maintained_graph_ready")
+            && raw_trace.contains("clustered_index")
             && public_sql.len() == 1
             && public_sql[0].contains("ORDER BY vector_text <=>")
             && public_sql[0].contains("LIMIT"),
-        "top-k ordering must match the raw contextdb HNSW/vector-index query issued by vector_search on a reopened Store, not insertion order, canned exact-match rows, copied trace, or a HashMap full scan; rows were seeded mid/weak/exact/far/near plus 1008 zero-score distractors, hits={hits:?}, targets={targets:?}, raw_targets={raw_targets:?}, hnsw_stats={hnsw_stats:?}, public_sql={public_sql:?}, raw_trace={:?}",
+        "top-k ordering must match the raw contextdb vector-index query issued by vector_search on a reopened Store, not insertion order, canned exact-match rows, copied trace, or a HashMap full scan; rows were seeded mid/weak/exact/far/near plus 1008 zero-score distractors, hits={hits:?}, targets={targets:?}, raw_targets={raw_targets:?}, public_sql={public_sql:?}, raw_trace={:?}",
         raw_trace
     );
 }
