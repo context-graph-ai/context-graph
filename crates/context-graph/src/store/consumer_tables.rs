@@ -597,7 +597,9 @@ fn column_mismatch(declared: &DeclaredColumn, stored: &StoredColumn, mismatches:
         auto_index_at,
         auto_expansion_ceiling,
         flat_below,
-        hnsw,
+        search,
+        ivf,
+        engine_policy,
         consolidation,
         rank_policy,
         context_id,
@@ -734,13 +736,33 @@ fn column_mismatch(declared: &DeclaredColumn, stored: &StoredColumn, mismatches:
             format!("{stored_flat_below:?}"),
         );
     }
-    let declared_hnsw =
-        hnsw.m.is_some() || hnsw.ef_construction.is_some() || hnsw.ef_search.is_some();
-    let stored_hnsw = stored.hnsw_m.is_some()
-        || stored.hnsw_ef_construction.is_some()
-        || stored.hnsw_ef_search.is_some();
-    if declared_hnsw != stored_hnsw {
-        differs("HNSW", declared_hnsw.to_string(), stored_hnsw.to_string());
+    let declared_search = search.target_accuracy.is_some() || search.expected_vectors.is_some();
+    let stored_search = stored.search_target_accuracy_hundredths.is_some()
+        || stored.search_expected_vectors.is_some();
+    if declared_search != stored_search {
+        differs(
+            "SEARCH",
+            declared_search.to_string(),
+            stored_search.to_string(),
+        );
+    }
+    let declared_ivf = ivf.lists.is_some() || ivf.probes.is_some() || ivf.refine_factor.is_some();
+    let stored_ivf = stored.ivf_lists.is_some()
+        || stored.ivf_probes.is_some()
+        || stored.ivf_refine_factor_hundredths.is_some();
+    if declared_ivf != stored_ivf {
+        differs("IVF", declared_ivf.to_string(), stored_ivf.to_string());
+    }
+    let declared_engine_policy =
+        *engine_policy != contextdb_parser::VectorEnginePolicyOptions::default();
+    let stored_engine_policy =
+        stored.vector_engine_policy != contextdb_core::VectorEnginePolicy::default();
+    if declared_engine_policy != stored_engine_policy {
+        differs(
+            "WITH",
+            declared_engine_policy.to_string(),
+            stored_engine_policy.to_string(),
+        );
     }
     let declared_consolidation = consolidation.disabled
         || consolidation.change_percent.is_some()
