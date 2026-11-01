@@ -785,8 +785,8 @@ fn many_session_status_and_find_use_constant_coverage_queries_and_record_scan_co
             )]),
         )
         .expect("measure the exact selected-session query");
-    assert_eq!(selected_window.rows.len(), 10);
-    assert!(selected_window.trace.rows_examined <= 300);
+    assert_eq!(selected_window.rows().len(), 10);
+    assert!(selected_window.trace().rows_examined <= 300);
     let generation_id = search
         .active_generation_id
         .expect("bounded projection publishes a ready head");
@@ -823,8 +823,8 @@ fn many_session_status_and_find_use_constant_coverage_queries_and_record_scan_co
             &progress_params,
         )
         .expect("measure the exact selected-progress query");
-    assert_eq!(progress.rows.len(), 10);
-    assert!(progress.trace.rows_examined <= 300);
+    assert_eq!(progress.rows().len(), 10);
+    assert!(progress.trace().rows_examined <= 300);
     eprintln!(
         "many-session coverage benchmark: status_total_queries={}, find_total_queries={}, status_coverage_queries={}, find_coverage_queries={}, selected_session_rows_examined={}, selected_progress_rows_examined={}",
         status_queries.len(),
@@ -847,7 +847,7 @@ fn many_session_status_and_find_use_constant_coverage_queries_and_record_scan_co
                     || sql.contains("event_search_session_progress")
             })
             .count(),
-        selected_window.trace.rows_examined,
-        progress.trace.rows_examined,
+        selected_window.trace().rows_examined,
+        progress.trace().rows_examined,
     );
 }

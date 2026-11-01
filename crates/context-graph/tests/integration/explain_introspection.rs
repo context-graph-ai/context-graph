@@ -193,7 +193,7 @@ fn vector_search_with_context_id_in_filter_explain_uses_indexed_scan_filter_inte
         .explain("SELECT id FROM evidence WHERE context_id = $context_id ORDER BY vector_text <=> $q LIMIT 5")
         .expect("raw vector explain");
     let raw_ids = raw_vector_query
-        .rows
+        .rows()
         .iter()
         .filter_map(|row| match row.first() {
             Some(Value::Uuid(uuid)) => Some(EvidenceId::from(*uuid)),
@@ -229,16 +229,16 @@ fn vector_search_with_context_id_in_filter_explain_uses_indexed_scan_filter_inte
         first.is_some_and(|hit| hit.target == EmbeddingTarget::Evidence(expected)
             && hit.context_id == Some(allowed_context.id)
             && hit.index_ref == "evidence.vector_text"
-            && hit.planner_trace == format!("{:?}", raw_vector_query.trace)
+            && hit.planner_trace == format!("{:?}", raw_vector_query.trace())
             && hit.planner_trace.contains("IndexScan -> VectorSearch")
-            && raw_vector_query.trace.index_used.is_some()
+            && raw_vector_query.trace().index_used.is_some()
             && raw_vector_query
-                .trace
+                .trace()
                 .predicates_pushed
                 .iter()
                 .any(|p| p == "context_id")
             && raw_vector_query
-                .trace
+                .trace()
                 .vector_search
                 .as_ref()
                 .is_some_and(|route| {
@@ -258,9 +258,9 @@ fn vector_search_with_context_id_in_filter_explain_uses_indexed_scan_filter_inte
                     expected_fourth,
                     expected_fifth
                 ]
-            && raw_vector_query.trace.physical_plan == "IndexScan -> VectorSearch",
+            && raw_vector_query.trace().physical_plan == "IndexScan -> VectorSearch",
         "vector search must preserve indexed context prefiltering and the exact route for five admitted vectors; first={first:?}, hits={hits:?}, hit_ids={hit_ids:?}, raw_ids={raw_ids:?}, expected_row_id={expected_row_id:?}, raw_hnsw_rows={raw_hnsw_rows:?}, hnsw_stats={hnsw_stats:?}, raw_explain={raw_explain:?}, raw_trace={:?}",
-        raw_vector_query.trace
+        raw_vector_query.trace()
     );
 }
 

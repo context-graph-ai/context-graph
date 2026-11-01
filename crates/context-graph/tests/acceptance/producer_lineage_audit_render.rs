@@ -501,7 +501,7 @@ fn regulator_one_query_joins_decision_lineage_to_producer_system_across_n_observ
     let explain = db.explain(&sql).unwrap_or_default();
     let rows = raw_result
         .as_ref()
-        .map(|result| decode_raw_lineage_rows(&result.rows))
+        .map(|result| decode_raw_lineage_rows(&result.rows()))
         .unwrap_or_default();
     let expected = decision_ids
         .iter()

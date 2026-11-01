@@ -1182,7 +1182,8 @@ fn a_claim_that_would_render_more_passages_than_the_bound_leaves_later_events_fo
             )]),
         )
         .expect("inspect passage commits")
-        .rows;
+        .rows()
+        .to_vec();
     let mut per_commit = HashMap::<String, usize>::new();
     for row in &rows {
         *per_commit.entry(format!("{:?}", row[0])).or_default() += 1;

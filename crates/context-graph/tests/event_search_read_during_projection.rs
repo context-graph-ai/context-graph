@@ -324,9 +324,9 @@ fn active_reader_snapshot_remains_consistent_across_currency_maintenance() {
         .open_cursor(sql, &params)
         .expect("open reader statement before passage update");
     let first = cursor.first_page().expect("first snapshot page").clone();
-    assert_eq!(first.rows.len(), 1, "one initial projected passage");
-    assert_eq!(first.rows[0][1], Value::Bool(true));
-    let passage_id = first.rows[0][0].clone();
+    assert_eq!(first.rows().len(), 1, "one initial projected passage");
+    assert_eq!(first.rows()[0][1], Value::Bool(true));
+    let passage_id = first.rows()[0][0].clone();
 
     // A ConsumerReader alone does not pin one snapshot across separate statements. Keep the
     // statement cursor open and pin its pre-update engine snapshot for a second explicit read.
@@ -352,7 +352,7 @@ fn active_reader_snapshot_remains_consistent_across_currency_maintenance() {
     let old = db
         .execute_at_snapshot(sql, &params, snapshot)
         .expect("old snapshot remains readable after maintenance");
-    assert_eq!(old.rows[0][1], Value::Bool(true));
+    assert_eq!(old.rows()[0][1], Value::Bool(true));
     let current = reader.execute(sql, &params).expect("read current passage");
     assert_eq!(current.rows[0][1], Value::Bool(false));
 
@@ -431,12 +431,12 @@ fn consumer_cursor_fetches_unread_passage_versions_across_currency_maintenance()
         .open_cursor(sql, &params)
         .expect("open consumer cursor before passage update");
     let first = cursor.first_page().expect("first cursor page").clone();
-    assert!(first.has_more, "unread passage pages must remain");
+    assert!(first.has_more(), "unread passage pages must remain");
     assert!(
-        first.rows.len() <= 100,
+        first.rows().len() <= 100,
         "the changed row must still be unread"
     );
-    assert!(first.rows.iter().all(|row| row[0] != target));
+    assert!(first.rows().iter().all(|row| row[0] != target));
 
     db.execute(
         "UPDATE event_search_passages SET is_searchable = false WHERE id = $id",
@@ -455,15 +455,15 @@ fn consumer_cursor_fetches_unread_passage_versions_across_currency_maintenance()
     );
 
     let mut pages = 1;
-    let mut seen = first.rows;
-    let mut has_more = first.has_more;
+    let mut seen = first.rows().to_vec();
+    let mut has_more = first.has_more();
     while has_more {
         let page = cursor
             .fetch(None)
             .expect("continue the same cursor without retry");
         pages += 1;
-        has_more = page.has_more;
-        seen.extend(page.rows);
+        has_more = page.has_more();
+        seen.extend(page.rows().iter().cloned());
     }
     assert!(pages >= 3, "the cursor must fetch several pages");
     assert_eq!(seen.len(), before.rows.len());

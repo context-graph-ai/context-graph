@@ -1252,7 +1252,11 @@ fn store_open_against_mismatched_cg_schema_version_returns_legacy_schema_detecte
             )]),
         )
         .expect("schema version row count");
-    let schema_version_count = match schema_version_rows.rows.first().and_then(|row| row.first()) {
+    let schema_version_count = match schema_version_rows
+        .rows()
+        .first()
+        .and_then(|row| row.first())
+    {
         Some(Value::Int64(value)) => *value,
         _ => 0,
     };

@@ -154,9 +154,9 @@ fn raw_digest_vector_query(
         ]),
     )
         .expect("raw digest vector query");
-    let trace = format!("{:?}", result.trace);
+    let trace = format!("{:?}", result.trace());
     let ids = result
-        .rows
+        .rows()
         .into_iter()
         .filter_map(|row| match row.first() {
             Some(Value::Uuid(id)) => Some(DigestId::from(*id)),
@@ -176,7 +176,7 @@ fn raw_unrestricted_digest_vector_ids(
         &HashMap::from([("q".to_string(), Value::Vector(query_vector))]),
     )
     .expect("raw unrestricted digest vector query")
-    .rows
+    .rows()
     .into_iter()
     .filter_map(|row| match row.first() {
         Some(Value::Uuid(id)) => Some(DigestId::from(*id)),
@@ -187,7 +187,7 @@ fn raw_unrestricted_digest_vector_ids(
 
 fn raw_count(db: &Database, sql: &str, params: HashMap<String, Value>) -> usize {
     let result = db.execute(sql, &params).expect("raw count");
-    let scalar = result.rows.first().and_then(|row| row.first());
+    let scalar = result.rows().first().and_then(|row| row.first());
     assert!(
         matches!(scalar, Some(Value::Int64(_))),
         "expected count row, got {scalar:?}"

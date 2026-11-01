@@ -88,7 +88,8 @@ fn rows(store: &Store, sql: &str, params: HashMap<String, Value>) -> Vec<Vec<Val
         .sync_database()
         .execute(sql, &params)
         .expect("inspect durable Store state")
-        .rows
+        .rows()
+        .to_vec()
 }
 
 fn raw_rows(path: &std::path::Path, sql: &str, params: HashMap<String, Value>) -> Vec<Vec<Value>> {
@@ -96,7 +97,8 @@ fn raw_rows(path: &std::path::Path, sql: &str, params: HashMap<String, Value>) -
         .expect("open raw read-only session")
         .execute(sql, &params)
         .expect("inspect committed image without application readiness")
-        .rows
+        .rows()
+        .to_vec()
 }
 
 fn raw_table_names(path: &std::path::Path) -> BTreeSet<String> {
@@ -107,16 +109,17 @@ fn raw_table_names(path: &std::path::Path) -> BTreeSet<String> {
         let page = reader
             .metadata(MetadataRequest::Tables, continuation.as_deref())
             .expect("inspect raw table metadata");
-        let MetadataBody::Tables { items, has_more } = page.body else {
+        let MetadataBody::Tables { items, has_more } = &page.body else {
             panic!("table metadata returned a different page kind");
         };
-        tables.extend(items);
-        if !has_more {
+        tables.extend(items.iter().cloned());
+        if !*has_more {
             assert!(page.continuation.is_none());
             return tables;
         }
         continuation = Some(
             page.continuation
+                .clone()
                 .expect("paged table metadata has a continuation"),
         );
     }
@@ -607,7 +610,7 @@ async fn authenticated_binding(
 fn raw_query(path: &Path, sql: &str) -> contextdb_core::Result<Vec<Vec<Value>>> {
     ReadSession::open(path)?
         .execute(sql, &HashMap::new())
-        .map(|result| result.rows)
+        .map(|result| result.rows().to_vec())
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -653,7 +656,8 @@ async fn interrupted_authenticated_install_recovers_configured_consumer_tables_w
         .sync_database()
         .execute("SHOW SYNC BINDINGS", &HashMap::new())
         .expect("record durable authenticated binding")
-        .rows;
+        .rows()
+        .to_vec();
 
     probe.arm();
     let interrupted_store = store.clone();
@@ -729,7 +733,7 @@ async fn interrupted_authenticated_install_recovers_configured_consumer_tables_w
             .sync_database()
             .execute("SHOW SYNC BINDINGS", &HashMap::new())
             .expect("inspect retained binding after recovery")
-            .rows,
+            .rows(),
         binding_before,
         "recovery retains the authenticated binding"
     );

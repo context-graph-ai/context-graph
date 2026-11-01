@@ -374,7 +374,7 @@ fn ready_unactivated_interpretation_changes_only_the_explicit_staged_search_gene
         )
         .expect("inspect ordinary search head");
     assert_eq!(
-        ordinary_head.rows,
+        ordinary_head.rows(),
         vec![vec![Value::Uuid(ordinary.generation_id.as_uuid())]]
     );
     let interpretation_head = store
@@ -386,7 +386,7 @@ fn ready_unactivated_interpretation_changes_only_the_explicit_staged_search_gene
             ]),
         )
         .expect("inspect unactivated interpretation head");
-    assert!(interpretation_head.rows.is_empty());
+    assert!(interpretation_head.rows().is_empty());
 
     let staged = store
         .rebuild_event_search(staged_rebuild_request(
@@ -415,7 +415,7 @@ fn ready_unactivated_interpretation_changes_only_the_explicit_staged_search_gene
         )
         .expect("inspect staged sealed membership");
     assert_eq!(
-        staged_membership.rows,
+        staged_membership.rows(),
         vec![vec![Value::Uuid(interpretation.generation_id.as_uuid())]]
     );
     let staged_text = store
@@ -428,7 +428,7 @@ fn ready_unactivated_interpretation_changes_only_the_explicit_staged_search_gene
         )
         .expect("inspect staged derived passage");
     assert_eq!(
-        staged_text.rows,
+        staged_text.rows(),
         vec![vec![Value::Text(format!(
             "User [author=\"captured-author\"]: {DERIVED_TEXT}"
         ))]]
@@ -461,7 +461,7 @@ fn ready_unactivated_interpretation_changes_only_the_explicit_staged_search_gene
                 &params(context_id),
             )
             .expect("inspect search head after staged rebuild")
-            .rows,
-        ordinary_head.rows
+            .rows(),
+        ordinary_head.rows()
     );
 }

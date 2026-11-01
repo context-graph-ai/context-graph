@@ -323,7 +323,7 @@ fn late_append_stays_out_of_the_already_embedded_passage_then_catches_up_before_
         )
         .expect("inspect sealed source membership");
     assert_eq!(
-        members.rows,
+        members.rows(),
         vec![
             vec![Value::Uuid(sealed_event.id.as_uuid())],
             vec![Value::Uuid(found.hits[0].sources[1].event_id.as_uuid())],

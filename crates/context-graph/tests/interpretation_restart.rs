@@ -262,7 +262,8 @@ fn rows(store: &Store, sql: &str, params: HashMap<String, Value>) -> Vec<Vec<Val
     store
         .execute_sql_for_test(sql, &params)
         .expect("inspect runner-created durable rows")
-        .rows
+        .rows()
+        .to_vec()
 }
 
 #[derive(Clone, Debug, PartialEq)]

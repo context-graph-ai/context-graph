@@ -198,7 +198,8 @@ fn rows(store: &Store, sql: &str, params: HashMap<String, Value>) -> Vec<Vec<Val
     store
         .execute_sql_for_test(sql, &params)
         .expect("inspect or control real durable state")
-        .rows
+        .rows()
+        .to_vec()
 }
 
 fn one_row(store: &Store, sql: &str, params: HashMap<String, Value>) -> Vec<Value> {
@@ -392,23 +393,23 @@ fn retained_shared_event_without_local_commit_is_included_by_public_build() {
                 &HashMap::from([("context_id".into(), Value::Uuid(context_id.as_uuid()))]),
             )
             .expect("read production-created shared rows");
-        assert!(!copied.rows.is_empty(), "seed has {table} rows");
+        assert!(!copied.rows().is_empty(), "seed has {table} rows");
         let placeholders = copied
-            .columns
+            .columns()
             .iter()
             .map(|column| format!("${column}"))
             .collect::<Vec<_>>()
             .join(", ");
         let insert = format!(
             "INSERT INTO {table} ({}) VALUES ({placeholders})",
-            copied.columns.join(", ")
+            copied.columns().join(", ")
         );
-        for row in &copied.rows {
+        for row in copied.rows() {
             fixture
                 .execute_sql_for_test(
                     &insert,
                     &copied
-                        .columns
+                        .columns()
                         .iter()
                         .cloned()
                         .zip(row.iter().cloned())
@@ -422,9 +423,10 @@ fn retained_shared_event_without_local_commit_is_included_by_public_build() {
                 &HashMap::from([("context_id".into(), Value::Uuid(context_id.as_uuid()))]),
             )
             .expect("read copied shared rows");
-        assert_eq!(fixture_rows.columns, copied.columns);
+        assert_eq!(fixture_rows.columns(), copied.columns());
         assert_eq!(
-            fixture_rows.rows, copied.rows,
+            fixture_rows.rows(),
+            copied.rows(),
             "{table} stays full-row equivalent"
         );
     }

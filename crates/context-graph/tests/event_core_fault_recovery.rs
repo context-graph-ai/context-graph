@@ -101,7 +101,8 @@ fn rows(store: &Store, sql: &str, params: HashMap<String, Value>) -> Vec<Vec<Val
         .sync_database()
         .execute(sql, &params)
         .expect("inspect durable state")
-        .rows
+        .rows()
+        .to_vec()
 }
 
 fn table_fingerprint(db: &Database) -> BTreeSet<String> {
@@ -111,12 +112,13 @@ fn table_fingerprint(db: &Database) -> BTreeSet<String> {
 fn binding_fingerprint(db: &Database) -> Vec<Vec<Value>> {
     db.execute("SHOW SYNC BINDINGS", &HashMap::new())
         .expect("inspect authenticated bindings")
-        .rows
+        .rows()
+        .to_vec()
 }
 
 fn version_rows(db: &Database) -> contextdb_core::Result<Vec<Vec<Value>>> {
     db.execute("SELECT version FROM cg_schema_version", &HashMap::new())
-        .map(|result| result.rows)
+        .map(|result| result.rows().to_vec())
 }
 
 fn persisted_table_names(path: &Path) -> BTreeSet<String> {
@@ -128,11 +130,11 @@ fn persisted_table_names(path: &Path) -> BTreeSet<String> {
         let answer = reader
             .metadata(MetadataRequest::Tables, continuation.as_deref())
             .expect("read interrupted committed table inventory");
-        let MetadataBody::Tables { items, has_more } = answer.body else {
+        let MetadataBody::Tables { items, has_more } = &answer.body else {
             panic!("table inventory returned a different metadata body");
         };
-        names.extend(items);
-        if !has_more {
+        names.extend(items.iter().cloned());
+        if !*has_more {
             assert!(
                 answer.continuation.is_none(),
                 "a complete table inventory has no continuation"
@@ -142,6 +144,7 @@ fn persisted_table_names(path: &Path) -> BTreeSet<String> {
         continuation = Some(
             answer
                 .continuation
+                .clone()
                 .expect("a paged table inventory names its continuation"),
         );
     }

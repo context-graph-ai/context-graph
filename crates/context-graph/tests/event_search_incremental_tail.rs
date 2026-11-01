@@ -267,7 +267,7 @@ fn vector(store: &Store, passage: &EventSearchPassage) -> Value {
             ]),
         )
         .expect("inspect persisted vector")
-        .rows[0][0]
+        .rows()[0][0]
         .clone()
 }
 

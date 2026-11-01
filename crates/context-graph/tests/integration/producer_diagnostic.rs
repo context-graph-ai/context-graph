@@ -749,7 +749,7 @@ fn raw_signature_lineage_rows(
         &params(vec![("signature_id", Value::Text(signature_id.to_string()))]),
     )?;
     let mut rows = Vec::new();
-    for row in result.rows {
+    for row in result.rows() {
         let (
             Some(Value::Text(signature_id)),
             Some(Value::Text(role)),

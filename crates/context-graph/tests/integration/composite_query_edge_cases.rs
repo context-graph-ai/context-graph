@@ -612,7 +612,7 @@ fn vector_search_top_k_ordering_matches_hnsw_documented_ranking() {
         )
         .expect("raw vector query");
     let raw_targets = raw_vector_query
-        .rows
+        .rows()
         .iter()
         .filter_map(|row| match row.first() {
             Some(Value::Uuid(id)) => Some(EmbeddingTarget::Evidence(EvidenceId::from(*id))),
@@ -621,7 +621,7 @@ fn vector_search_top_k_ordering_matches_hnsw_documented_ranking() {
         .collect::<Vec<_>>();
     let hnsw_stats =
         raw_db.__debug_vector_hnsw_stats(VectorIndexRef::new("evidence", "vector_text"));
-    let raw_trace = format!("{:?}", raw_vector_query.trace);
+    let raw_trace = format!("{:?}", raw_vector_query.trace());
 
     assert!(
         targets

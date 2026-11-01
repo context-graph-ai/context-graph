@@ -268,8 +268,8 @@ fn count_row(store: &Store, context_id: ContextId) -> Option<(u64, EventCoverage
             &params(context_id),
         )
         .expect("read the count row");
-    assert!(answer.rows.len() <= 1, "one count row per Context");
-    answer.rows.first().map(|row| {
+    assert!(answer.rows().len() <= 1, "one count row per Context");
+    answer.rows().first().map(|row| {
         (
             int(&row[0]),
             EventCoverageCounts {
@@ -288,7 +288,7 @@ fn counted_from_events(store: &Store, context_id: ContextId) -> (u64, EventCover
         let answer = store
             .execute_sql_for_test(sql, &params)
             .expect("count events");
-        int(&answer.rows[0][0])
+        int(&answer.rows()[0][0])
     };
     let by_coverage = |coverage: &str| {
         let mut with = params(context_id);
@@ -689,16 +689,17 @@ fn show_reads_its_source_links_once_through_the_passage_first_index() {
         )
         .expect("rerun the recorded link read");
     assert_eq!(
-        traced.trace.physical_plan, "IndexScan",
+        traced.trace().physical_plan,
+        "IndexScan",
         "{:#?}",
-        traced.trace
+        traced.trace()
     );
-    assert_eq!(traced.rows.len(), passage.sources.len());
+    assert_eq!(traced.rows().len(), passage.sources.len());
     assert_eq!(
-        traced.trace.rows_examined as usize,
+        traced.trace().rows_examined as usize,
         passage.sources.len(),
         "show reads each returned source link once: {:#?}",
-        traced.trace
+        traced.trace()
     );
 }
 

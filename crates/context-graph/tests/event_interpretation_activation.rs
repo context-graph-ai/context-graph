@@ -288,14 +288,14 @@ fn heads(store: &Store, context_id: ContextId) -> (Vec<Vec<Value>>, Vec<Vec<Valu
             ]),
         )
         .expect("snapshot interpretation head")
-        .rows;
+        .rows().to_vec();
     let search = store
         .execute_sql_for_test(
             "SELECT generation_id, activated_at FROM event_search_heads WHERE context_id = $context_id",
             &HashMap::from([("context_id".into(), Value::Uuid(context_id.as_uuid()))]),
         )
         .expect("snapshot search head")
-        .rows;
+        .rows().to_vec();
     (interpretation, search)
 }
 

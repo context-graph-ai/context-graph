@@ -230,7 +230,8 @@ fn rows(store: &Store, sql: &str, params: HashMap<String, Value>) -> Vec<Vec<Val
     store
         .execute_sql_for_test(sql, &params)
         .expect("inspect public-runner durable rows")
-        .rows
+        .rows()
+        .to_vec()
 }
 
 fn claim_snapshot(store: &Store, context_id: context_graph::ContextId) -> ClaimSnapshot {

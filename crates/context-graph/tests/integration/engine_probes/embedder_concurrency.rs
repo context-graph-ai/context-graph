@@ -457,13 +457,13 @@ fn store_count(store: &Store, sql: &str, params: &HashMap<String, Value>) -> i64
 }
 
 fn count_from_result(result: contextdb_engine::QueryResult) -> i64 {
-    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.rows().len(), 1);
     assert!(
-        matches!(result.rows[0].first(), Some(Value::Int64(_))),
+        matches!(result.rows()[0].first(), Some(Value::Int64(_))),
         "expected count integer, got {:?}",
-        result.rows[0].first()
+        result.rows()[0].first()
     );
-    match result.rows[0][0] {
+    match result.rows()[0][0] {
         Value::Int64(value) => value,
         _ => 0,
     }
@@ -1236,7 +1236,7 @@ fn engine_probe_immutable_embedding_handle_id_rejects_update_under_contention() 
             && matches!(update_b, Err(EngineError::ImmutableTable(ref table)) if table == "evidence_embedding_handles")
             && mutable_control
                 .as_ref()
-                .is_ok_and(|result| result.rows_affected == 1)
+                .is_ok_and(|result| result.rows_affected() == 1)
             && handle_rows == 1,
         "contended handle-id updates must be rejected as ImmutableTable while mutable sibling update succeeds, seed={seed:?}, update_a={update_a:?}, update_b={update_b:?}, mutable_control={mutable_control:?}, handle_rows={handle_rows}"
     );
@@ -1311,7 +1311,9 @@ fn engine_probe_composite_fk_same_context_rejects_cross_context_embedding_handle
 
     assert!(
         seed.is_ok()
-            && valid.as_ref().is_ok_and(|result| result.rows_affected == 1)
+            && valid
+                .as_ref()
+                .is_ok_and(|result| result.rows_affected() == 1)
             && matches!(
                 invalid,
                 Err(EngineError::ForeignKeyViolation {
@@ -1778,7 +1780,7 @@ fn reindex_space_via_database_insert_vector_does_not_fire_observation_trigger() 
             && invalidations_after_vector_write == 0
             && positive_control
                 .as_ref()
-                .is_ok_and(|result| result.rows_affected == 1)
+                .is_ok_and(|result| result.rows_affected() == 1)
             && after_observation_insert == before_vector_write + 1,
         "vector-only reindex writes must not fire the observation trigger, while the observation positive control must fire exactly once, seed={seed:?}, row_id={row_id:?}, vector_write={vector_write:?}, before_vector_write={before_vector_write}, after_vector_write={after_vector_write}, invalidations_after_vector_write={invalidations_after_vector_write}, positive_control={positive_control:?}, after_observation_insert={after_observation_insert}"
     );

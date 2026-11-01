@@ -635,7 +635,7 @@ fn positive_activation_retry_is_idempotent() {
         )
         .expect("inspect interpretation head");
     assert_eq!(
-        interpretation_head.rows,
+        interpretation_head.rows(),
         vec![vec![
             DbValue::Uuid(interpretation.generation_id.as_uuid()),
             DbValue::TxId(activated.transaction_id),
@@ -649,7 +649,7 @@ fn positive_activation_retry_is_idempotent() {
         )
         .expect("inspect search head");
     assert_eq!(
-        search_head.rows,
+        search_head.rows(),
         vec![vec![
             DbValue::Uuid(search.generation_id.as_uuid()),
             DbValue::TxId(activated.transaction_id),
@@ -670,7 +670,7 @@ fn positive_activation_retry_is_idempotent() {
         )
         .expect("inspect the exact-anchor projection selected by the active head");
     assert_eq!(
-        active_exact_anchor.rows,
+        active_exact_anchor.rows(),
         vec![vec![DbValue::Text("src/lib.rs".into())]],
         "the activated interpretation's exact anchor is visible"
     );
@@ -688,9 +688,9 @@ fn positive_activation_retry_is_idempotent() {
         "Assistant [author=\"released-author\"]: released text"
     );
     let retry_snapshot = (
-        interpretation_head.rows,
-        search_head.rows,
-        active_exact_anchor.rows,
+        interpretation_head.rows().to_vec(),
+        search_head.rows().to_vec(),
+        active_exact_anchor.rows().to_vec(),
         active_search.hits,
     );
     drop(visible_store);
@@ -714,14 +714,14 @@ fn positive_activation_retry_is_idempotent() {
                 ]),
             )
             .expect("inspect interpretation head after retry")
-            .rows,
+            .rows().to_vec(),
         retry_store
             .execute_sql_for_test(
                 "SELECT generation_id, activated_at FROM event_search_heads WHERE context_id = $context_id",
                 &HashMap::from([("context_id".into(), DbValue::Uuid(context_id.as_uuid()))]),
             )
             .expect("inspect search head after retry")
-            .rows,
+            .rows().to_vec(),
         retry_store
             .execute_sql_for_test(
                 "SELECT canonical_value FROM event_interpretation_anchors WHERE context_id = $context_id AND generation_id = $generation_id AND key = $key",
@@ -735,7 +735,7 @@ fn positive_activation_retry_is_idempotent() {
                 ]),
             )
             .expect("inspect exact-anchor projection after retry")
-            .rows,
+            .rows().to_vec(),
         retry_store
             .find_event_history(
                 ContextSelector::one(context_id),

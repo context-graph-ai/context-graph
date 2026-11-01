@@ -357,7 +357,7 @@ fn lease_rows(store: &Store, context_id: ContextId) -> usize {
             &HashMap::from([("context_id".into(), Value::Uuid(context_id.as_uuid()))]),
         )
         .expect("inspect projection leases")
-        .rows
+        .rows()
         .len()
 }
 

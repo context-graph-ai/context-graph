@@ -229,13 +229,13 @@ fn count_from_store(
     let result = store
         .execute_sql_for_test(sql, params)
         .expect("count query");
-    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.rows().len(), 1);
     assert!(
-        matches!(result.rows[0].first(), Some(Value::Int64(_))),
+        matches!(result.rows()[0].first(), Some(Value::Int64(_))),
         "expected count integer, got {:?}",
-        result.rows[0].first()
+        result.rows()[0].first()
     );
-    match result.rows[0][0] {
+    match result.rows()[0][0] {
         Value::Int64(value) => value,
         _ => 0,
     }

@@ -91,7 +91,7 @@ fn kind_for(db: &Database, evidence_id: EvidenceId) -> Option<String> {
             &HashMap::from([("id".to_string(), Value::Uuid(evidence_id.as_uuid()))]),
         )
         .expect("kind query");
-    result.rows.first().and_then(|row| match row.first() {
+    result.rows().first().and_then(|row| match row.first() {
         Some(Value::Text(kind)) => Some(kind.clone()),
         _ => None,
     })

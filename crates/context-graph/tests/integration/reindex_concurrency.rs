@@ -666,13 +666,13 @@ fn execute_query(
 
 fn count(db_path: &Path, sql: &str, params: &HashMap<String, Value>) -> i64 {
     let result = execute_query(db_path, sql, params);
-    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.rows().len(), 1);
     assert!(
-        matches!(result.rows[0].first(), Some(Value::Int64(_))),
+        matches!(result.rows()[0].first(), Some(Value::Int64(_))),
         "expected count integer, got {:?}",
-        result.rows[0].first()
+        result.rows()[0].first()
     );
-    match result.rows[0][0] {
+    match result.rows()[0][0] {
         Value::Int64(value) => value,
         _ => 0,
     }
@@ -701,7 +701,7 @@ fn store_count(store: &Store, query: &str, params: &HashMap<String, Value>) -> i
     let result = store
         .execute_sql_for_test(query, params)
         .expect("store count query");
-    match result.rows.first().and_then(|row| row.first()) {
+    match result.rows().first().and_then(|row| row.first()) {
         Some(Value::Int64(value)) => *value,
         _ => 0,
     }
@@ -732,7 +732,7 @@ fn lease_owner_run_id(db_path: &Path, space: &str) -> Option<String> {
         "SELECT owner_run_id FROM reindex_cursors WHERE embedding_space_id = $space",
         &params(vec![("space", Value::Text(space.to_string()))]),
     );
-    result.rows.first().and_then(|row| match row.first() {
+    result.rows().first().and_then(|row| match row.first() {
         Some(Value::Text(owner)) => Some(owner.clone()),
         _ => None,
     })
@@ -795,8 +795,8 @@ fn raw_conditional_lease_takeover_rejected(db_path: &Path, space: &str) -> bool 
         ]),
         )
     };
-    matches!(available_status_result, Ok(query) if query.rows_affected == 0)
-        && matches!(stale_owner_result, Ok(query) if query.rows_affected == 0)
+    matches!(available_status_result, Ok(query) if query.rows_affected() == 0)
+        && matches!(stale_owner_result, Ok(query) if query.rows_affected() == 0)
         && lease_owner_run_id(db_path, space).as_deref() == Some(owner_run_id.as_str())
         && durable_in_progress_lease_at(db_path, space, 1) == 1
 }
@@ -856,7 +856,7 @@ fn evidence_text_projection(db_path: &Path, evidence_id: EvidenceId) -> Option<S
             &params(vec![("id", Value::Uuid(evidence_id.as_uuid()))]),
         )
         .expect("evidence text projection query");
-    result.rows.first().and_then(|row| match row.first() {
+    result.rows().first().and_then(|row| match row.first() {
         Some(Value::Text(text)) => Some(text.clone()),
         _ => None,
     })
@@ -869,7 +869,7 @@ fn evidence_context_uuid(store: &Store, evidence_id: EvidenceId) -> Option<uuid:
             &params(vec![("id", Value::Uuid(evidence_id.as_uuid()))]),
         )
         .ok()?;
-    match result.rows.first().and_then(|row| row.first()) {
+    match result.rows().first().and_then(|row| row.first()) {
         Some(Value::Uuid(context_id)) => Some(*context_id),
         _ => None,
     }
@@ -901,7 +901,7 @@ fn insert_extra_historical_handle(store: &Store, evidence_id: EvidenceId) -> boo
             &common_params,
         )
     });
-    matches!(result, Ok(query) if query.rows_affected == 1)
+    matches!(result, Ok(query) if query.rows_affected() == 1)
 }
 
 fn text_vector_matches_exactly(db_path: &Path, evidence_id: EvidenceId, expected: &[f32]) -> bool {

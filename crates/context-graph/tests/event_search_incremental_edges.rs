@@ -230,7 +230,7 @@ fn memberships(
             ("context_id".into(), Value::Uuid(context_id.as_uuid())),
             ("generation_id".into(), Value::Uuid(generation_id.as_uuid())),
         ]),
-    ).expect("inspect persisted source membership").rows
+    ).expect("inspect persisted source membership").rows().to_vec()
 }
 
 #[test]

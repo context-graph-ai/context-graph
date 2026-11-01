@@ -45,8 +45,11 @@ fn revision(store: &Store, context_id: ContextId) -> Option<Value> {
             &HashMap::from([("context_id".into(), Value::Uuid(context_id.as_uuid()))]),
         )
         .expect("read event Context revision");
-    assert!(result.rows.len() <= 1, "the Context primary key is unique");
-    result.rows.first().map(|row| row[0].clone())
+    assert!(
+        result.rows().len() <= 1,
+        "the Context primary key is unique"
+    );
+    result.rows().first().map(|row| row[0].clone())
 }
 
 #[test]

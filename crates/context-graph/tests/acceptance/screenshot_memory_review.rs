@@ -741,7 +741,7 @@ fn count_rows(db_path: &std::path::Path, sql: &str, params: Vec<(&str, Value)>) 
         .map(|(key, value)| (key.to_string(), value))
         .collect();
     let result = db.execute(sql, &params).expect("count query");
-    match result.rows.first().and_then(|row| row.first()) {
+    match result.rows().first().and_then(|row| row.first()) {
         Some(Value::Int64(value)) => *value,
         other => {
             assert!(
@@ -767,7 +767,7 @@ fn digest_projection(
             &params,
         )
         .expect("digest projection query");
-    let row = result.rows.first()?;
+    let row = result.rows().first()?;
     let source = match row.first() {
         Some(Value::Text(value)) => value.clone(),
         _ => return None,
@@ -794,7 +794,7 @@ fn raw_top_digest_ids(db_path: &Path, query: &[f32], top_k: usize) -> Vec<Digest
         &params,
     )
     .expect("raw digest vector query")
-    .rows
+    .rows()
     .into_iter()
     .filter_map(|row| match row.first() {
         Some(Value::Uuid(id)) => Some(DigestId::from(*id)),
@@ -2016,7 +2016,7 @@ fn raw_dedup_trace(store: &Store, query_digest: DigestId, candidate_digest: Dige
             ]),
         )
         .expect("raw dedup trace query");
-    format!("{:?}", result.trace)
+    format!("{:?}", result.trace())
 }
 
 #[cfg(context_graph_internal_test_support)]
@@ -2044,7 +2044,7 @@ fn raw_evidence_row_vector_hits(
         )
         .expect("raw evidence ROW_VECTOR query");
     let targets = result
-        .rows
+        .rows()
         .iter()
         .map(|row| match row.first() {
             Some(Value::Uuid(id)) => EmbeddingTarget::Evidence(EvidenceId::from(*id)),
@@ -2052,11 +2052,11 @@ fn raw_evidence_row_vector_hits(
         })
         .collect::<Vec<_>>();
     let scores = result
-        .rows
+        .rows()
         .iter()
         .map(|row| score_from_value(row.get(2)))
         .collect::<Vec<_>>();
-    (targets, scores, format!("{:?}", result.trace))
+    (targets, scores, format!("{:?}", result.trace()))
 }
 
 #[cfg(context_graph_internal_test_support)]
@@ -2079,7 +2079,7 @@ fn raw_semantic_vector_hits(
         )
         .expect("raw semantic vector query");
     let targets = result
-        .rows
+        .rows()
         .iter()
         .map(|row| match row.first() {
             Some(Value::Uuid(id)) => EmbeddingTarget::Evidence(EvidenceId::from(*id)),
@@ -2087,11 +2087,11 @@ fn raw_semantic_vector_hits(
         })
         .collect::<Vec<_>>();
     let scores = result
-        .rows
+        .rows()
         .iter()
         .map(|row| score_from_value(row.get(2)))
         .collect::<Vec<_>>();
-    (targets, scores, format!("{:?}", result.trace))
+    (targets, scores, format!("{:?}", result.trace()))
 }
 
 #[cfg(context_graph_internal_test_support)]
@@ -2146,7 +2146,7 @@ fn txids(db_path: &std::path::Path, sql: &str, params: Vec<(&str, Value)>) -> Ve
         .collect();
     db.execute(sql, &params)
         .expect("txid query")
-        .rows
+        .rows()
         .into_iter()
         .filter_map(|row| match row.first() {
             Some(Value::TxId(txid)) => Some(*txid),
