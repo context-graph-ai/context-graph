@@ -2942,8 +2942,15 @@ pub fn event_fresh_graph_build(_c: &mut Criterion) {
     let partition = &before[0];
     assert_eq!(partition.live_rows, ROWS);
     assert_eq!(partition.retained_rows, 0);
-    assert!(!partition.graph_available);
-    assert!(partition.base_generation.is_none());
+    let partition_key = partition.partition.partition_key.clone();
+    let indexed = |db: &Database| {
+        db.__debug_vector_partition_indexed_for_test(index.clone(), partition_key.clone())
+    };
+    let index_generation = |db: &Database| {
+        db.__debug_vector_partition_generation_for_test(index.clone(), partition_key.clone())
+    };
+    assert!(!indexed(&db));
+    assert!(index_generation(&db).is_none());
     assert!(
         partition.maintenance_progress.is_none(),
         "no build may be in flight"
@@ -2955,8 +2962,8 @@ pub fn event_fresh_graph_build(_c: &mut Criterion) {
     assert_eq!(db.memory_limit(), Some(WRITER_LIMIT));
     let precondition = json!({
         "asserted": true, "partitions": before.len(), "live_rows": partition.live_rows,
-        "retained_rows": partition.retained_rows, "graph_available": partition.graph_available,
-        "base_generation": partition.base_generation, "build_in_flight": false,
+        "retained_rows": partition.retained_rows, "graph_available": indexed(&db),
+        "base_generation": index_generation(&db), "build_in_flight": false,
         "pending_inserts": partition.pending_inserts, "tombstones": partition.tombstones,
         "maintenance_policy": "caller_driven", "writer_memory_limit_bytes": WRITER_LIMIT,
         "desired_policy": format!("{:?}", partition.desired_policy),
@@ -2987,8 +2994,9 @@ pub fn event_fresh_graph_build(_c: &mut Criterion) {
         .partition_infos(&index, &mut partition_observation_owner_2)
         .expect("published graph facts");
     assert_eq!(after.len(), 1);
-    assert!(after[0].graph_available);
-    assert!(after[0].base_generation.is_some());
+    assert!(indexed(&db));
+    let published = index_generation(&db);
+    assert!(published.is_some());
     assert_eq!(after[0].pending_inserts, 0);
     assert!(after[0].maintenance_failure.is_none());
     assert!(after[0].maintenance_failure_details.is_none());
@@ -3005,8 +3013,8 @@ pub fn event_fresh_graph_build(_c: &mut Criterion) {
         .partition_infos(&index, &mut partition_observation_owner_3)
         .expect("restart graph facts");
     assert_eq!(ready.len(), 1);
-    assert!(ready[0].graph_available);
-    assert_eq!(ready[0].base_generation, after[0].base_generation);
+    assert!(indexed(&reopened));
+    assert_eq!(index_generation(&reopened), published);
     let query = reopened
         .execute(
             "SELECT embedding FROM passages WHERE id = $id",
@@ -3027,7 +3035,7 @@ pub fn event_fresh_graph_build(_c: &mut Criterion) {
         .expect("restart indexed trace");
     assert!(
         trace.route.is_some_and(|route| route.as_str() != "exact")
-            || trace.partition_hnsw.iter().any(|partition| partition
+            || trace.partitions.iter().any(|partition| partition
                 .route
                 .is_some_and(|route| route.as_str() != "exact")),
         "restart search must use the persisted index"
@@ -3727,7 +3735,7 @@ mod route {
             "rows_examined": trace.rows_examined,
             "partition_key": vector.map(|v| v.partition_key_columns.clone()),
             "partition_scope": vector.map(|v| v.scope.as_str()),
-            "selected_partitions_disclosed": vector.map(|v| v.partition_hnsw.len()),
+            "selected_partitions_disclosed": vector.map(|v| v.partitions.len()),
             "requested_mode": vector.map(|v| format!("{:?}", v.requested_mode)),
             "resolved_mode": vector.map(|v| format!("{:?}", v.resolved_mode)),
             "route": vector.and_then(|v| v.route).map(|r| r.as_str()),
@@ -4651,8 +4659,7 @@ mod gate {
     pub struct QueryWork {
         pub evaluations: u64,
         pub exact_evaluations: u64,
-        pub used_graph: bool,
-        pub graph_evaluations: u64,
+        pub used_index: bool,
         pub elapsed: Duration,
         pub exact_elapsed: Duration,
     }
@@ -4744,7 +4751,7 @@ mod gate {
                 .modes
                 .iter()
                 .flat_map(|mode| &mode.queries)
-                .filter(|query| query.used_graph && query.graph_evaluations == 0)
+                .filter(|query| query.used_index && query.evaluations == 0)
                 .count();
         if blind > 0 {
             failures.push(format!(
@@ -4784,10 +4791,10 @@ mod gate {
             }
             match cell.requirement {
                 Requirement::SingleContext => {
-                    let on_graph = mode.queries.iter().filter(|query| query.used_graph).count();
-                    if on_graph != mode.queries.len() {
+                    let on_index = mode.queries.iter().filter(|query| query.used_index).count();
+                    if on_index != mode.queries.len() {
                         failures.push(format!(
-                            "{label} {name}: walked the maintained graph on {on_graph} of {} queries",
+                            "{label} {name}: used the maintained index on {on_index} of {} queries",
                             mode.queries.len()
                         ));
                     }
@@ -4947,9 +4954,6 @@ mod recall {
 
     use contextdb_core::Value;
     use contextdb_engine::read_session::ReadSession;
-    use contextdb_vector::hnsw::{
-        HnswCandidateDistanceEvent, HnswCandidateObserver, with_hnsw_candidate_observer,
-    };
     use contextdb_vector::mem::{
         NativeVectorScoreObserver, with_native_vector_score_observer_for_test,
     };
@@ -4959,34 +4963,27 @@ mod recall {
 
     struct Counter(AtomicU64);
 
-    impl HnswCandidateObserver for Counter {
-        fn before_candidate_distance(&self, _: HnswCandidateDistanceEvent) {
-            self.0.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-
     impl NativeVectorScoreObserver for Counter {
         fn before_native_vector_score(&self) {
             self.0.fetch_add(1, Ordering::Relaxed);
         }
     }
 
-    /// One statement's answer and the distance work the engine did for it: graph candidate
-    /// distances and native (exact or rerank) vector scores, counted where they are computed.
+    /// One statement's answer and the distance work the engine did for it: exact-route scores,
+    /// counted where they are computed, plus the indexed route's disclosed full-precision reranks.
     pub struct Counted {
         pub result: Result<contextdb_engine::QueryResult, String>,
-        pub graph_evaluations: u64,
         pub native_evaluations: u64,
         pub elapsed: Duration,
     }
 
     impl Counted {
         pub fn evaluations(&self) -> u64 {
-            self.graph_evaluations + self.native_evaluations
+            self.native_evaluations
         }
 
-        /// Whether the executed route walked a maintained graph in any selected partition.
-        pub fn used_graph(&self) -> bool {
+        /// Whether the executed route used the maintained index in any selected partition.
+        pub fn used_index(&self) -> bool {
             let Ok(result) = &self.result else {
                 return false;
             };
@@ -4995,13 +4992,13 @@ mod recall {
             };
             vector.route.is_some_and(|route| route.as_str() != "exact")
                 || vector
-                    .partition_hnsw
+                    .partitions
                     .iter()
                     .any(|partition| partition.route.is_some_and(|r| r.as_str() != "exact"))
         }
 
-        /// The executed route, the per-partition routes and the breadth each partition resolved
-        /// (and where that breadth came from), for the evidence line.
+        /// The executed route, the per-partition routes and the layout each partition resolved
+        /// (and where each value came from), for the evidence line.
         pub fn route(&self) -> serde_json::Value {
             match &self.result {
                 Err(error) => serde_json::json!({"error": error}),
@@ -5012,12 +5009,15 @@ mod recall {
                         "route": vector.and_then(|v| v.route).map(|r| r.as_str()),
                         "resolved_mode": vector.map(|v| format!("{:?}", v.resolved_mode)),
                         "route_evidence": vector.map(|v| v.route_evidence.as_str()),
-                        "partitions": vector.map(|v| v.partition_hnsw.iter().map(|p| serde_json::json!({
+                        "partitions": vector.map(|v| v.partitions.iter().map(|p| serde_json::json!({
                             "route": p.route.map(|r| r.as_str()),
                             "reason": p.reason,
-                            "hnsw_m": p.hnsw_m,
-                            "hnsw_ef_search": p.hnsw_ef_search,
-                            "ef_search_source": p.ef_search_source,
+                            "lists": p.lists,
+                            "lists_source": p.lists_source,
+                            "probes": p.probes,
+                            "probes_source": p.probes_source,
+                            "refine_factor_hundredths": p.refine_factor_hundredths,
+                            "refine_factor_source": p.refine_factor_source,
                         })).collect::<Vec<_>>()),
                         "fallback": vector.and_then(|v| v.fallback.clone()),
                         "refusal": vector.and_then(|v| v.refusal.clone()),
@@ -5028,21 +5028,23 @@ mod recall {
     }
 
     pub fn run(session: &ReadSession, sql: &str, params: &HashMap<String, Value>) -> Counted {
-        let graph = Arc::new(Counter(AtomicU64::new(0)));
         let native = Arc::new(Counter(AtomicU64::new(0)));
         let started = Instant::now();
-        let result = with_hnsw_candidate_observer(graph.clone(), || {
-            with_native_vector_score_observer_for_test(native.clone(), || {
-                session
-                    .execute(sql, params)
-                    .map_err(|error| error.to_string())
-            })
+        let result = with_native_vector_score_observer_for_test(native.clone(), || {
+            session
+                .execute(sql, params)
+                .map_err(|error| error.to_string())
         });
         let elapsed = started.elapsed();
+        let reranked = result
+            .as_ref()
+            .ok()
+            .and_then(|answer| answer.trace().vector_search.as_ref())
+            .and_then(|vector| vector.rescore_evaluations)
+            .unwrap_or(0) as u64;
         Counted {
             result,
-            graph_evaluations: graph.0.load(Ordering::Relaxed),
-            native_evaluations: native.0.load(Ordering::Relaxed),
+            native_evaluations: native.0.load(Ordering::Relaxed) + reranked,
             elapsed,
         }
     }
@@ -5176,9 +5178,8 @@ mod recall {
         pub wanted: usize,
         pub query_recalls: Vec<f64>,
         pub elapsed: Vec<Duration>,
-        pub graph_evaluations: Vec<u64>,
         pub native_evaluations: Vec<u64>,
-        pub used_graph: usize,
+        pub used_index: usize,
         pub errors: Vec<String>,
         pub routes: BTreeMap<String, usize>,
         pub first_route: Option<serde_json::Value>,
@@ -5220,13 +5221,13 @@ mod recall {
                 "recall_floor": super::gate::RECALL_FLOOR,
                 "statement": (!self.elapsed.is_empty()).then(|| super::Summary::of(&self.elapsed).json()),
                 "distance_evaluations": {
-                    "graph_total": total(&self.graph_evaluations),
+                    "graph_total": 0,
                     "native_total": total(&self.native_evaluations),
-                    "per_query_mean": (total(&self.graph_evaluations) + total(&self.native_evaluations)) as f64 / self.elapsed.len().max(1) as f64,
-                    "graph_per_query_max": max(&self.graph_evaluations),
+                    "per_query_mean": total(&self.native_evaluations) as f64 / self.elapsed.len().max(1) as f64,
+                    "graph_per_query_max": 0,
                     "native_per_query_max": max(&self.native_evaluations),
                 },
-                "queries_on_graph": self.used_graph,
+                "queries_on_index": self.used_index,
                 "executed_routes": self.routes,
                 "first_route": self.first_route,
                 "errors": self.errors.iter().take(3).collect::<Vec<_>>(),
@@ -5239,9 +5240,8 @@ mod recall {
                 Err(error) => self.errors.push(error.clone()),
                 Ok(result) => {
                     self.elapsed.push(counted.elapsed);
-                    self.graph_evaluations.push(counted.graph_evaluations);
                     self.native_evaluations.push(counted.native_evaluations);
-                    self.used_graph += usize::from(counted.used_graph());
+                    self.used_index += usize::from(counted.used_index());
                     let route = counted.route();
                     let key = format!(
                         "{}/{}",
@@ -5450,8 +5450,7 @@ pub fn event_find_recall_at_10_against_exact_on_the_real_model_fixture(_c: &mut 
                         work[index].push(gate::QueryWork {
                             evaluations: answered.evaluations(),
                             exact_evaluations: reference.evaluations(),
-                            used_graph: answered.used_graph(),
-                            graph_evaluations: answered.graph_evaluations,
+                            used_index: answered.used_index(),
                             elapsed: answered.elapsed,
                             exact_elapsed: reference.elapsed,
                         });
@@ -5701,11 +5700,14 @@ pub fn event_recall_gate_controls(_c: &mut Criterion) {
         !binding_mismatches(None, &binding).is_empty(),
     ));
     let ms = |n: u64| Some(Duration::from_millis(n));
-    let work = |fewer: bool, graph: bool, observed: bool| QueryWork {
-        evaluations: if fewer { 300 } else { 1_250 },
+    let work = |fewer: bool, indexed: bool, observed: bool| QueryWork {
+        evaluations: match (observed || !indexed, fewer) {
+            (false, _) => 0,
+            (true, true) => 300,
+            (true, false) => 1_250,
+        },
         exact_evaluations: 1_250,
-        used_graph: graph,
-        graph_evaluations: if observed && graph { 290 } else { 0 },
+        used_index: indexed,
         elapsed: Duration::from_millis(30),
         exact_elapsed: Duration::from_millis(40),
     };
@@ -5743,8 +5745,7 @@ pub fn event_recall_gate_controls(_c: &mut Criterion) {
         QueryWork {
             evaluations: 1_251,
             exact_evaluations: 1_250,
-            used_graph: true,
-            graph_evaluations: 290,
+            used_index: true,
             elapsed: Duration::from_millis(30),
             exact_elapsed: Duration::from_millis(40),
         };
@@ -5778,8 +5779,7 @@ pub fn event_recall_gate_controls(_c: &mut Criterion) {
         QueryWork {
             evaluations: 1_500,
             exact_evaluations: 1_250,
-            used_graph: true,
-            graph_evaluations: 290,
+            used_index: true,
             elapsed: Duration::from_millis(31),
             exact_elapsed: Duration::from_millis(41),
         },
