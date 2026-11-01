@@ -206,40 +206,6 @@ fn terminate_observed_background_worker(observer: &std::path::Path) {
     }
 }
 
-/// Wait for `reached` with no elapsed-time bound, ending early only when the observed worker's
-/// recorded process group is gone: a worker that exited can never reach its rendezvous.
-#[cfg(any(
-    context_graph_internal_test_support,
-    feature = "event-search-test-support"
-))]
-fn wait_for_observed_worker<T>(
-    observer: &std::path::Path,
-    mut reached: impl FnMut() -> Option<T>,
-) -> Option<T> {
-    wait_for_state(
-        std::time::Duration::MAX,
-        std::time::Duration::from_millis(20),
-        || {
-            if let Some(value) = reached() {
-                return Ok::<_, ()>(Some(Some(value)));
-            }
-            let Some(process_group) =
-                std::fs::read_to_string(observer.join("embedding-worker-process-group"))
-                    .ok()
-                    .and_then(|group| group.trim().parse::<i32>().ok())
-            else {
-                return Ok(None);
-            };
-            // SAFETY: signal 0 only probes whether the recorded process group still exists.
-            let exited = unsafe { libc::kill(-process_group, 0) } == -1
-                && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
-            Ok(exited.then_some(reached()))
-        },
-    )
-    .expect("observed worker wait cannot fail")
-    .expect("a wait without an elapsed-time bound ends only on an observation")
-}
-
 #[cfg(any(
     context_graph_internal_test_support,
     feature = "event-search-test-support"
