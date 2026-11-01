@@ -1131,6 +1131,7 @@ fn assert_no_candidate_work_before_result(method: &str, source: &str) {
         "map_err",
         "new",
         "Ok",
+        "rows",
         "snapshot",
         "sql_string_list",
         "to_string",
@@ -1500,6 +1501,7 @@ fn assert_discovery_method_uses_engine_snapshot(method: &str, min_graph_tables: 
             "map_engine_err",
             "decode_intention",
             "decode_discovery_decisions_at_read",
+            "columns",
         ],
     );
     assert_no_candidate_work_before_result(method, &source);
