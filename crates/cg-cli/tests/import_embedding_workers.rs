@@ -1600,10 +1600,10 @@ mod request_write_ceilings {
                 &["__event-search-worker", &envelope()],
                 &[(REQUEST_OBSERVER_ENV, &observer)],
             );
-            await_marker(&observer, "entered.1");
+            await_marker(&mut worker, &observer, "entered.1");
             event_support::write_test_file(observer.join("release.1"), b"second assessment")
                 .unwrap();
-            await_marker(&observer, "entered.2");
+            await_marker(&mut worker, &observer, "entered.2");
             let path = write_session(
                 &machine.history_root(),
                 &project,
@@ -2388,7 +2388,7 @@ mod request_write_ceilings {
                     b"released",
                 )
                 .unwrap();
-                await_marker(&observer, &format!("entered.{pass}"));
+                await_marker(&mut worker, &observer, &format!("entered.{pass}"));
                 for marker in [
                     "failure-record-entered",
                     "failure-record-continue",
