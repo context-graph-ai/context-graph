@@ -106,7 +106,7 @@ impl Store {
 
     fn embedding_spaces_via(&self, query: &LookupQuery<'_>) -> Result<Vec<EmbeddingSpace>> {
         let result = query(
-            "SELECT embedding_space_id, dimension, metric, model_family, model_name, model_version, supported_evidence_kinds, default_for_evidence_kind, bindings FROM embedding_spaces",
+            "SELECT embedding_space_id, dimension, metric, model_family, model_name, model_version, supported_evidence_kinds, default_for_evidence_kind, bindings, placement FROM embedding_spaces",
             &HashMap::new(),
         )?;
         let mut spaces = Vec::with_capacity(result.rows.len());
@@ -142,7 +142,11 @@ impl Store {
                 .map(|raw| evidence_kind_from_str(&raw))
                 .transpose()?,
                 bindings,
-                placement: Some(crate::VectorPlacement::NODE_LOCAL_REPRODUCIBLE),
+                placement: crate::VectorPlacement::from_stored(&get_text(
+                    row,
+                    result.columns(),
+                    "placement",
+                )?),
             });
         }
         spaces.sort_by(|a, b| a.embedding_space_id.cmp(&b.embedding_space_id));

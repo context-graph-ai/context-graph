@@ -464,6 +464,18 @@ impl VectorPlacement {
         rebuild: VectorRebuild::CallerOnly,
     };
 
+    /// Reads the stored spelling back; `None` for anything else.
+    pub fn from_stored(stored: &str) -> Option<Self> {
+        [
+            Self::TRAVELS_REPRODUCIBLE,
+            Self::TRAVELS_CALLER_ONLY,
+            Self::NODE_LOCAL_REPRODUCIBLE,
+            Self::NODE_LOCAL_CALLER_ONLY,
+        ]
+        .into_iter()
+        .find(|placement| placement.as_str() == stored)
+    }
+
     /// The stored spelling, one word per axis.
     pub fn as_str(self) -> &'static str {
         match (self.locality, self.rebuild) {

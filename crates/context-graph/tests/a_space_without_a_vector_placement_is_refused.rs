@@ -93,3 +93,27 @@ fn a_stored_space_cannot_change_its_placement() {
         changed.err()
     );
 }
+
+#[test]
+fn a_stored_space_lists_back_with_the_placement_it_declared() {
+    let dir = tempfile::tempdir().expect("a directory for the store");
+    let path = dir.path().join("context-graph.db");
+    let store = Store::open(config(
+        path.clone(),
+        vec![space(Some(VectorPlacement::TRAVELS_CALLER_ONLY))],
+    ))
+    .expect("a store with a travelling caller-only space");
+    drop(store);
+    let reopened = Store::open(config(
+        path,
+        vec![space(Some(VectorPlacement::TRAVELS_CALLER_ONLY))],
+    ))
+    .expect("the same declaration reopens");
+    let listed = reopened
+        .list_embedding_spaces()
+        .expect("spaces list")
+        .into_iter()
+        .find(|space| space.embedding_space_id == SPACE)
+        .expect("the declared space is stored");
+    assert_eq!(listed.placement, Some(VectorPlacement::TRAVELS_CALLER_ONLY));
+}
