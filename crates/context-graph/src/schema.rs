@@ -7,6 +7,10 @@ pub(crate) const CONFLICT_DETECTION_OUTCOMES_TRIGGER_DDL: &str =
     "CREATE TRIGGER conflict_detection_on_outcomes ON outcomes WHEN INSERT INCLUDING SYNC";
 pub(crate) const PRECEDENT_MATCH_TRIGGER_DDL: &str =
     "CREATE TRIGGER precedent_match_on_decisions ON decisions WHEN INSERT";
+pub(crate) const REBUILD_QUEUE_ON_DIGESTS_TRIGGER_DDL: &str =
+    "CREATE TRIGGER rebuild_queue_on_digests ON digests WHEN INSERT INCLUDING SYNC";
+pub(crate) const REBUILD_QUEUE_ON_EVIDENCE_TRIGGER_DDL: &str =
+    "CREATE TRIGGER rebuild_queue_on_evidence ON evidence WHEN INSERT INCLUDING SYNC";
 
 /// The store's own triggers, in the order a store declares them. They are part of the startup
 /// schema a peer replays, so they install with the tables and indexes rather than after them.
@@ -14,6 +18,8 @@ pub(crate) const STORE_TRIGGER_DDL: &[&str] = &[
     CONFLICT_DETECTION_DECISIONS_TRIGGER_DDL,
     CONFLICT_DETECTION_OUTCOMES_TRIGGER_DDL,
     PRECEDENT_MATCH_TRIGGER_DDL,
+    REBUILD_QUEUE_ON_DIGESTS_TRIGGER_DDL,
+    REBUILD_QUEUE_ON_EVIDENCE_TRIGGER_DDL,
     IMPACT_ANALYSIS_TRIGGER_DDL,
 ];
 pub(crate) const OUTCOMES_DDL: &str = "CREATE TABLE outcomes (id UUID NOT NULL UNIQUE, decision_id UUID NOT NULL REFERENCES decisions(id), context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), success BOOLEAN NOT NULL, notes TEXT, recorded_at TXID NOT NULL, PRIMARY KEY (context_id, decision_id), UNIQUE (context_id, id), FOREIGN KEY (context_id, decision_id) REFERENCES decisions(context_id, id)) SYNC TWO WAY SYNC CONFLICT KEEP LATEST";
@@ -444,7 +450,7 @@ pub(crate) const REPRODUCIBLE_VECTORS_768_DDL: &str = "CREATE TABLE reproducible
 pub(crate) const REPRODUCIBLE_VECTOR_HANDLES_DDL: &str = "CREATE TABLE reproducible_vector_handles (id UUID PRIMARY KEY, target_table TEXT NOT NULL, target_id UUID NOT NULL, embedding_space_id TEXT NOT NULL REFERENCES embedding_spaces(embedding_space_id), model_generation INTEGER NOT NULL, context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), digest_id UUID REFERENCES digests(id), evidence_id UUID REFERENCES evidence(id), produced_by JSON, producer_system TEXT NOT NULL, created_at TXID NOT NULL, FOREIGN KEY (context_id, digest_id) REFERENCES digests(context_id, id), FOREIGN KEY (context_id, evidence_id) REFERENCES evidence(context_id, id)) SYNC OFF HISTORY CURRENT ONLY";
 /// Items in a node-local reproducible space that this node still has to embed under the space's
 /// current model generation, or that it refused to embed with a recorded reason.
-pub(crate) const REBUILD_PENDING_DDL: &str = "CREATE TABLE rebuild_pending (target_table TEXT NOT NULL, target_id UUID NOT NULL, embedding_space_id TEXT NOT NULL REFERENCES embedding_spaces(embedding_space_id), model_generation INTEGER NOT NULL, state TEXT NOT NULL, reason TEXT, context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), PRIMARY KEY (embedding_space_id, model_generation, state, target_table, target_id)) SYNC OFF HISTORY CURRENT ONLY MAINTAIN COUNT (embedding_space_id, model_generation, state)";
+pub(crate) const REBUILD_PENDING_DDL: &str = "CREATE TABLE rebuild_pending (target_table TEXT NOT NULL, target_id UUID NOT NULL, embedding_space_id TEXT NOT NULL REFERENCES embedding_spaces(embedding_space_id), model_generation INTEGER NOT NULL, state TEXT NOT NULL, reason TEXT, context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), digest_id UUID REFERENCES digests(id), evidence_id UUID REFERENCES evidence(id), PRIMARY KEY (embedding_space_id, model_generation, state, target_table, target_id), FOREIGN KEY (context_id, digest_id) REFERENCES digests(context_id, id), FOREIGN KEY (context_id, evidence_id) REFERENCES evidence(context_id, id)) SYNC OFF HISTORY CURRENT ONLY MAINTAIN COUNT (embedding_space_id, model_generation, state)";
 /// A reindex's progress on this node. Each node rebuilds its own reproducible vectors, so progress is
 /// node-local; model_generation increments when a reindex starts a new model.
 pub(crate) const REINDEX_CURSORS_DDL: &str = "CREATE TABLE reindex_cursors (embedding_space_id TEXT PRIMARY KEY REFERENCES embedding_spaces(embedding_space_id), status TEXT NOT NULL, owner_run_id TEXT NOT NULL, lease_epoch INTEGER NOT NULL, last_committed_cursor INTEGER NOT NULL, from_producer JSON, to_producer JSON, model_generation INTEGER NOT NULL, started_at TXID NOT NULL, last_advanced_at TXID NOT NULL) SYNC OFF";

@@ -30,6 +30,7 @@ pub(crate) mod observation;
 pub(crate) mod open_retry;
 mod outcome;
 mod precedent_match;
+pub(crate) mod rebuild_queue;
 mod reindex;
 pub(crate) mod relationship;
 pub mod signatures;
@@ -2147,6 +2148,7 @@ fn validate_runtime_identifier(identifier: &str) -> Result<()> {
 fn register_store_triggers(db: &Database) -> Result<()> {
     register_conflict_detection_triggers(db)?;
     register_precedent_match_trigger(db)?;
+    rebuild_queue::register_rebuild_queue_triggers(db)?;
     register_impact_analysis_trigger(db)?;
     db.complete_initialization().map_err(map_engine_err)?;
     Ok(())

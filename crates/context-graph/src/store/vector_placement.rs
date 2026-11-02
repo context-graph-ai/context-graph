@@ -125,6 +125,14 @@ impl Store {
                 Value::Text(vector.embedding_space_id.to_string()),
             ),
         ]);
+        super::rebuild_queue::dequeue(
+            &self.db,
+            tx,
+            vector.target_table,
+            vector.target_id,
+            vector.embedding_space_id,
+        )
+        .map_err(map_engine_err)?;
         for table in [vector.table, NODE_LOCAL_HANDLE_TABLE] {
             self.db
                 .execute_in_tx(
