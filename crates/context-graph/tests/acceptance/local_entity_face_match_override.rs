@@ -39,6 +39,7 @@ fn store(name: &str) -> Store {
                     table_name: "evidence".to_string(),
                     vector_column: "vector_vision".to_string(),
                 }],
+                placement: Some(context_graph::VectorPlacement::TRAVELS_CALLER_ONLY),
             },
             EmbeddingSpaceDecl {
                 embedding_space_id: FACE_MISMATCH_SPACE.to_string(),
@@ -50,6 +51,7 @@ fn store(name: &str) -> Store {
                 supported_evidence_kinds: vec![EvidenceKind::ImageFrame],
                 default_for_evidence_kind: None,
                 bindings: Vec::new(),
+                placement: Some(context_graph::VectorPlacement::TRAVELS_CALLER_ONLY),
             },
         ],
         ..Default::default()

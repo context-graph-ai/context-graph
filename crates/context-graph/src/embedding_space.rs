@@ -53,6 +53,7 @@ pub fn event_history_embedding_space() -> EmbeddingSpace {
             table_name: "event_search_passages".to_string(),
             vector_column: "vector_text".to_string(),
         }],
+        placement: Some(crate::VectorPlacement::NODE_LOCAL_REPRODUCIBLE),
     }
 }
 
@@ -80,5 +81,6 @@ pub(crate) fn text_nomic_space(dimension: usize, default_for_text: bool) -> Embe
         supported_evidence_kinds: vec![EvidenceKind::Text, EvidenceKind::StructuredSignal],
         default_for_evidence_kind: default_for_text.then_some(EvidenceKind::Text),
         bindings,
+        placement: Some(crate::VectorPlacement::NODE_LOCAL_REPRODUCIBLE),
     }
 }

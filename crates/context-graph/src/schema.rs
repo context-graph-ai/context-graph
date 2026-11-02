@@ -248,7 +248,7 @@ pub const TABLES: &[TableSpec] = &[
     },
     TableSpec {
         name: "embedding_spaces",
-        ddl: "CREATE TABLE embedding_spaces (embedding_space_id TEXT PRIMARY KEY, dimension INTEGER NOT NULL, metric TEXT NOT NULL, model_family TEXT, model_name TEXT, model_version TEXT, supported_evidence_kinds JSON, default_for_evidence_kind TEXT, bindings JSON, created_at TXID NOT NULL) SYNC TWO WAY SYNC CONFLICT KEEP FIRST",
+        ddl: "CREATE TABLE embedding_spaces (embedding_space_id TEXT PRIMARY KEY, dimension INTEGER NOT NULL, metric TEXT NOT NULL, model_family TEXT, model_name TEXT, model_version TEXT, supported_evidence_kinds JSON, default_for_evidence_kind TEXT, bindings JSON, placement TEXT NOT NULL, created_at TXID NOT NULL) SYNC TWO WAY SYNC CONFLICT KEEP FIRST",
     },
     TableSpec {
         name: "embedding_space_bindings",

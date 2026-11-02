@@ -177,6 +177,7 @@ fn weight_backed_registration_and_match_round_trip_through_the_store() {
                 supported_evidence_kinds: space.supported_evidence_kinds.clone(),
                 default_for_evidence_kind: None,
                 bindings: Vec::new(),
+                placement: Some(context_graph::VectorPlacement::NODE_LOCAL_REPRODUCIBLE),
             },
             embedder: embedder.clone(),
         }],

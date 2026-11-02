@@ -29,6 +29,7 @@ fn space(
         supported_evidence_kinds: supported,
         default_for_evidence_kind: default,
         bindings: Vec::new(),
+        placement: Some(context_graph::VectorPlacement::NODE_LOCAL_REPRODUCIBLE),
     }
 }
 

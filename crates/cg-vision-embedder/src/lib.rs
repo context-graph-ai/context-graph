@@ -281,6 +281,7 @@ impl context_graph::Embedder for SiglipVisionEmbedder {
             supported_evidence_kinds: self.supported_inputs(),
             default_for_evidence_kind: None,
             bindings: Vec::new(),
+            placement: Some(context_graph::VectorPlacement::TRAVELS_CALLER_ONLY),
         }
     }
 }

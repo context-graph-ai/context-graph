@@ -32,6 +32,7 @@ fn store(name: &str) -> Store {
             supported_evidence_kinds: vec![context_graph::EvidenceKind::ImageFrame],
             default_for_evidence_kind: None,
             bindings: Vec::new(),
+            placement: Some(context_graph::VectorPlacement::NODE_LOCAL_REPRODUCIBLE),
         }],
         ..Default::default()
     })
@@ -431,6 +432,7 @@ fn embedder_input_supports_in_memory_image_bytes() {
                 supported_evidence_kinds: vec![context_graph::EvidenceKind::ImageFrame],
                 default_for_evidence_kind: None,
                 bindings: Vec::new(),
+                placement: Some(context_graph::VectorPlacement::NODE_LOCAL_REPRODUCIBLE),
             }
         }
     }

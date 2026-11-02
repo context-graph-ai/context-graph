@@ -31,6 +31,7 @@ fn store() -> Store {
                 table_name: "digests".to_string(),
                 vector_column: "vector_text".to_string(),
             }],
+            placement: Some(context_graph::VectorPlacement::NODE_LOCAL_REPRODUCIBLE),
         }],
         ..Default::default()
     })

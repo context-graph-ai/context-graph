@@ -388,6 +388,7 @@ fn vision_space() -> EmbeddingSpaceDecl {
             table_name: "evidence".to_string(),
             vector_column: "vector_vision".to_string(),
         }],
+        placement: Some(context_graph::VectorPlacement::TRAVELS_CALLER_ONLY),
     }
 }
 
@@ -402,6 +403,7 @@ fn face_reference_space() -> EmbeddingSpaceDecl {
         supported_evidence_kinds: vec![EvidenceKind::ImageFrame],
         default_for_evidence_kind: None,
         bindings: Vec::new(),
+        placement: Some(context_graph::VectorPlacement::TRAVELS_CALLER_ONLY),
     }
 }
 

@@ -115,6 +115,7 @@ fn vision_embedding_space_decl(id: &str) -> context_graph::EmbeddingSpaceDecl {
             table_name: "evidence".to_string(),
             vector_column: "vector_vision".to_string(),
         }],
+        placement: Some(context_graph::VectorPlacement::TRAVELS_CALLER_ONLY),
     }
 }
 

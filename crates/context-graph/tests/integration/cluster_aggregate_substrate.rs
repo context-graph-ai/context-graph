@@ -42,6 +42,7 @@ fn face_space() -> EmbeddingSpace {
             table_name: "evidence".to_string(),
             vector_column: "vector_vision".to_string(),
         }],
+        placement: Some(context_graph::VectorPlacement::TRAVELS_CALLER_ONLY),
     }
 }
 

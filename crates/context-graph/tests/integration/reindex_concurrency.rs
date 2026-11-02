@@ -321,6 +321,7 @@ fn text_space() -> EmbeddingSpace {
             table_name: "evidence".to_string(),
             vector_column: "vector_text".to_string(),
         }],
+        placement: Some(context_graph::VectorPlacement::NODE_LOCAL_REPRODUCIBLE),
     }
 }
 
@@ -335,6 +336,7 @@ fn unbound_space() -> EmbeddingSpace {
         supported_evidence_kinds: vec![EvidenceKind::ImageFrame],
         default_for_evidence_kind: None,
         bindings: Vec::new(),
+        placement: Some(context_graph::VectorPlacement::TRAVELS_CALLER_ONLY),
     }
 }
 
@@ -353,6 +355,7 @@ fn image_space() -> EmbeddingSpace {
             table_name: "evidence".to_string(),
             vector_column: "vector_vision".to_string(),
         }],
+        placement: Some(context_graph::VectorPlacement::TRAVELS_CALLER_ONLY),
     }
 }
 

@@ -538,6 +538,7 @@ fn embeddinggemma_space(dimension: usize, default_for_text: bool) -> EmbeddingSp
         supported_evidence_kinds: vec![EvidenceKind::Text, EvidenceKind::StructuredSignal],
         default_for_evidence_kind: default_for_text.then_some(EvidenceKind::Text),
         bindings,
+        placement: Some(context_graph::VectorPlacement::NODE_LOCAL_REPRODUCIBLE),
     }
 }
 

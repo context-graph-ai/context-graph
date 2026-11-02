@@ -83,6 +83,7 @@ impl Embedder for MockEmbedder {
                 table_name: "evidence".to_string(),
                 vector_column: "vector_text".to_string(),
             }],
+            placement: Some(crate::VectorPlacement::NODE_LOCAL_REPRODUCIBLE),
         }
     }
 }

@@ -510,6 +510,7 @@ fn vision_config() -> StoreConfig {
                 table_name: "evidence".to_string(),
                 vector_column: "vector_vision".to_string(),
             }],
+            placement: Some(context_graph::VectorPlacement::TRAVELS_CALLER_ONLY),
         }],
         ..Default::default()
     }
@@ -4805,6 +4806,7 @@ fn store_open_same_id_model_drift_extra_embedding_space_does_not_poison_fresh_db
                     vector_column: "vector_text".to_string(),
                 },
             ],
+            placement: Some(context_graph::VectorPlacement::NODE_LOCAL_REPRODUCIBLE),
         }],
         ..Default::default()
     };
@@ -4913,6 +4915,7 @@ fn store_open_extra_embedding_space_cannot_claim_existing_vector_column_owned_by
                 table_name: "evidence".to_string(),
                 vector_column: "vector_text".to_string(),
             }],
+            placement: Some(context_graph::VectorPlacement::NODE_LOCAL_REPRODUCIBLE),
         }],
         ..Default::default()
     };
@@ -4945,6 +4948,7 @@ fn store_open_two_declarations_default_for_evidence_kind_text_returns_ambiguous_
                 supported_evidence_kinds: vec![EvidenceKind::Text],
                 default_for_evidence_kind: Some(EvidenceKind::Text),
                 bindings: vec![],
+                placement: Some(context_graph::VectorPlacement::NODE_LOCAL_REPRODUCIBLE),
             },
             EmbeddingSpaceDecl {
                 embedding_space_id: "second_text_default".to_string(),
@@ -4956,6 +4960,7 @@ fn store_open_two_declarations_default_for_evidence_kind_text_returns_ambiguous_
                 supported_evidence_kinds: vec![EvidenceKind::Text],
                 default_for_evidence_kind: Some(EvidenceKind::Text),
                 bindings: vec![],
+                placement: Some(context_graph::VectorPlacement::NODE_LOCAL_REPRODUCIBLE),
             },
         ],
         ..Default::default()

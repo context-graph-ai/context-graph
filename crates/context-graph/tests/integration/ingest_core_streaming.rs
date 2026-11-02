@@ -245,6 +245,7 @@ impl Embedder for RecordingNomicDigestEmbedder {
             embedding_space_id: "recording-nomic-digest".to_string(),
             dimension: 1,
             supported_evidence_kinds: vec![EvidenceKind::Text],
+            placement: Some(context_graph::VectorPlacement::NODE_LOCAL_REPRODUCIBLE),
             ..Default::default()
         }
     }
@@ -279,6 +280,7 @@ impl Embedder for CapturingSequenceEmbedder {
             embedding_space_id: self.space_id.to_string(),
             dimension: 1,
             supported_evidence_kinds: vec![EvidenceKind::Text],
+            placement: Some(context_graph::VectorPlacement::NODE_LOCAL_REPRODUCIBLE),
             ..Default::default()
         }
     }

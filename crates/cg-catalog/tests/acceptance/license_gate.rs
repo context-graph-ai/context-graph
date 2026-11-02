@@ -61,6 +61,7 @@ fn gemma_text_space() -> EmbeddingSpace {
             table_name: "evidence".to_string(),
             vector_column: "vector_text".to_string(),
         }],
+        placement: Some(context_graph::VectorPlacement::NODE_LOCAL_REPRODUCIBLE),
     }
 }
 

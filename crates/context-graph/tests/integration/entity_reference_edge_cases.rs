@@ -46,6 +46,7 @@ fn store_config(db_path: PathBuf) -> StoreConfig {
             supported_evidence_kinds: vec![EvidenceKind::ImageFrame],
             default_for_evidence_kind: None,
             bindings: Vec::new(),
+            placement: Some(context_graph::VectorPlacement::TRAVELS_CALLER_ONLY),
         }],
         ..Default::default()
     }

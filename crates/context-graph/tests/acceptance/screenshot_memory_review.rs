@@ -92,6 +92,7 @@ fn image_space() -> EmbeddingSpace {
             table_name: "evidence".to_string(),
             vector_column: "vector_vision".to_string(),
         }],
+        placement: Some(context_graph::VectorPlacement::TRAVELS_CALLER_ONLY),
     }
 }
 
@@ -110,6 +111,7 @@ fn new_text_space() -> EmbeddingSpace {
             table_name: "digests".to_string(),
             vector_column: "vector_text".to_string(),
         }],
+        placement: Some(context_graph::VectorPlacement::NODE_LOCAL_REPRODUCIBLE),
     }
 }
 
@@ -229,6 +231,7 @@ impl Embedder for AxisTextEmbedder {
                     vector_column: "vector_text".to_string(),
                 },
             ],
+            placement: Some(context_graph::VectorPlacement::NODE_LOCAL_REPRODUCIBLE),
         }
     }
 }

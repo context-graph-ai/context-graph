@@ -24,6 +24,7 @@ fn text_space(id: &str, version: &str, default: Option<EvidenceKind>) -> Embeddi
             table_name: "evidence".to_string(),
             vector_column: "vector_text".to_string(),
         }],
+        placement: Some(context_graph::VectorPlacement::NODE_LOCAL_REPRODUCIBLE),
     }
 }
 
@@ -38,6 +39,7 @@ fn registry_space(id: &str, version: &str) -> EmbeddingSpaceDecl {
         supported_evidence_kinds: vec![EvidenceKind::Text],
         default_for_evidence_kind: None,
         bindings: Vec::new(),
+        placement: Some(context_graph::VectorPlacement::NODE_LOCAL_REPRODUCIBLE),
     }
 }
 

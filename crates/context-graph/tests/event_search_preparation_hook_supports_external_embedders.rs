@@ -71,6 +71,7 @@ impl Embedder for DeterministicEventSearchEmbedder {
             supported_evidence_kinds: vec![EvidenceKind::Text],
             default_for_evidence_kind: None,
             bindings: Vec::new(),
+            placement: Some(context_graph::VectorPlacement::NODE_LOCAL_REPRODUCIBLE),
         }
     }
 

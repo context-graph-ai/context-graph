@@ -80,6 +80,7 @@ impl Embedder for FixedEmbedder {
                 table_name: "event_search_passages".into(),
                 vector_column: "vector_text".into(),
             }],
+            placement: Some(context_graph::VectorPlacement::NODE_LOCAL_REPRODUCIBLE),
         }
     }
 

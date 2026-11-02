@@ -421,6 +421,60 @@ pub struct EmbeddingSpaceBinding {
     pub vector_column: String,
 }
 
+/// Where a space's vectors live: with their item on every node it reaches, or only on the node that
+/// stored them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VectorLocality {
+    Travels,
+    NodeLocal,
+}
+
+/// Whether cg on a node can recompute a space's vectors from content that node may receive, or only
+/// a caller can supply them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VectorRebuild {
+    Reproducible,
+    CallerOnly,
+}
+
+/// A space's declared vector placement. It is mandatory: a space registered without one is refused
+/// before any data is accepted, and it is never inferred from the evidence kind or from who supplies
+/// a vector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VectorPlacement {
+    pub locality: VectorLocality,
+    pub rebuild: VectorRebuild,
+}
+
+impl VectorPlacement {
+    pub const NODE_LOCAL_REPRODUCIBLE: Self = Self {
+        locality: VectorLocality::NodeLocal,
+        rebuild: VectorRebuild::Reproducible,
+    };
+    pub const NODE_LOCAL_CALLER_ONLY: Self = Self {
+        locality: VectorLocality::NodeLocal,
+        rebuild: VectorRebuild::CallerOnly,
+    };
+    pub const TRAVELS_REPRODUCIBLE: Self = Self {
+        locality: VectorLocality::Travels,
+        rebuild: VectorRebuild::Reproducible,
+    };
+    pub const TRAVELS_CALLER_ONLY: Self = Self {
+        locality: VectorLocality::Travels,
+        rebuild: VectorRebuild::CallerOnly,
+    };
+
+    /// The stored spelling, one word per axis.
+    pub fn as_str(self) -> &'static str {
+        match (self.locality, self.rebuild) {
+            (VectorLocality::Travels, VectorRebuild::Reproducible) => "travels reproducible",
+            (VectorLocality::Travels, VectorRebuild::CallerOnly) => "travels caller_only",
+            (VectorLocality::NodeLocal, VectorRebuild::Reproducible) => "node_local reproducible",
+            (VectorLocality::NodeLocal, VectorRebuild::CallerOnly) => "node_local caller_only",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EmbeddingSpace {
     pub embedding_space_id: String,
@@ -432,6 +486,9 @@ pub struct EmbeddingSpace {
     pub supported_evidence_kinds: Vec<EvidenceKind>,
     pub default_for_evidence_kind: Option<EvidenceKind>,
     pub bindings: Vec<EmbeddingSpaceBinding>,
+    /// Mandatory; `None` is refused at registration.
+    #[serde(default)]
+    pub placement: Option<VectorPlacement>,
 }
 
 impl Default for EmbeddingSpace {
@@ -446,6 +503,7 @@ impl Default for EmbeddingSpace {
             supported_evidence_kinds: Vec::new(),
             default_for_evidence_kind: None,
             bindings: Vec::new(),
+            placement: None,
         }
     }
 }

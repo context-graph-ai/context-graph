@@ -3207,6 +3207,7 @@ fn parallel_text_embedding_space_decl(model_id: &str, dimension: u32) -> Embeddi
             table_name: "evidence".to_string(),
             vector_column: runtime_text_vector_column(model_id, dimension),
         }],
+        placement: Some(context_graph::VectorPlacement::NODE_LOCAL_REPRODUCIBLE),
     }
 }
 

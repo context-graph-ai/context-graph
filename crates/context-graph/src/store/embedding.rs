@@ -2045,6 +2045,7 @@ mod tests {
                     table_name: "evidence".to_string(),
                     vector_column: "vector_text".to_string(),
                 }],
+                placement: Some(crate::VectorPlacement::NODE_LOCAL_REPRODUCIBLE),
             }
         }
     }
@@ -2352,6 +2353,7 @@ mod event_search_space_isolation_tests {
                 table_name: "evidence".to_string(),
                 vector_column: "vector_text".to_string(),
             }],
+            placement: Some(crate::VectorPlacement::NODE_LOCAL_REPRODUCIBLE),
         };
         let result = Store::open(StoreConfig {
             db_path: dir.path().join("cg.db"),

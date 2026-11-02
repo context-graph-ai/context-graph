@@ -142,6 +142,7 @@ impl Store {
                 .map(|raw| evidence_kind_from_str(&raw))
                 .transpose()?,
                 bindings,
+                placement: Some(crate::VectorPlacement::NODE_LOCAL_REPRODUCIBLE),
             });
         }
         spaces.sort_by(|a, b| a.embedding_space_id.cmp(&b.embedding_space_id));

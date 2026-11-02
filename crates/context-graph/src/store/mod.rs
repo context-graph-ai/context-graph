@@ -2059,6 +2059,7 @@ fn ensure_entity_reference_embedding_tables(
 
 fn validate_runtime_embedding_space_declaration(space: &EmbeddingSpaceDecl) -> Result<()> {
     validate_embedding_space_id(&space.embedding_space_id)?;
+    require_declared_placement(space)?;
     if space.supported_evidence_kinds.is_empty() {
         return Err(CgError::EmbedderDeclaresNoSupportedInputs {
             embedding_space_id: space.embedding_space_id.clone(),
@@ -2355,7 +2356,18 @@ fn seed_embedding_spaces_without_readiness(
     Ok(())
 }
 
+/// Placement is mandatory for every space, built-in or declared, before any data is accepted.
+fn require_declared_placement(space: &EmbeddingSpaceDecl) -> Result<()> {
+    if space.placement.is_none() {
+        return Err(CgError::VectorPlacementUndeclared {
+            embedding_space_id: space.embedding_space_id.clone(),
+        });
+    }
+    Ok(())
+}
+
 fn seed_embedding_space(db: &Database, space: &EmbeddingSpaceDecl) -> Result<()> {
+    require_declared_placement(space)?;
     validate_embedding_space_bindings(db, space)?;
     let existing = db
         .execute(
@@ -2423,10 +2435,20 @@ fn seed_embedding_space(db: &Database, space: &EmbeddingSpaceDecl) -> Result<()>
                         .collect::<Vec<_>>()
                 )),
             ),
+            (
+                "placement".to_string(),
+                Value::Text(
+                    space
+                        .placement
+                        .map(VectorPlacement::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                ),
+            ),
             ("created_at".to_string(), Value::TxId(crate::TxId(1))),
         ]);
         match db.execute(
-            "INSERT INTO embedding_spaces (embedding_space_id, dimension, metric, model_family, model_name, model_version, supported_evidence_kinds, default_for_evidence_kind, bindings, created_at) VALUES ($embedding_space_id, $dimension, $metric, $model_family, $model_name, $model_version, $supported_evidence_kinds, $default_for_evidence_kind, $bindings, $created_at)",
+            "INSERT INTO embedding_spaces (embedding_space_id, dimension, metric, model_family, model_name, model_version, supported_evidence_kinds, default_for_evidence_kind, bindings, placement, created_at) VALUES ($embedding_space_id, $dimension, $metric, $model_family, $model_name, $model_version, $supported_evidence_kinds, $default_for_evidence_kind, $bindings, $placement, $created_at)",
             &params,
         ) {
             Ok(_) => {}
@@ -2475,13 +2497,24 @@ fn validate_existing_embedding_space(db: &Database, space: &EmbeddingSpaceDecl) 
     )]);
     let rows = db
         .execute(
-            "SELECT dimension, metric, model_family, model_name, model_version, supported_evidence_kinds, default_for_evidence_kind, bindings FROM embedding_spaces WHERE embedding_space_id = $id",
+            "SELECT dimension, metric, model_family, model_name, model_version, supported_evidence_kinds, default_for_evidence_kind, bindings, placement FROM embedding_spaces WHERE embedding_space_id = $id",
             &params,
         )
         .map_err(map_engine_err)?;
     let Some(row) = rows.rows().first() else {
         return Ok(());
     };
+    let declared_placement = space
+        .placement
+        .map(VectorPlacement::as_str)
+        .unwrap_or_default();
+    if !matches!(row.get(8), Some(Value::Text(stored)) if stored == declared_placement) {
+        return Err(CgError::EmbeddingSpaceConfigMismatch {
+            field: "placement",
+            expected: row.get(8).map(value_to_config_string).unwrap_or_default(),
+            actual: declared_placement.to_string(),
+        });
+    }
     if !matches!(row.first(), Some(Value::Int64(n)) if *n as usize == space.dimension) {
         return Err(CgError::EmbeddingSpaceConfigMismatch {
             field: "dimension",

@@ -65,6 +65,7 @@ fn writer() -> Written {
             supported_evidence_kinds: vec![EvidenceKind::ImageFrame],
             default_for_evidence_kind: None,
             bindings: Vec::new(),
+            placement: Some(context_graph::VectorPlacement::TRAVELS_CALLER_ONLY),
         }],
         ..Default::default()
     })
@@ -246,6 +247,7 @@ fn text_space() -> EmbeddingSpaceDecl {
             table_name: "digests".to_string(),
             vector_column: "vector_text".to_string(),
         }],
+        placement: Some(context_graph::VectorPlacement::NODE_LOCAL_REPRODUCIBLE),
     }
 }
 

@@ -118,6 +118,7 @@ fn procurement_store() -> context_graph::Result<Store> {
                     table_name: "evidence".to_string(),
                     vector_column: "vector_text".to_string(),
                 }],
+                placement: Some(context_graph::VectorPlacement::NODE_LOCAL_REPRODUCIBLE),
             }],
             ..Default::default()
         },

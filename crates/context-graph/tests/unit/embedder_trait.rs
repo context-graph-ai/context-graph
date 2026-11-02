@@ -113,6 +113,7 @@ impl Embedder for RoutingProbeEmbedder {
             supported_evidence_kinds: self.supported_inputs(),
             default_for_evidence_kind: None,
             bindings: Vec::new(),
+            placement: Some(context_graph::VectorPlacement::NODE_LOCAL_REPRODUCIBLE),
         }
     }
 }

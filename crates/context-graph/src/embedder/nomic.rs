@@ -897,6 +897,7 @@ impl Embedder for NomicTextEmbedder {
             default_for_evidence_kind: (self.dimension == NOMIC_DEFAULT_DIMENSION)
                 .then_some(EvidenceKind::Text),
             bindings,
+            placement: Some(crate::VectorPlacement::NODE_LOCAL_REPRODUCIBLE),
         }
     }
 }

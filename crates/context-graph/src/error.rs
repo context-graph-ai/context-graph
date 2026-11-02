@@ -236,6 +236,10 @@ pub enum CgError {
     EmbedderDeclaresNoSupportedInputs {
         embedding_space_id: String,
     },
+    /// A space was declared without saying where its vectors live and whether they can be rebuilt.
+    VectorPlacementUndeclared {
+        embedding_space_id: String,
+    },
     EmptyVector,
     InvalidVectorFloat {
         field: &'static str,
@@ -904,6 +908,10 @@ impl fmt::Display for CgError {
             CgError::EmbedderModelNotAvailable { source, path } => write!(
                 f,
                 "the text-embedding model from {source} is not available at {path}. Install it with `cg model fetch --defaults`, then try the operation again"
+            ),
+            CgError::VectorPlacementUndeclared { embedding_space_id } => write!(
+                f,
+                "embedding space {embedding_space_id} declares no vector placement; declare whether its vectors travel or stay on this node, and whether they are reproducible or caller-only, before storing anything in it"
             ),
             _ => write!(f, "{self:?}"),
         }
