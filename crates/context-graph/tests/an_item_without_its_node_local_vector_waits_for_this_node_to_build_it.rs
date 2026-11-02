@@ -10,10 +10,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use context_graph::embedder::{Embedder, EmbeddingInput, EmbeddingOutput};
 use context_graph::{
-    ContextId, CreateContext, CreateDigest, DigestId, DistanceMetric, EmbedderConfig,
+    ContextId, CreateContext, CreateDigest, CreateEntity, DigestId, DistanceMetric, EmbedderConfig,
     EmbedderRegistration, EmbeddingId, EmbeddingSpaceBinding, EmbeddingSpaceDecl, EmbeddingTarget,
-    EvidenceKind, EvidenceProducer, PrecomputedEmbedding, REBUILD_PAGE_BYTES, REBUILD_PAGE_ROWS,
-    REBUILD_REFUSED_TOO_LARGE_TO_READ, Store, StoreConfig,
+    EntityType, EventPlacementPolicy, EventPlacementState, EvidenceId, EvidenceKind,
+    EvidenceProducer, EvidenceRef, ObservationId, PrecomputedEmbedding, REBUILD_PAGE_BYTES,
+    REBUILD_PAGE_ROWS, REBUILD_REFUSED_TOO_LARGE_TO_READ, RecordObservation, RetentionStatus,
+    Store, StoreConfig,
 };
 use contextdb_core::Value;
 
@@ -553,5 +555,270 @@ fn a_model_switch_starts_a_new_generation_and_a_page_embedded_under_the_old_one_
         vector_generations(&node.store),
         vec![2, 2, 2, 2],
         "the rebuild completes under the new generation"
+    );
+}
+
+/// The number of node-local vector rows the text space holds.
+fn vector_rows(store: &Store) -> usize {
+    store
+        .sync_database()
+        .execute(
+            "SELECT target_id FROM reproducible_vectors_768 WHERE embedding_space_id = $space",
+            &HashMap::from([("space".to_string(), Value::Text(TEXT_SPACE.to_string()))]),
+        )
+        .expect("the vector rows read")
+        .rows()
+        .len()
+}
+
+fn open_with_model(path: &std::path::Path, placement: Option<EventPlacementPolicy>) -> Store {
+    Store::open_with_embedder_registrations(
+        StoreConfig {
+            db_path: path.to_path_buf(),
+            event_placement: placement,
+            ..Default::default()
+        },
+        vec![EmbedderRegistration {
+            space: text_space(),
+            embedder: Arc::new(NodeModel {
+                failing: Arc::new(AtomicBool::new(false)),
+            }),
+        }],
+    )
+    .expect("a store with this node's text model")
+}
+
+// Moving a store's event placement to a tenant hub drops this node's derived event tables. The
+// node-local vectors, their handles and the rebuild queue are not event state: they stay, and the
+// moved store still builds what it owes.
+#[test]
+fn reproducible_vectors_survive_the_move_to_tenant_hub_event_placement() {
+    let dir = tempfile::tempdir().expect("a directory for the store");
+    let path = dir.path().join("context-graph.db");
+    let store = open_with_model(&path, None);
+    let context_id = store
+        .create_context(CreateContext {
+            name: "placement-move".to_string(),
+            labels: Vec::new(),
+            properties: BTreeMap::new(),
+        })
+        .expect("a context")
+        .id;
+    let written = DigestId::new_v7();
+    store
+        .create_digest(CreateDigest {
+            id: written,
+            source: "placement-move".to_string(),
+            session_ref: None,
+            summary: "a digest written here with its vector".to_string(),
+            kind: EvidenceKind::Text,
+            embedding: PrecomputedEmbedding {
+                id: EmbeddingId::new_v7(),
+                embedding_space_id: TEXT_SPACE.to_string(),
+                vector: axis(4),
+                target: EmbeddingTarget::Digest(written),
+                produced_by: producer(),
+            },
+            context_id,
+            properties: BTreeMap::new(),
+        })
+        .expect("a digest with its vector");
+    let landed = land_digest(
+        &store,
+        context_id,
+        "a digest that arrived without a vector".to_string(),
+    );
+    let handles_before = handles(&store);
+    let counts_before = store.rebuild_queue_counts(TEXT_SPACE).expect("counts");
+    assert_eq!(counts_before.waiting, 1, "the landed digest waits");
+    assert_eq!(vector_rows(&store), 1, "the written digest has its vector");
+    drop(store);
+
+    let moved = open_with_model(&path, Some(EventPlacementPolicy::TenantHub));
+    assert_eq!(
+        moved.event_placement_state().expect("the moved placement"),
+        EventPlacementState::TenantHubUnbound,
+        "an empty standalone store moves to a tenant hub before capture"
+    );
+    assert_eq!(
+        handles(&moved),
+        handles_before,
+        "every handle survives the move"
+    );
+    assert_eq!(vector_rows(&moved), 1, "every vector survives the move");
+    let counts_after = moved.rebuild_queue_counts(TEXT_SPACE).expect("counts");
+    assert_eq!(
+        counts_after.waiting, counts_before.waiting,
+        "the queue survives the move"
+    );
+    assert_eq!(
+        counts_after.model_generation,
+        counts_before.model_generation
+    );
+    assert_eq!(queued_states(&moved, landed), vec!["waiting".to_string()]);
+    assert_eq!(moved.rebuild_turn(TEXT_SPACE).expect("a turn").rebuilt, 1);
+    assert_eq!(
+        moved
+            .rebuild_queue_counts(TEXT_SPACE)
+            .expect("counts")
+            .waiting,
+        0,
+        "the moved store still builds what it owes"
+    );
+    assert_eq!(vector_rows(&moved), 2);
+}
+
+const CAPTION: &str = "a captioned frame";
+
+/// The text space bound to digests and evidence, as the built-in one is.
+fn captioned_space() -> EmbeddingSpaceDecl {
+    let mut space = text_space();
+    space.bindings.push(EmbeddingSpaceBinding {
+        embedding_space_id: TEXT_SPACE.to_string(),
+        table_name: "evidence".to_string(),
+        vector_column: "vector_text".to_string(),
+    });
+    space
+}
+
+/// The rebuild-queue states of one evidence row under the text space's current generation.
+fn evidence_waiting(store: &Store, evidence_id: EvidenceId, generation: i64) -> Vec<String> {
+    store
+        .sync_database()
+        .execute(
+            "SELECT state FROM rebuild_pending WHERE embedding_space_id = $space AND model_generation = $generation AND target_table = 'evidence' AND target_id = $id",
+            &HashMap::from([
+                ("space".to_string(), Value::Text(TEXT_SPACE.to_string())),
+                ("generation".to_string(), Value::Int64(generation)),
+                ("id".to_string(), Value::Uuid(evidence_id.as_uuid())),
+            ]),
+        )
+        .expect("the rebuild queue reads")
+        .rows()
+        .iter()
+        .map(|row| match row.first() {
+            Some(Value::Text(state)) => state.clone(),
+            other => panic!("a queue state is text, found {other:?}"),
+        })
+        .collect()
+}
+
+// An image frame with a caption may be written with a caption vector under a text space (the write
+// door accepts it), so a node that holds the frame without that vector owes it one, and still owes
+// it after a model switch.
+#[test]
+fn a_captioned_frame_without_its_text_vector_waits_and_is_owed_again_after_a_model_switch() {
+    let dir = tempfile::tempdir().expect("a directory for the store");
+    let store = Store::open_with_embedder_registrations(
+        StoreConfig {
+            db_path: dir.path().join("context-graph.db"),
+            ..Default::default()
+        },
+        vec![EmbedderRegistration {
+            space: captioned_space(),
+            embedder: Arc::new(NodeModel {
+                failing: Arc::new(AtomicBool::new(false)),
+            }),
+        }],
+    )
+    .expect("a store with this node's text model");
+    let context_id = store
+        .create_context(CreateContext {
+            name: "captioned-frames".to_string(),
+            labels: Vec::new(),
+            properties: BTreeMap::new(),
+        })
+        .expect("a context")
+        .id;
+    let entity = store
+        .create_entity(CreateEntity {
+            entity_type: EntityType::Person,
+            name: "captioned frame entity".to_string(),
+            properties: BTreeMap::new(),
+            tags: Vec::new(),
+            context_id,
+        })
+        .expect("an entity");
+    // A digest with its vector, so the model switch's reindex has an item to re-embed.
+    let written = DigestId::new_v7();
+    store
+        .create_digest(CreateDigest {
+            id: written,
+            source: "captioned-frames".to_string(),
+            session_ref: None,
+            summary: "a digest written here with its vector".to_string(),
+            kind: EvidenceKind::Text,
+            embedding: PrecomputedEmbedding {
+                id: EmbeddingId::new_v7(),
+                embedding_space_id: TEXT_SPACE.to_string(),
+                vector: axis(6),
+                target: EmbeddingTarget::Digest(written),
+                produced_by: EvidenceProducer {
+                    model_version: "earlier".to_string(),
+                    ..producer()
+                },
+            },
+            context_id,
+            properties: BTreeMap::new(),
+        })
+        .expect("a digest with its vector");
+    // The frame lands with its caption and no text vector, as a receiving node holds it.
+    let frame = EvidenceId::new_v7();
+    store
+        .record_observation(RecordObservation {
+            id: ObservationId::new_v7(),
+            entity_id: entity.id,
+            context_id,
+            observation_type: "captioned-frame".to_string(),
+            source: "captioned-frames".to_string(),
+            observed_at: chrono::Utc::now(),
+            evidence: vec![EvidenceRef {
+                id: frame,
+                kind: EvidenceKind::ImageFrame,
+                source_ref: format!("cas://sha256:{:064x}", frame.as_uuid().as_u128()),
+                mime_type: Some("image/jpeg".to_string()),
+                text_projection: Some(CAPTION.to_string()),
+                retention_status: RetentionStatus::RetainedExternal,
+                producer: producer(),
+                ..Default::default()
+            }],
+            observed_properties: BTreeMap::new(),
+            state_delta: BTreeMap::new(),
+            properties: BTreeMap::new(),
+            embeddings: Vec::new(),
+        })
+        .expect("a captioned frame without a text vector");
+    let generation = store
+        .rebuild_queue_counts(TEXT_SPACE)
+        .expect("counts")
+        .model_generation;
+    assert_eq!(
+        evidence_waiting(&store, frame, generation),
+        vec!["waiting".to_string()],
+        "a captioned frame without its caption vector waits for this node to build it"
+    );
+
+    store
+        .reindex_space(TEXT_SPACE, context_graph::ReindexOptions::default())
+        .expect("the reindex under the new model");
+    let counts = store.rebuild_queue_counts(TEXT_SPACE).expect("counts");
+    assert_eq!(
+        counts.model_generation,
+        generation + 1,
+        "the model switch starts a generation"
+    );
+    assert_eq!(
+        evidence_waiting(&store, frame, generation + 1),
+        vec!["waiting".to_string()],
+        "after a model switch the captioned frame is owed a vector under the new generation"
+    );
+    assert_eq!(store.rebuild_turn(TEXT_SPACE).expect("a turn").rebuilt, 1);
+    assert_eq!(
+        store
+            .rebuild_queue_counts(TEXT_SPACE)
+            .expect("counts")
+            .waiting,
+        0,
+        "the frame's caption vector is built under the new model"
     );
 }

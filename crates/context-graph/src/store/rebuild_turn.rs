@@ -310,13 +310,8 @@ impl Store {
         for binding in &space.bindings {
             let (table, extra_columns) = match binding.table_name.as_str() {
                 "digests" => ("digests", ""),
-                "evidence" => ("evidence", ", kind"),
+                "evidence" => ("evidence", ", kind, text_projection"),
                 _ => continue,
-            };
-            let text_column = if table == "digests" {
-                "summary"
-            } else {
-                "text_projection"
             };
             let mut after: Option<uuid::Uuid> = None;
             loop {
@@ -328,9 +323,16 @@ impl Store {
                     }
                     None => "",
                 };
+                // Digests always owe a vector; whether an evidence row owes one is decided by the
+                // queue's one predicate below, not here.
+                let text_filter = if table == "digests" {
+                    "summary IS NOT NULL AND summary != ''"
+                } else {
+                    "text_projection IS NOT NULL"
+                };
                 let page = self.read_query(
                     &format!(
-                        "SELECT id, context_id{extra_columns} FROM {table} WHERE {text_column} IS NOT NULL AND {text_column} != ''{after_clause} ORDER BY id LIMIT {RESET_PAGE_ROWS}"
+                        "SELECT id, context_id{extra_columns} FROM {table} WHERE {text_filter}{after_clause} ORDER BY id LIMIT {RESET_PAGE_ROWS}"
                     ),
                     &params,
                 )?;
@@ -349,13 +351,20 @@ impl Store {
                             continue;
                         };
                         if table == "evidence" {
-                            let kind = match row.get(2) {
-                                Some(Value::Text(kind)) => super::evidence_kind_from_str(kind).ok(),
-                                _ => None,
-                            };
-                            if !kind
-                                .is_some_and(|kind| space.supported_evidence_kinds.contains(&kind))
-                            {
+                            let columns = HashMap::from([
+                                (
+                                    "kind".to_string(),
+                                    row.get(2).cloned().unwrap_or(Value::Null),
+                                ),
+                                (
+                                    "text_projection".to_string(),
+                                    row.get(3).cloned().unwrap_or(Value::Null),
+                                ),
+                            ]);
+                            if !super::rebuild_queue::evidence_owes_text_vector(
+                                &columns,
+                                &space.supported_evidence_kinds,
+                            ) {
                                 continue;
                             }
                         }
@@ -394,16 +403,34 @@ impl Store {
     /// its own cursor, so a text larger than one read page comes back as that refusal, typed by the
     /// engine, rather than as a failed turn.
     fn rebuild_source(&self, target_table: &str, target_id: uuid::Uuid) -> Result<RebuildSource> {
-        let (text_column, sql) = match target_table {
-            "digests" => ("summary", "SELECT created_at FROM digests WHERE id = $id"),
-            "evidence" => (
-                "text_projection",
-                "SELECT created_at FROM evidence WHERE id = $id",
+        let params = HashMap::from([("id".to_string(), Value::Uuid(target_id))]);
+        // A digest records when it was created; evidence has no such column and is created in its
+        // observation's transaction, so its observation's created_at is that moment.
+        let (text_column, created) = match target_table {
+            "digests" => (
+                "summary",
+                self.read_query("SELECT created_at FROM digests WHERE id = $id", &params)?,
             ),
+            "evidence" => {
+                let owner = self.read_query(
+                    "SELECT observation_id FROM evidence WHERE id = $id",
+                    &params,
+                )?;
+                let Some(Value::Uuid(observation_id)) =
+                    owner.rows().first().and_then(|row| row.first())
+                else {
+                    return Ok(RebuildSource::Gone);
+                };
+                (
+                    "text_projection",
+                    self.read_query(
+                        "SELECT created_at FROM observations WHERE id = $id",
+                        &HashMap::from([("id".to_string(), Value::Uuid(*observation_id))]),
+                    )?,
+                )
+            }
             _ => return Ok(RebuildSource::Gone),
         };
-        let params = HashMap::from([("id".to_string(), Value::Uuid(target_id))]);
-        let created = self.read_query(sql, &params)?;
         let Some(Value::TxId(created_at)) = created.rows().first().and_then(|row| row.first())
         else {
             return Ok(RebuildSource::Gone);

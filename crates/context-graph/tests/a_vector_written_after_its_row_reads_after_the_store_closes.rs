@@ -404,3 +404,160 @@ fn a_reindexed_digest_vector_reads_through_a_read_only_session_after_the_store_c
     );
     assert_eq!(reread, replacement_vector());
 }
+
+const VISION_SPACE: &str = "vision_fixture_512";
+const VISION_DIMENSION: usize = 512;
+const CAPTION: &str = "a frame whose caption is embedded as text";
+
+fn evidence_text_space() -> EmbeddingSpaceDecl {
+    EmbeddingSpaceDecl {
+        bindings: vec![EmbeddingSpaceBinding {
+            embedding_space_id: TEXT_SPACE.to_string(),
+            table_name: "evidence".to_string(),
+            vector_column: "vector_text".to_string(),
+        }],
+        ..text_space()
+    }
+}
+
+fn vision_space() -> EmbeddingSpaceDecl {
+    EmbeddingSpaceDecl {
+        embedding_space_id: VISION_SPACE.to_string(),
+        dimension: VISION_DIMENSION,
+        metric: DistanceMetric::Cosine,
+        model_family: "vision".to_string(),
+        model_name: "fixture".to_string(),
+        model_version: "1".to_string(),
+        supported_evidence_kinds: vec![EvidenceKind::ImageFrame],
+        default_for_evidence_kind: None,
+        bindings: vec![EmbeddingSpaceBinding {
+            embedding_space_id: VISION_SPACE.to_string(),
+            table_name: "evidence".to_string(),
+            vector_column: "vector_vision".to_string(),
+        }],
+        placement: Some(context_graph::VectorPlacement::TRAVELS_CALLER_ONLY),
+    }
+}
+
+struct CaptionEmbedder;
+
+impl Embedder for CaptionEmbedder {
+    fn embed(&self, input: EmbeddingInput) -> context_graph::Result<EmbeddingOutput> {
+        let EmbeddingInput::Text(text) = input else {
+            panic!("an evidence text vector reindexes from the evidence's text projection");
+        };
+        assert_eq!(text, CAPTION);
+        Ok(EmbeddingOutput {
+            embedding_space_id: TEXT_SPACE.to_string(),
+            dimension: TEXT_DIMENSION,
+            producer: producer(),
+            vector: replacement_vector(),
+        })
+    }
+
+    fn supported_inputs(&self) -> Vec<EvidenceKind> {
+        vec![EvidenceKind::Text]
+    }
+
+    fn embedding_space(&self) -> EmbeddingSpaceDecl {
+        evidence_text_space()
+    }
+}
+
+// An image frame carries two vectors: its caption's text vector, which this node can rebuild and
+// keeps node-local, and its vision vector, which only the caller can produce and so travels in the
+// row. Reindexing the text space replaces the first in a later transaction and leaves the second.
+#[test]
+fn a_reindexed_evidence_text_vector_reads_through_a_read_only_session_after_the_store_closes() {
+    let dir = tempfile::tempdir().expect("a directory for the store");
+    let path = dir.path().join("context-graph.db");
+    let open = || {
+        Store::open_with_embedder_registrations(
+            StoreConfig {
+                db_path: path.clone(),
+                default_text_embedder: Some(EmbedderConfig::disabled()),
+                extra_embedding_spaces: vec![vision_space()],
+                ..Default::default()
+            },
+            vec![EmbedderRegistration {
+                space: evidence_text_space(),
+                embedder: Arc::new(CaptionEmbedder),
+            }],
+        )
+        .expect("a writable store with a registered text embedder and a vision space")
+    };
+    let store = open();
+    let context = store
+        .create_context(CreateContext {
+            name: "vector-reread-evidence-reindex".to_string(),
+            labels: Vec::new(),
+            properties: BTreeMap::new(),
+        })
+        .expect("a context");
+    let entity = store
+        .create_entity(CreateEntity {
+            entity_type: EntityType::Person,
+            name: "evidence reindex entity".to_string(),
+            properties: BTreeMap::new(),
+            tags: Vec::new(),
+            context_id: context.id,
+        })
+        .expect("an entity");
+    let evidence_id = EvidenceId::new_v7();
+    let original_text = axis(TEXT_DIMENSION, 3);
+    let vision = axis(VISION_DIMENSION, 9);
+    store
+        .record_observation(RecordObservation {
+            id: ObservationId::new_v7(),
+            entity_id: entity.id,
+            context_id: context.id,
+            observation_type: "vector-reread".to_string(),
+            source: "vector-reread".to_string(),
+            observed_at: Utc::now(),
+            evidence: vec![EvidenceRef {
+                id: evidence_id,
+                kind: EvidenceKind::ImageFrame,
+                source_ref: format!("cas://sha256:{:064x}", evidence_id.as_uuid().as_u128()),
+                mime_type: Some("image/jpeg".to_string()),
+                text_projection: Some(CAPTION.to_string()),
+                retention_status: RetentionStatus::RetainedExternal,
+                producer: producer(),
+                ..Default::default()
+            }],
+            observed_properties: BTreeMap::new(),
+            state_delta: BTreeMap::new(),
+            properties: BTreeMap::new(),
+            embeddings: vec![
+                PrecomputedEmbedding {
+                    id: EmbeddingId::new_v7(),
+                    embedding_space_id: TEXT_SPACE.to_string(),
+                    vector: original_text.clone(),
+                    target: EmbeddingTarget::Evidence(evidence_id),
+                    produced_by: producer(),
+                },
+                PrecomputedEmbedding {
+                    id: EmbeddingId::new_v7(),
+                    embedding_space_id: VISION_SPACE.to_string(),
+                    vector: vision.clone(),
+                    target: EmbeddingTarget::Evidence(evidence_id),
+                    produced_by: producer(),
+                },
+            ],
+        })
+        .expect("an image frame with a caption vector and a vision vector");
+    store
+        .reindex_space(TEXT_SPACE, ReindexOptions::default())
+        .expect("reindexing replaces the caption's text vector");
+    drop(store);
+    let reread = read_vector_after_close(&path, "evidence", "vector_text", evidence_id.as_uuid());
+    assert_ne!(
+        reread, original_text,
+        "the reindex must have replaced the text vector"
+    );
+    assert_eq!(reread, replacement_vector());
+    assert_eq!(
+        read_vector_after_close(&path, "evidence", "vector_vision", evidence_id.as_uuid()),
+        vision,
+        "the vision vector is untouched by a text reindex and still travels in the row"
+    );
+}

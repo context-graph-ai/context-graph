@@ -197,19 +197,29 @@ pub(crate) fn dequeue(
     Ok(())
 }
 
-/// The one eligibility predicate: every digest; evidence whose kind the space supports and whose
-/// text projection is not empty.
+/// The one eligibility predicate: every digest; evidence that owes the space a text vector
+/// ([`evidence_owes_text_vector`]).
 fn projectable(target_table: &str, row: &HashMap<String, Value>, space: &RebuildSpace) -> bool {
-    if target_table == "digests" {
-        return true;
-    }
+    target_table == "digests" || evidence_owes_text_vector(row, &space.supported_evidence_kinds)
+}
+
+/// Whether an evidence row owes a text space a vector this node can build: its text projection is
+/// not empty, and the space either supports the row's kind or supports text. The second arm is the
+/// write door's own rule (`observation.rs`), so a captioned image frame that may be written with a
+/// caption vector is also queued, rebuilt and reindexed under that space.
+pub(crate) fn evidence_owes_text_vector(
+    row: &HashMap<String, Value>,
+    supported_evidence_kinds: &[EvidenceKind],
+) -> bool {
     let kind = match row.get("kind") {
         Some(Value::Text(kind)) => super::evidence_kind_from_str(kind).ok(),
         _ => None,
     };
     let has_text =
         matches!(row.get("text_projection"), Some(Value::Text(text)) if !text.trim().is_empty());
-    has_text && kind.is_some_and(|kind| space.supported_evidence_kinds.contains(&kind))
+    has_text
+        && (kind.is_some_and(|kind| supported_evidence_kinds.contains(&kind))
+            || supported_evidence_kinds.contains(&EvidenceKind::Text))
 }
 
 #[expect(

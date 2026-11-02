@@ -573,6 +573,7 @@ impl Store {
                 started_at,
                 snapshot,
                 &bindings,
+                &space.supported_evidence_kinds,
             )?);
         } else if bindings.iter().any(|(table, _)| table == "evidence") {
             candidates.extend(self.reindex_evidence_candidates(
@@ -699,6 +700,7 @@ impl Store {
         started_at: TxId,
         snapshot: contextdb_core::SnapshotId,
         bindings: &HashSet<(String, String)>,
+        supported_evidence_kinds: &[EvidenceKind],
     ) -> Result<Vec<ReindexCandidate>> {
         let mut producers = HashMap::<(String, uuid::Uuid), EvidenceProducer>::new();
         for handle in self
@@ -777,6 +779,15 @@ impl Store {
                     EmbeddingInput::Text(text),
                 )
             } else {
+                // A node-local table holds text vectors only. A row that owes this space one, by
+                // the queue's own predicate, re-embeds from its text projection whatever its kind
+                // (a captioned image frame included); a row that owes none is skipped.
+                if !super::rebuild_queue::evidence_owes_text_vector(
+                    &source.values,
+                    supported_evidence_kinds,
+                ) {
+                    continue;
+                }
                 let kind = source
                     .values
                     .get("kind")
@@ -784,14 +795,10 @@ impl Store {
                     .map(evidence_kind_from_str)
                     .transpose()?
                     .unwrap_or(EvidenceKind::Text);
-                let column = match kind {
-                    EvidenceKind::ImageFrame => "vector_vision",
-                    _ => "vector_text",
-                };
                 (
                     kind,
-                    column.to_string(),
-                    embedding_input_for_evidence(kind, source)?,
+                    "vector_text".to_string(),
+                    embedding_input_for_evidence(EvidenceKind::Text, source)?,
                 )
             };
             if !bindings.contains(&(target_table.to_string(), vector_column.clone())) {
