@@ -31,6 +31,11 @@ pub(crate) mod open_retry;
 mod outcome;
 mod precedent_match;
 pub(crate) mod rebuild_queue;
+mod rebuild_turn;
+pub use rebuild_turn::{
+    REBUILD_PAGE_BYTES, REBUILD_PAGE_ROWS, REBUILD_REFUSED_TOO_LARGE,
+    REBUILD_REFUSED_TOO_LARGE_TO_READ, RebuildQueueCounts, RebuildTurnOutcome,
+};
 mod reindex;
 pub(crate) mod relationship;
 pub mod signatures;

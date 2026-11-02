@@ -1,0 +1,404 @@
+//! One rebuild turn: this node builds the vectors it still owes a node-local reproducible space.
+//!
+//! A turn takes one page of the space's waiting items, at most [`REBUILD_PAGE_ROWS`] items and
+//! [`REBUILD_PAGE_BYTES`] of source text, embeds them with the space's own model, and commits every
+//! vector, handle and queue change of the page in one transaction. That transaction first re-reads
+//! the space's model generation and publishes nothing if it moved, so a page embedded under an
+//! earlier model never lands. An item whose text alone exceeds the page bound is moved to the
+//! refused state with its reason, in the same transaction, and is never truncated or retried under
+//! the same generation.
+
+use std::collections::HashMap;
+
+use contextdb_core::{TxId, Value};
+
+use super::Store;
+use super::convert::map_engine_err;
+use super::rebuild_queue::{PENDING_REFUSED, PENDING_WAITING, model_generation};
+use super::vector_placement::{NodeLocalVector, PhysicalVector, physical_vector};
+use crate::embedder::EmbeddingInput;
+use crate::{CgError, ContextId, Result, VectorRebuild};
+
+/// The most items one rebuild page embeds.
+pub const REBUILD_PAGE_ROWS: usize = 32;
+/// The most source text one rebuild page embeds, and the most any one item may carry.
+pub const REBUILD_PAGE_BYTES: usize = 4 * 1024 * 1024;
+/// Why an item too large for the page bound is not rebuilt.
+pub const REBUILD_REFUSED_TOO_LARGE: &str = "the item's text exceeds the 4 MiB embedding admission";
+/// Why an item larger than one read page of this store is not rebuilt: its text cannot be read
+/// within the store's cursor page bound, so it cannot be embedded here.
+pub const REBUILD_REFUSED_TOO_LARGE_TO_READ: &str =
+    "the item's text exceeds what one read page of this store can carry";
+
+/// What one rebuild turn did for one space.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RebuildTurnOutcome {
+    pub embedding_space_id: String,
+    /// Vectors this turn committed.
+    pub rebuilt: usize,
+    /// Items this turn moved to the refused state.
+    pub refused: usize,
+    /// This node has no model for the space, so the turn wrote nothing for it.
+    pub unavailable: bool,
+    /// The space's model generation moved while the page was embedded, so the page published
+    /// nothing; the next turn works under the new generation.
+    pub generation_moved: bool,
+}
+
+/// What a node-local reproducible space still owes this node, under its current model generation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RebuildQueueCounts {
+    pub embedding_space_id: String,
+    pub model_generation: i64,
+    /// Items waiting for this node to build their vector.
+    pub waiting: u64,
+    /// Items this node will not build under this generation, with the reason for each reason.
+    pub refused: u64,
+    pub refused_reasons: Vec<String>,
+    /// Whether this node has the space's model, and so can build anything at all.
+    pub available: bool,
+}
+
+/// One waiting item and the text it is embedded from, or why it is refused.
+struct PageItem {
+    target_table: String,
+    target_id: uuid::Uuid,
+    context_id: ContextId,
+    source_created_at: TxId,
+    text: Option<String>,
+    refusal: &'static str,
+}
+
+/// What reading an item's source gave.
+enum RebuildSource {
+    Text { text: String, created_at: TxId },
+    TooLargeToRead { created_at: TxId },
+    Gone,
+}
+
+impl Store {
+    /// The spaces this node rebuilds vectors for: every node-local reproducible space.
+    pub fn node_local_rebuild_spaces(&self) -> Result<Vec<String>> {
+        Ok(self
+            .list_embedding_spaces()?
+            .into_iter()
+            .filter(|space| {
+                matches!(physical_vector(space), PhysicalVector::NodeLocal { .. })
+                    && space
+                        .placement
+                        .is_some_and(|placement| placement.rebuild == VectorRebuild::Reproducible)
+            })
+            .map(|space| space.embedding_space_id)
+            .collect())
+    }
+
+    /// What a node-local reproducible space still owes this node, read in one snapshot.
+    pub fn rebuild_queue_counts(&self, embedding_space_id: &str) -> Result<RebuildQueueCounts> {
+        let generation = self.node_local_generation(embedding_space_id)?;
+        let count = |state: &str| -> Result<u64> {
+            let result = self.read_query(
+                "SELECT COUNT(*) AS n FROM rebuild_pending WHERE embedding_space_id = $space AND model_generation = $generation AND state = $state",
+                &HashMap::from([
+                    (
+                        "space".to_string(),
+                        Value::Text(embedding_space_id.to_string()),
+                    ),
+                    ("generation".to_string(), Value::Int64(generation)),
+                    ("state".to_string(), Value::Text(state.to_string())),
+                ]),
+            )?;
+            match result.rows().first().and_then(|row| row.first()) {
+                Some(Value::Int64(count)) => Ok(*count as u64),
+                other => Err(CgError::Engine(format!(
+                    "the rebuild queue count for {embedding_space_id} came back as {other:?}"
+                ))),
+            }
+        };
+        let waiting = count(PENDING_WAITING)?;
+        let refused = count(PENDING_REFUSED)?;
+        let mut refused_reasons = Vec::new();
+        if refused > 0 {
+            let result = self.read_query(
+                "SELECT reason FROM rebuild_pending WHERE embedding_space_id = $space AND model_generation = $generation AND state = $state ORDER BY target_table, target_id LIMIT 32",
+                &HashMap::from([
+                    (
+                        "space".to_string(),
+                        Value::Text(embedding_space_id.to_string()),
+                    ),
+                    ("generation".to_string(), Value::Int64(generation)),
+                    ("state".to_string(), Value::Text(PENDING_REFUSED.to_string())),
+                ]),
+            )?;
+            for row in result.rows() {
+                if let Some(Value::Text(reason)) = row.first()
+                    && !refused_reasons.contains(reason)
+                {
+                    refused_reasons.push(reason.clone());
+                }
+            }
+        }
+        Ok(RebuildQueueCounts {
+            embedding_space_id: embedding_space_id.to_string(),
+            model_generation: generation,
+            waiting,
+            refused,
+            refused_reasons,
+            available: self.embedders.contains_key(embedding_space_id),
+        })
+    }
+
+    /// Builds one page of the vectors this node owes a node-local reproducible space.
+    pub fn rebuild_turn(&self, embedding_space_id: &str) -> Result<RebuildTurnOutcome> {
+        let mut outcome = RebuildTurnOutcome {
+            embedding_space_id: embedding_space_id.to_string(),
+            rebuilt: 0,
+            refused: 0,
+            unavailable: false,
+            generation_moved: false,
+        };
+        let space = self.embedding_space_for_write(embedding_space_id)?;
+        let PhysicalVector::NodeLocal { table } = physical_vector(&space) else {
+            return Ok(outcome);
+        };
+        if space
+            .placement
+            .is_none_or(|placement| placement.rebuild != VectorRebuild::Reproducible)
+        {
+            return Ok(outcome);
+        }
+        let Some(embedder) = self.embedders.get(embedding_space_id).cloned() else {
+            outcome.unavailable = true;
+            return Ok(outcome);
+        };
+        let generation = self.node_local_generation(embedding_space_id)?;
+        let waiting = self.read_query(
+            &format!(
+                "SELECT target_table, target_id, context_id FROM rebuild_pending WHERE embedding_space_id = $space AND model_generation = $generation AND state = $state ORDER BY target_table, target_id LIMIT {REBUILD_PAGE_ROWS}"
+            ),
+            &HashMap::from([
+                (
+                    "space".to_string(),
+                    Value::Text(embedding_space_id.to_string()),
+                ),
+                ("generation".to_string(), Value::Int64(generation)),
+                ("state".to_string(), Value::Text(PENDING_WAITING.to_string())),
+            ]),
+        )?;
+        if waiting.rows().is_empty() {
+            return Ok(outcome);
+        }
+        // Read each item's text, keeping the page within its byte bound; an item alone over the
+        // bound is refused rather than embedded.
+        let mut page_bytes = 0usize;
+        let mut items = Vec::new();
+        for row in waiting.rows() {
+            let (
+                Some(Value::Text(target_table)),
+                Some(Value::Uuid(target_id)),
+                Some(Value::Uuid(context_id)),
+            ) = (row.first(), row.get(1), row.get(2))
+            else {
+                continue;
+            };
+            let mut item = PageItem {
+                target_table: target_table.clone(),
+                target_id: *target_id,
+                context_id: ContextId::from(*context_id),
+                source_created_at: TxId(0),
+                text: None,
+                refusal: REBUILD_REFUSED_TOO_LARGE,
+            };
+            match self.rebuild_source(target_table, *target_id)? {
+                RebuildSource::Gone => continue,
+                RebuildSource::TooLargeToRead { created_at } => {
+                    item.source_created_at = created_at;
+                    item.refusal = REBUILD_REFUSED_TOO_LARGE_TO_READ;
+                }
+                RebuildSource::Text { text, created_at } => {
+                    item.source_created_at = created_at;
+                    if text.len() <= REBUILD_PAGE_BYTES {
+                        if page_bytes + text.len() > REBUILD_PAGE_BYTES {
+                            break;
+                        }
+                        page_bytes += text.len();
+                        item.text = Some(text);
+                    }
+                }
+            }
+            items.push(item);
+        }
+        // Embed outside any transaction; nothing is published until the page commits.
+        let mut vectors = Vec::new();
+        for item in &items {
+            let Some(text) = &item.text else {
+                continue;
+            };
+            let output = embedder.embed(EmbeddingInput::Text(text.clone()))?;
+            if output.embedding_space_id != embedding_space_id {
+                return Err(CgError::EmbeddingSpaceIdMismatch {
+                    embedder_declared: output.embedding_space_id,
+                    registry_declared: embedding_space_id.to_string(),
+                });
+            }
+            if output.dimension != space.dimension || output.vector.len() != space.dimension {
+                return Err(CgError::EmbeddingDimensionMismatch {
+                    space_id: embedding_space_id.to_string(),
+                    expected: space.dimension as u32,
+                    found: output.vector.len() as u32,
+                });
+            }
+            vectors.push((item, output));
+        }
+        let tx = self.db.begin().map_err(map_engine_err)?;
+        let committed = (|| -> Result<bool> {
+            if model_generation(&self.db, tx, embedding_space_id).map_err(map_engine_err)?
+                != generation
+            {
+                return Ok(false);
+            }
+            for (item, output) in &vectors {
+                self.write_node_local_vector(
+                    tx,
+                    NodeLocalVector {
+                        table: &table,
+                        target_table: &item.target_table,
+                        target_id: item.target_id,
+                        embedding_space_id,
+                        context_id: item.context_id,
+                        source_created_at: item.source_created_at,
+                        rebuildable: true,
+                        vector: output.vector.clone(),
+                        produced_by: super::evidence::producer_value(&output.producer),
+                        producer_system: &output.producer.system,
+                        handle_id: None,
+                    },
+                )?;
+            }
+            for item in items.iter().filter(|item| item.text.is_none()) {
+                self.refuse_rebuild_in_tx(tx, embedding_space_id, generation, item)?;
+            }
+            Ok(true)
+        })();
+        match committed {
+            Ok(true) => {
+                self.db.commit(tx).map_err(map_engine_err)?;
+                outcome.rebuilt = vectors.len();
+                outcome.refused = items.iter().filter(|item| item.text.is_none()).count();
+            }
+            Ok(false) => {
+                let _ = self.db.rollback(tx);
+                outcome.generation_moved = true;
+            }
+            Err(error) => {
+                let _ = self.db.rollback(tx);
+                return Err(error);
+            }
+        }
+        Ok(outcome)
+    }
+
+    /// The text an item is rebuilt from and when its source row was created. The text is read on
+    /// its own cursor, so a text larger than one read page comes back as that refusal, typed by the
+    /// engine, rather than as a failed turn.
+    fn rebuild_source(&self, target_table: &str, target_id: uuid::Uuid) -> Result<RebuildSource> {
+        let (text_column, sql) = match target_table {
+            "digests" => ("summary", "SELECT created_at FROM digests WHERE id = $id"),
+            "evidence" => (
+                "text_projection",
+                "SELECT created_at FROM evidence WHERE id = $id",
+            ),
+            _ => return Ok(RebuildSource::Gone),
+        };
+        let params = HashMap::from([("id".to_string(), Value::Uuid(target_id))]);
+        let created = self.read_query(sql, &params)?;
+        let Some(Value::TxId(created_at)) = created.rows().first().and_then(|row| row.first())
+        else {
+            return Ok(RebuildSource::Gone);
+        };
+        let created_at = *created_at;
+        let session = self
+            .internal_db()
+            .read_session(self.read_limits())
+            .map_err(map_engine_err)?;
+        let text_sql = format!("SELECT {text_column} FROM {target_table} WHERE id = $id");
+        let cursor = match session.open_cursor(&text_sql, &params) {
+            Ok(cursor) => cursor,
+            Err(error) if read_page_too_small(&error) => {
+                return Ok(RebuildSource::TooLargeToRead { created_at });
+            }
+            Err(error) => return Err(map_engine_err(error)),
+        };
+        let text = match cursor
+            .first_page()
+            .rows()
+            .first()
+            .and_then(|row| row.first())
+        {
+            Some(Value::Text(text)) => Some(text.clone()),
+            _ => None,
+        };
+        cursor.close().map_err(map_engine_err)?;
+        Ok(match text {
+            Some(text) => RebuildSource::Text { text, created_at },
+            None => RebuildSource::Gone,
+        })
+    }
+
+    fn refuse_rebuild_in_tx(
+        &self,
+        tx: TxId,
+        embedding_space_id: &str,
+        generation: i64,
+        item: &PageItem,
+    ) -> Result<()> {
+        super::rebuild_queue::dequeue(
+            &self.db,
+            tx,
+            &item.target_table,
+            item.target_id,
+            embedding_space_id,
+        )
+        .map_err(map_engine_err)?;
+        let (digest_id, evidence_id) = match item.target_table.as_str() {
+            "digests" => (Value::Uuid(item.target_id), Value::Null),
+            _ => (Value::Null, Value::Uuid(item.target_id)),
+        };
+        self.db
+            .execute_in_tx(
+                tx,
+                "INSERT INTO rebuild_pending (target_table, target_id, embedding_space_id, model_generation, state, reason, context_id, digest_id, evidence_id) VALUES ($target_table, $target_id, $space, $generation, $state, $reason, $context_id, $digest_id, $evidence_id)",
+                &HashMap::from([
+                    (
+                        "target_table".to_string(),
+                        Value::Text(item.target_table.clone()),
+                    ),
+                    ("target_id".to_string(), Value::Uuid(item.target_id)),
+                    (
+                        "space".to_string(),
+                        Value::Text(embedding_space_id.to_string()),
+                    ),
+                    ("generation".to_string(), Value::Int64(generation)),
+                    ("state".to_string(), Value::Text(PENDING_REFUSED.to_string())),
+                    ("reason".to_string(), Value::Text(item.refusal.to_string())),
+                    ("context_id".to_string(), Value::Uuid(item.context_id.as_uuid())),
+                    ("digest_id".to_string(), digest_id),
+                    ("evidence_id".to_string(), evidence_id),
+                ]),
+            )
+            .map_err(map_engine_err)?;
+        Ok(())
+    }
+}
+
+/// The engine's refusal of a read whose one row is larger than a cursor page may carry.
+fn read_page_too_small(error: &contextdb_core::Error) -> bool {
+    matches!(
+        error,
+        contextdb_core::Error::ReadFailure(failure)
+            if matches!(
+                failure.detail(),
+                contextdb_core::read_contract::ReadFailureDetail::OwnerLimitExceeded(detail)
+                    if detail.limit == contextdb_core::read_contract::ReadFailureLimit::CursorPageBytes
+            )
+    )
+}

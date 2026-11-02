@@ -71,7 +71,9 @@ pub use owner_control::{ControlHandler, OwnerControlError};
 pub use producer::CG_EDGE_SYSTEM_TAG;
 pub use store::{
     ConsumerSchema, ConsumerTable, DigestGraphWalkBoundary, DigestSearchFilter, DigestSearchHit,
-    EntityMatch, EntityReferenceMatchOptions, ReindexEvent, ReindexOptions, Store,
+    EntityMatch, EntityReferenceMatchOptions, REBUILD_PAGE_BYTES, REBUILD_PAGE_ROWS,
+    REBUILD_REFUSED_TOO_LARGE, REBUILD_REFUSED_TOO_LARGE_TO_READ, RebuildQueueCounts,
+    RebuildTurnOutcome, ReindexEvent, ReindexOptions, Store,
 };
 pub use store::{
     EventHistoryContextStatus, EventHistoryInterpretationHead, EventHistoryMemoryCounts,
