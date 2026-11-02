@@ -66,7 +66,6 @@ fn context_graph_tables_declare_the_frozen_sync_contract() {
         "intentions",
         "decisions",
         "entities",
-        "reindex_cursors",
         "outcomes",
         "invalidations",
         "entity_current_snapshots",
@@ -123,6 +122,12 @@ fn context_graph_tables_declare_the_frozen_sync_contract() {
         "cg_understanding_completions",
         "cg_local_settings",
         "cg_changed_cursors",
+        // Reproducible vectors, their handles, the rebuild queue and reindex progress are each
+        // node's own: every node rebuilds its own copy.
+        "reindex_cursors",
+        "reproducible_vectors_768",
+        "reproducible_vector_handles",
+        "rebuild_pending",
         "cg_runtime_models",
         "context_bindings",
         "event_placement",
@@ -141,10 +146,10 @@ fn context_graph_tables_declare_the_frozen_sync_contract() {
         "work_capabilities",
     ];
 
-    assert_eq!(KEEP_LATEST.len(), 9);
+    assert_eq!(KEEP_LATEST.len(), 8);
     assert_eq!(KEEP_FIRST.len(), 33);
     assert_eq!(LOCAL_ONLY_KEEP_FIRST.len(), 2);
-    assert_eq!(SYNC_OFF.len(), 16);
+    assert_eq!(SYNC_OFF.len(), 20);
     assert_eq!(ENGINE_OWNED.len(), 7);
 
     let mut expected = BTreeMap::new();
@@ -184,7 +189,17 @@ fn context_graph_tables_declare_the_frozen_sync_contract() {
     let expected_schema_tables = expected
         .keys()
         .copied()
-        .filter(|table| !matches!(*table, "cg_changed_cursors" | "cg_runtime_models"))
+        .filter(|table| {
+            !matches!(
+                *table,
+                "cg_changed_cursors"
+                    | "cg_runtime_models"
+                    | "reindex_cursors"
+                    | "reproducible_vectors_768"
+                    | "reproducible_vector_handles"
+                    | "rebuild_pending"
+            )
+        })
         .collect::<BTreeSet<_>>();
     assert_eq!(
         schema_tables, expected_schema_tables,

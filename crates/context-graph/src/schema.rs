@@ -279,10 +279,6 @@ pub const TABLES: &[TableSpec] = &[
         ddl: "CREATE TABLE entity_reference_embeddings_768 (id UUID PRIMARY KEY, context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), entity_id UUID NOT NULL, label TEXT, vector VECTOR(768), embedding_space_id TEXT NOT NULL REFERENCES embedding_spaces(embedding_space_id), produced_by JSON, created_at TXID NOT NULL, UNIQUE (entity_id, label), UNIQUE (context_id, id), FOREIGN KEY (context_id, entity_id) REFERENCES entities(context_id, id)) SYNC TWO WAY SYNC CONFLICT KEEP FIRST",
     },
     TableSpec {
-        name: "reindex_cursors",
-        ddl: "CREATE TABLE reindex_cursors (embedding_space_id TEXT PRIMARY KEY REFERENCES embedding_spaces(embedding_space_id), status TEXT NOT NULL, owner_run_id TEXT NOT NULL, lease_epoch INTEGER NOT NULL, last_committed_cursor INTEGER NOT NULL, from_producer JSON, to_producer JSON, started_at TXID NOT NULL, last_advanced_at TXID NOT NULL) SYNC TWO WAY SYNC CONFLICT KEEP LATEST",
-    },
-    TableSpec {
         name: "evidence_availability_log",
         ddl: "CREATE TABLE evidence_availability_log (id UUID PRIMARY KEY, context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), evidence_id UUID NOT NULL REFERENCES evidence(id), status TEXT NOT NULL, recorded_at_txid TXID NOT NULL, recorded_at TIMESTAMP, FOREIGN KEY (context_id, evidence_id) REFERENCES evidence(context_id, id)) IMMUTABLE SYNC TWO WAY SYNC CONFLICT KEEP FIRST",
     },
@@ -440,7 +436,36 @@ pub const TABLES: &[TableSpec] = &[
 pub(crate) const RUNTIME_MODELS_DDL: &str = "CREATE TABLE cg_runtime_models (id UUID PRIMARY KEY, context_label TEXT NOT NULL, model_key TEXT NOT NULL, advertised_context_tokens INTEGER NOT NULL, default_for_context BOOLEAN NOT NULL, created_at TXID NOT NULL) SYNC OFF";
 pub(crate) const CHANGED_CURSORS_DDL: &str = "CREATE TABLE cg_changed_cursors (context_id UUID PRIMARY KEY, last_seen_tx TXID NOT NULL, updated_at TXID NOT NULL) SYNC OFF";
 pub(crate) const SUBSCRIPTION_RECEIPTS_DDL: &str = "CREATE TABLE cg_subscription_receipts (sink_name TEXT NOT NULL, action_id TEXT NOT NULL, recorded_at TXID NOT NULL, PRIMARY KEY (sink_name, action_id)) SYNC OFF";
+/// Node-local copies of vectors in spaces declared node-local, one row per item and space. Replaced in
+/// place by a rebuild; never synchronised. Exactly one of digest_id and evidence_id names the parent.
+pub(crate) const REPRODUCIBLE_VECTORS_768_DDL: &str = "CREATE TABLE reproducible_vectors_768 (target_table TEXT NOT NULL, target_id UUID NOT NULL, embedding_space_id TEXT NOT NULL REFERENCES embedding_spaces(embedding_space_id), model_generation INTEGER NOT NULL, context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), digest_id UUID, evidence_id UUID, rebuildable BOOLEAN NOT NULL, vector_text VECTOR(768), PRIMARY KEY (target_table, target_id, embedding_space_id), UNIQUE (embedding_space_id, model_generation, rebuildable, target_table, target_id), FOREIGN KEY (context_id, digest_id) REFERENCES digests(context_id, id), FOREIGN KEY (context_id, evidence_id) REFERENCES evidence(context_id, id)) SYNC OFF HISTORY CURRENT ONLY MAINTAIN COUNT (embedding_space_id, model_generation, rebuildable)";
+/// Handles for node-local vectors. The id is derived from the item, space and model generation, so
+/// embedding the same item under the same model again replaces rather than duplicates.
+pub(crate) const REPRODUCIBLE_VECTOR_HANDLES_DDL: &str = "CREATE TABLE reproducible_vector_handles (id UUID PRIMARY KEY, target_table TEXT NOT NULL, target_id UUID NOT NULL, embedding_space_id TEXT NOT NULL REFERENCES embedding_spaces(embedding_space_id), model_generation INTEGER NOT NULL, context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), digest_id UUID, evidence_id UUID, produced_by JSON, producer_system TEXT NOT NULL, created_at TXID NOT NULL, FOREIGN KEY (context_id, digest_id) REFERENCES digests(context_id, id), FOREIGN KEY (context_id, evidence_id) REFERENCES evidence(context_id, id)) SYNC OFF HISTORY CURRENT ONLY";
+/// Items in a node-local reproducible space that this node still has to embed under the space's
+/// current model generation, or that it refused to embed with a recorded reason.
+pub(crate) const REBUILD_PENDING_DDL: &str = "CREATE TABLE rebuild_pending (target_table TEXT NOT NULL, target_id UUID NOT NULL, embedding_space_id TEXT NOT NULL REFERENCES embedding_spaces(embedding_space_id), model_generation INTEGER NOT NULL, state TEXT NOT NULL, reason TEXT, context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), PRIMARY KEY (embedding_space_id, model_generation, state, target_table, target_id)) SYNC OFF HISTORY CURRENT ONLY MAINTAIN COUNT (embedding_space_id, model_generation, state)";
+/// A reindex's progress on this node. Each node rebuilds its own reproducible vectors, so progress is
+/// node-local; model_generation increments when a reindex starts a new model.
+pub(crate) const REINDEX_CURSORS_DDL: &str = "CREATE TABLE reindex_cursors (embedding_space_id TEXT PRIMARY KEY REFERENCES embedding_spaces(embedding_space_id), status TEXT NOT NULL, owner_run_id TEXT NOT NULL, lease_epoch INTEGER NOT NULL, last_committed_cursor INTEGER NOT NULL, from_producer JSON, to_producer JSON, model_generation INTEGER NOT NULL, started_at TXID NOT NULL, last_advanced_at TXID NOT NULL) SYNC OFF";
+
 pub(crate) const LOCAL_RUNTIME_TABLES: &[TableSpec] = &[
+    TableSpec {
+        name: "reindex_cursors",
+        ddl: REINDEX_CURSORS_DDL,
+    },
+    TableSpec {
+        name: "reproducible_vectors_768",
+        ddl: REPRODUCIBLE_VECTORS_768_DDL,
+    },
+    TableSpec {
+        name: "reproducible_vector_handles",
+        ddl: REPRODUCIBLE_VECTOR_HANDLES_DDL,
+    },
+    TableSpec {
+        name: "rebuild_pending",
+        ddl: REBUILD_PENDING_DDL,
+    },
     TableSpec {
         name: "cg_runtime_models",
         ddl: RUNTIME_MODELS_DDL,

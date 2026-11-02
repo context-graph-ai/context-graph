@@ -273,7 +273,7 @@ impl Store {
         } else {
             self.db.execute_in_tx(
                 tx,
-                "INSERT INTO reindex_cursors (embedding_space_id, status, owner_run_id, lease_epoch, last_committed_cursor, from_producer, to_producer, started_at, last_advanced_at) VALUES ($space, $status, $owner, $lease_epoch, $cursor, $from_producer, $to_producer, $started_at, $advanced_at)",
+                "INSERT INTO reindex_cursors (embedding_space_id, status, owner_run_id, lease_epoch, last_committed_cursor, from_producer, to_producer, model_generation, started_at, last_advanced_at) VALUES ($space, $status, $owner, $lease_epoch, $cursor, $from_producer, $to_producer, 1, $started_at, $advanced_at)",
                 &params,
             )
         };
