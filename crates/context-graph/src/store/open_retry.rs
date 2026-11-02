@@ -1,7 +1,6 @@
 //! Bounded physical-open contention waits; schema installation is never retried here.
-use crate::owner_control::{ReaderRelease, wait_for_reader_release_within};
 use crate::{CgError, Result};
-use std::path::Path;
+
 use std::time::{Duration, Instant};
 
 #[cfg(feature = "test-support")]
@@ -21,17 +20,20 @@ pub fn set_store_open_retry_allowance_for_test(allowance: Option<Duration>) {
 }
 
 pub(super) enum Contention {
-    Readers,
     Writer,
 }
 
-pub(super) fn retry<T>(
-    path: &Path,
-    contention: Contention,
-    mut open: impl FnMut() -> Result<T>,
-) -> Result<T> {
+/// How long a writable open waits for live readers before it is answered held_by_readers. The
+/// engine owns that wait; cg only says for how long, and never retries a reader refusal itself.
+pub(super) fn reader_wait_allowance() -> Duration {
+    let allowance = crate::owner_control::READER_RELEASE_ALLOWANCE;
+    #[cfg(feature = "test-support")]
+    let allowance = TEST_ALLOWANCE.with(|slot| slot.get()).unwrap_or(allowance);
+    allowance
+}
+
+pub(super) fn retry<T>(contention: Contention, mut open: impl FnMut() -> Result<T>) -> Result<T> {
     let allowance = match contention {
-        Contention::Readers => crate::owner_control::READER_RELEASE_ALLOWANCE,
         Contention::Writer => crate::owner_control::WRITER_TRANSITION_ALLOWANCE,
     };
     #[cfg(feature = "test-support")]
@@ -41,11 +43,6 @@ pub(super) fn retry<T>(
     let mut pause = Duration::from_millis(20);
     loop {
         let refusal = match open() {
-            Err(error @ CgError::StoreHeldByReaders { .. })
-                if matches!(contention, Contention::Readers) =>
-            {
-                error
-            }
             Err(error @ CgError::StoreLocked { .. })
                 if matches!(contention, Contention::Writer) =>
             {
@@ -74,13 +71,6 @@ pub(super) fn retry<T>(
         if remaining.is_zero() {
             return Err(refusal);
         }
-        if matches!(contention, Contention::Readers) {
-            match wait_for_reader_release_within(path, started + allowance) {
-                ReaderRelease::Released => continue,
-                ReaderRelease::Stopped => return Err(refusal),
-                ReaderRelease::Unobservable(_) => {}
-            }
-        }
         let remaining = allowance.saturating_sub(started.elapsed());
         if remaining.is_zero() {
             return Err(refusal);
@@ -95,9 +85,9 @@ mod tests {
     use super::*;
     #[test]
     fn uncontended_open_runs_once_and_other_refusals_are_never_retried() {
-        for contention in [Contention::Readers, Contention::Writer] {
+        for contention in [Contention::Writer] {
             let mut opens = 0;
-            let result = retry(Path::new("unused"), contention, || {
+            let result = retry(contention, || {
                 opens += 1;
                 Ok(7)
             });
@@ -105,23 +95,24 @@ mod tests {
             assert_eq!(opens, 1);
         }
         let mut opens = 0;
-        let result: Result<()> = retry(Path::new("unused"), Contention::Readers, || {
+        let result: Result<()> = retry(Contention::Writer, || {
             opens += 1;
-            Err(CgError::StoreLocked {
-                holder_pid: Some(42),
+            Err(CgError::StoreHeldByReaders {
+                observed_direct_readers: 2,
+                readers: Vec::new(),
                 path: "unused".into(),
             })
         });
         assert!(matches!(
             result,
-            Err(CgError::StoreLocked {
-                holder_pid: Some(42),
+            Err(CgError::StoreHeldByReaders {
+                observed_direct_readers: 2,
                 ..
             })
         ));
         assert_eq!(opens, 1);
         let mut opens = 0;
-        let result: Result<()> = retry(Path::new("unused"), Contention::Writer, || {
+        let result: Result<()> = retry(Contention::Writer, || {
             opens += 1;
             Err(CgError::Engine("not contention".into()))
         });

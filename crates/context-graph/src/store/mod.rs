@@ -38,7 +38,7 @@ mod subscriptions;
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 
 use contextdb_core::{
     ColumnType, EdgeDiscardMode, Error as EngineError, ScopeLabel, SyncDirection, TxId, Value,
@@ -122,7 +122,32 @@ const _: fn() = embedding::production_primitive_anchor;
 const MAX_GRAPH_DEPTH: u8 = 10;
 const SCHEMA_BOOTSTRAP_VALIDATE_ATTEMPTS: usize = 256;
 const EVENT_PLACEMENT_TO_TENANT_HUB: &str = "transition_to_tenant_hub";
-static REGISTRY: OnceLock<Mutex<HashMap<PathBuf, Weak<Database>>>> = OnceLock::new();
+static REGISTRY: OnceLock<Mutex<HashMap<PathBuf, RegistryEntry>>> = OnceLock::new();
+/// Wakes threads waiting for another thread's open of the same path to publish or fail.
+static REGISTRY_CHANGED: Condvar = Condvar::new();
+
+/// One path's place in the process-local handle registry: an open still producing the handle, or
+/// the published handle itself. The registry mutex is never held while an open waits for readers.
+enum RegistryEntry {
+    Opening,
+    Open(Weak<Database>),
+}
+
+impl RegistryEntry {
+    fn live(&self) -> Option<Arc<Database>> {
+        match self {
+            Self::Opening => None,
+            Self::Open(handle) => handle.upgrade(),
+        }
+    }
+
+    fn strong_count(&self) -> usize {
+        match self {
+            Self::Opening => 0,
+            Self::Open(handle) => handle.strong_count(),
+        }
+    }
+}
 static SCHEMA_INSTALL_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 pub(crate) trait StoreReadObserver: Send + Sync {
@@ -1036,7 +1061,13 @@ impl DatabaseOpenExtras {
     ) -> DatabaseOpenOptions {
         let mut options = DatabaseOpenOptions {
             open_disposition: self.open_disposition,
-            reader_wait_deadline: self.reader_wait_deadline.clone(),
+            // A writable open with no caller deadline or stop waits for live readers inside the
+            // engine, for cg's one reader allowance, and is then answered held_by_readers.
+            reader_wait_deadline: self.reader_wait_deadline.clone().or_else(|| {
+                self.reader_wait_stop.is_none().then(|| {
+                    contextdb_engine::ReaderWaitDeadline::after(open_retry::reader_wait_allowance())
+                })
+            }),
             reader_wait_stop: self.reader_wait_stop.clone(),
             memory_limit: Some(write_memory_limit.get()),
             ..DatabaseOpenOptions::default()
@@ -1076,36 +1107,48 @@ fn open_bootstrapped_database(
     consumer_schema: &ConsumerSchema,
 ) -> Result<(Arc<Database>, Option<Arc<Database>>)> {
     let registry = REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
-    let open = || {
-        // Each attempt reacquires and rechecks. A reader wait must never own the registry mutex.
-        let guard = registry.lock().expect("store registry lock");
-        if extras.is_plain()
-            && !replace_shared_handle
-            && let Some(existing) = guard.get(db_path).and_then(Weak::upgrade)
-        {
-            return Ok((guard, existing, true));
+    let mut guard = registry.lock().expect("store registry lock");
+    // Another thread opening this path publishes or fails first; an unrelated path never waits.
+    while matches!(guard.get(db_path), Some(RegistryEntry::Opening)) {
+        guard = REGISTRY_CHANGED.wait(guard).expect("store registry lock");
+    }
+    if extras.is_plain()
+        && !replace_shared_handle
+        && let Some(existing) = guard.get(db_path).and_then(RegistryEntry::live)
+    {
+        drop(guard);
+        bootstrap_schema(&existing, config, true, consumer_schema)?;
+        return Ok(narrowed_handle(existing, contexts, scope_labels));
+    }
+    guard.insert(db_path.to_path_buf(), RegistryEntry::Opening);
+    drop(guard);
+    // No cg lock is held here: the engine may wait for live readers until its deadline.
+    let opened = Database::open_with_options(
+        db_path,
+        extras.open_options(
+            config.read_memory_limit_bytes,
+            config.read_active_time_ms,
+            config.write_memory_limit_bytes,
+        ),
+    )
+    .map_err(|error| extras.map_refusal(db_path, error))
+    .map(Arc::new)
+    .and_then(|db| bootstrap_schema(&db, config, false, consumer_schema).map(|()| db));
+    let mut guard = registry.lock().expect("store registry lock");
+    match &opened {
+        Ok(db) => {
+            guard.insert(
+                db_path.to_path_buf(),
+                RegistryEntry::Open(Arc::downgrade(db)),
+            );
         }
-        let db = Arc::new(
-            {
-                let options = extras.open_options(
-                    config.read_memory_limit_bytes,
-                    config.read_active_time_ms,
-                    config.write_memory_limit_bytes,
-                );
-                Database::open_with_options(db_path, options)
-            }
-            .map_err(|error| extras.map_refusal(db_path, error))?,
-        );
-        Ok((guard, db, false))
-    };
-    let (mut guard, db, reused) =
-        if extras.reader_wait_deadline.is_some() || extras.reader_wait_stop.is_some() {
-            open()?
-        } else {
-            open_retry::retry(db_path, open_retry::Contention::Readers, open)?
-        };
-    bootstrap_schema(&db, config, reused, consumer_schema)?;
-    guard.insert(db_path.to_path_buf(), Arc::downgrade(&db));
+        Err(_) => {
+            guard.remove(db_path);
+        }
+    }
+    drop(guard);
+    REGISTRY_CHANGED.notify_all();
+    let db = opened?;
     Ok(narrowed_handle(db, contexts, scope_labels))
 }
 
@@ -1252,8 +1295,8 @@ fn bootstrap_schema(
 fn existing_shared_database(db_path: &Path) -> Option<Arc<Database>> {
     let registry = REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
     let mut guard = registry.lock().expect("store registry lock");
-    let existing = guard.get(db_path).and_then(Weak::upgrade);
-    guard.retain(|_, handle| handle.strong_count() > 0);
+    let existing = guard.get(db_path).and_then(RegistryEntry::live);
+    guard.retain(|_, entry| matches!(entry, RegistryEntry::Opening) || entry.strong_count() > 0);
     existing
 }
 
@@ -1270,7 +1313,7 @@ pub fn database_is_live_for_test(db_path: &Path) -> bool {
                 .lock()
                 .expect("store registry lock")
                 .get(db_path)
-                .map(Weak::strong_count)
+                .map(RegistryEntry::strong_count)
         })
         .is_some_and(|strong_count| strong_count > 0)
 }

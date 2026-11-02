@@ -882,7 +882,11 @@ fn assert_no_unsanctioned_app_side_locks_or_global_state_in_core_sources(context
         "let mut guard = self.trace.lock().expect(\"trace lock\");",
         "let guard = self.trace.lock().expect(\"trace lock\");",
         "let mut events = self.reindex_events.lock().expect(\"reindex events\");",
-        "static REGISTRY: OnceLock<Mutex<HashMap<PathBuf, Weak<Database>>>> = OnceLock::new();",
+        // The process-local handle registry records a path as Opening while its open is in flight,
+        // so the registry mutex is never held while the engine waits for readers. The Opening state
+        // is the same process-local handle sharing and guards no evidence or decision write.
+        "static REGISTRY: OnceLock<Mutex<HashMap<PathBuf, RegistryEntry>>> = OnceLock::new();",
+        "use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};",
         "let registry = REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));",
         "let mut guard = registry.lock().expect(\"store registry lock\");",
         "let guard = registry.lock().expect(\"store registry lock\");",

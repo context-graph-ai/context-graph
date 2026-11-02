@@ -48,11 +48,9 @@ fn open_for_run(
 ) -> Result<Store> {
     #[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
     STORE_OPENS.with(|opens| opens.set(opens.get() + 1));
-    super::open_retry::retry(
-        &config.db_path,
-        super::open_retry::Contention::Writer,
-        || Store::open_with_embedder_registrations(config.clone(), vec![embedder.clone()]),
-    )
+    super::open_retry::retry(super::open_retry::Contention::Writer, || {
+        Store::open_with_embedder_registrations(config.clone(), vec![embedder.clone()])
+    })
 }
 
 /// Admission shared by every projection door that has selected an event-search registration.
