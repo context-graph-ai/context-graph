@@ -174,6 +174,7 @@ impl Store {
                                 vector: route.vector.clone(),
                                 produced_by: producer_value(&route.produced_by),
                                 producer_system: &route.produced_by.system,
+                                handle_id: Some(route.id.as_uuid()),
                             },
                         ) {
                             let _ = self.db.rollback(tx);
@@ -256,6 +257,7 @@ impl Store {
                                 vector: route.vector.clone(),
                                 produced_by: producer_value(&route.produced_by),
                                 producer_system: &route.produced_by.system,
+                                handle_id: Some(route.id.as_uuid()),
                             },
                         ) {
                             let _ = self.db.rollback(tx);

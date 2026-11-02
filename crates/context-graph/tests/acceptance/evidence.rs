@@ -1108,6 +1108,29 @@ fn assert_first_vector_hit_id(
     assert_eq!(row.values.get("id"), Some(&Value::Uuid(expected)));
 }
 
+fn assert_first_node_local_hit(
+    db: &Database,
+    hits: &[(RowId, f32)],
+    target_table: &str,
+    expected: uuid::Uuid,
+) {
+    assert!(
+        !hits.is_empty(),
+        "expected at least one node-local vector hit for {target_table}"
+    );
+    let row = db
+        .scan("reproducible_vectors_768", db.snapshot())
+        .expect("scan the node-local vector table")
+        .into_iter()
+        .find(|row| row.row_id == hits[0].0)
+        .expect("the node-local vector hit row must still be visible");
+    assert_eq!(
+        row.values.get("target_table"),
+        Some(&Value::Text(target_table.to_string()))
+    );
+    assert_eq!(row.values.get("target_id"), Some(&Value::Uuid(expected)));
+}
+
 fn vector_hits_contain_id(
     db: &Database,
     table: &str,
@@ -5381,29 +5404,31 @@ fn create_digest_with_text_evidence_kind_lands_in_digests_vector_text_index_quer
     let db = reopen_database_for_store(store);
     let hits = db
         .query_vector(
-            VectorIndexRef::new("digests", "vector_text"),
+            VectorIndexRef::new("reproducible_vectors_768", "vector_text"),
             &text_vector(),
             1,
             None,
             db.snapshot(),
         )
         .expect("query");
-    assert_first_vector_hit_id(&db, "digests", &hits, digest_id.as_uuid());
+    // The built-in text space keeps its vectors on this node, in its node-local vector table, keyed
+    // by the source table and item; the synced digest row holds no copy.
+    assert_first_node_local_hit(&db, &hits, "digests", digest_id.as_uuid());
     let decoy_hits = db
         .query_vector(
-            VectorIndexRef::new("digests", "vector_text"),
+            VectorIndexRef::new("reproducible_vectors_768", "vector_text"),
             &decoy_vector,
             1,
             None,
             db.snapshot(),
         )
         .expect("decoy query");
-    assert_first_vector_hit_id(&db, "digests", &decoy_hits, decoy_digest_id.as_uuid());
+    assert_first_node_local_hit(&db, &decoy_hits, "digests", decoy_digest_id.as_uuid());
     assert_eq!(
         count_where(
             &db,
-            "digest_embedding_handles",
-            "id = $id AND embedding_space_id = $embedding_space_id AND target_id = $target_id",
+            "reproducible_vector_handles",
+            "id = $id AND embedding_space_id = $embedding_space_id AND target_table = 'digests' AND target_id = $target_id",
             db_params(vec![
                 ("id", Value::Uuid(embedding_id.as_uuid())),
                 ("embedding_space_id", Value::Text(TEXT_SPACE.to_string())),
@@ -5411,7 +5436,8 @@ fn create_digest_with_text_evidence_kind_lands_in_digests_vector_text_index_quer
             ])
         ),
         1,
-        "create_digest must persist embedding handle lineage for the digest vector"
+        "create_digest must persist embedding handle lineage for the digest vector, keeping the \
+         embedding id the caller supplied"
     );
     let meta = db.table_meta("digests").expect("digests meta");
     assert!(

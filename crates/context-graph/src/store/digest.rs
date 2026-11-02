@@ -133,6 +133,7 @@ impl Store {
                     vector: input.embedding.vector.clone(),
                     produced_by: producer_value(&input.embedding.produced_by),
                     producer_system: &input.embedding.produced_by.system,
+                    handle_id: Some(input.embedding.id.as_uuid()),
                 },
             ) {
                 let _ = self.db.rollback(tx);

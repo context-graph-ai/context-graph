@@ -95,6 +95,20 @@ fn writer() -> Written {
     }
 }
 
+/// The one node-local handle a digest has, read through a read-only session on the closed store.
+fn digest_handle_after_close(path: &Path, digest_id: DigestId) -> uuid::Uuid {
+    let row = read_row_after_close(
+        path,
+        "SELECT target_id, id FROM reproducible_vector_handles WHERE target_table = 'digests' AND target_id = $id",
+        digest_id.as_uuid(),
+        "the digest's node-local handle",
+    );
+    let Value::Uuid(handle) = row[1] else {
+        panic!("a handle id is a uuid, found {:?}", row[1]);
+    };
+    handle
+}
+
 /// One row read through a read-only session on the closed store.
 fn read_row_after_close(path: &Path, sql: &str, id: uuid::Uuid, label: &str) -> Vec<Value> {
     // context-graph's own read options, with allowances wide enough that only the stored rows decide
@@ -314,17 +328,20 @@ impl Embedder for ReplacementEmbedder {
 fn a_reindexed_digest_vector_reads_through_a_read_only_session_after_the_store_closes() {
     let dir = tempfile::tempdir().expect("a directory for the store");
     let path = dir.path().join("context-graph.db");
-    let store = Store::open_with_embedder_registrations(
-        StoreConfig {
-            db_path: path.clone(),
-            ..Default::default()
-        },
-        vec![EmbedderRegistration {
-            space: text_space(),
-            embedder: Arc::new(ReplacementEmbedder),
-        }],
-    )
-    .expect("a writable store with a registered text embedder");
+    let open = || {
+        Store::open_with_embedder_registrations(
+            StoreConfig {
+                db_path: path.clone(),
+                ..Default::default()
+            },
+            vec![EmbedderRegistration {
+                space: text_space(),
+                embedder: Arc::new(ReplacementEmbedder),
+            }],
+        )
+        .expect("a writable store with a registered text embedder")
+    };
+    let store = open();
     let context = store
         .create_context(CreateContext {
             name: "vector-reread-reindex".to_string(),
@@ -334,6 +351,7 @@ fn a_reindexed_digest_vector_reads_through_a_read_only_session_after_the_store_c
         .expect("a context");
     let digest_id = DigestId::new_v7();
     let original = axis(TEXT_DIMENSION, 3);
+    let supplied_handle = EmbeddingId::new_v7();
     store
         .create_digest(CreateDigest {
             id: digest_id,
@@ -342,7 +360,7 @@ fn a_reindexed_digest_vector_reads_through_a_read_only_session_after_the_store_c
             summary: "a digest whose vector is replaced by reindexing".to_string(),
             kind: EvidenceKind::Text,
             embedding: PrecomputedEmbedding {
-                id: EmbeddingId::new_v7(),
+                id: supplied_handle,
                 embedding_space_id: TEXT_SPACE.to_string(),
                 vector: original.clone(),
                 target: EmbeddingTarget::Digest(digest_id),
@@ -352,10 +370,33 @@ fn a_reindexed_digest_vector_reads_through_a_read_only_session_after_the_store_c
             properties: BTreeMap::new(),
         })
         .expect("a digest committed before the reindex");
+    drop(store);
+    assert_eq!(
+        digest_handle_after_close(&path, digest_id),
+        supplied_handle.as_uuid(),
+        "a supplied vector keeps the embedding id its caller gave it"
+    );
+    let store = open();
     store
         .reindex_space(TEXT_SPACE, ReindexOptions::default())
         .expect("reindexing replaces the digest vector");
     drop(store);
+    let rebuilt_handle = digest_handle_after_close(&path, digest_id);
+    assert_ne!(
+        rebuilt_handle,
+        supplied_handle.as_uuid(),
+        "a vector this node rebuilt carries this node's own handle, not the supplied one"
+    );
+    let store = open();
+    store
+        .reindex_space(TEXT_SPACE, ReindexOptions::default())
+        .expect("a second reindex under the same model");
+    drop(store);
+    assert_eq!(
+        digest_handle_after_close(&path, digest_id),
+        rebuilt_handle,
+        "rebuilding the same item under the same model gives the same handle id, and still one"
+    );
     let reread = read_vector_after_close(&path, "digests", "vector_text", digest_id.as_uuid());
     assert_ne!(
         reread, original,

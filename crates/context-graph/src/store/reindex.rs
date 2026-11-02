@@ -363,6 +363,7 @@ impl Store {
                     vector: commit.vector,
                     produced_by: producer_value(commit.producer),
                     producer_system: &commit.producer.system,
+                    handle_id: None,
                 },
             );
             let advanced = written.and_then(|()| {

@@ -76,6 +76,9 @@ pub(crate) struct NodeLocalVector<'a> {
     pub(crate) vector: Vec<f32>,
     pub(crate) produced_by: Value,
     pub(crate) producer_system: &'a str,
+    /// The handle id a caller supplied with this vector, kept as given; `None` for a vector this
+    /// node built itself, whose handle takes the deterministic id.
+    pub(crate) handle_id: Option<uuid::Uuid>,
 }
 
 impl Store {
@@ -180,12 +183,14 @@ impl Store {
         let handle = HashMap::from([
             (
                 "id".to_string(),
-                Value::Uuid(node_local_handle_id(
-                    vector.target_table,
-                    vector.target_id,
-                    vector.embedding_space_id,
-                    generation,
-                )),
+                Value::Uuid(vector.handle_id.unwrap_or_else(|| {
+                    node_local_handle_id(
+                        vector.target_table,
+                        vector.target_id,
+                        vector.embedding_space_id,
+                        generation,
+                    )
+                })),
             ),
             (
                 "target_table".to_string(),
@@ -262,6 +267,7 @@ impl Store {
                     vector,
                     produced_by,
                     producer_system: "",
+                    handle_id: None,
                 },
             ),
             PhysicalVector::InRow => {
