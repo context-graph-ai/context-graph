@@ -16,21 +16,17 @@
 use std::collections::{HashMap, HashSet};
 
 use chrono::Utc;
-use contextdb_core::{Value as DbValue, VectorIndexRef};
+use contextdb_core::Value as DbValue;
 use contextdb_engine::work_ledger::{
     self, InputRef, JobSpec, add_job_input_in_tx, job_state, job_state_counts, submit_job_in_tx,
 };
 use sha2::{Digest as _, Sha256};
 
-use crate::embedding_space::BuiltinSpaceRegistry;
 use crate::fabric::CaptureFault;
 use crate::ingest::split_transcript_into_windows;
 use crate::status_reads::{StatusReads, aggregate_u64};
 use crate::understanding::MAX_UNDERSTANDING_ATTEMPTS;
-use crate::{
-    CgError, Context, ContextId, CreateContext, DigestId, EmbeddingId, EvidenceProducer, Result,
-    Store,
-};
+use crate::{CgError, Context, ContextId, CreateContext, DigestId, Result, Store};
 
 pub use crate::status_reads::{ReadObservation, StatusReadObserver, UnobservedReads};
 
@@ -309,6 +305,7 @@ fn write_verbatim_digest(
     summary: &str,
 ) -> Result<()> {
     let vector = store.embed_digest_text(summary)?;
+    let physical = store.digest_text_placement()?;
     let db = store.internal_db();
     let row_id = db
         .insert_row(
@@ -323,7 +320,10 @@ fn write_verbatim_digest(
                 ),
                 ("summary".to_string(), DbValue::Text(summary.to_string())),
                 ("kind".to_string(), DbValue::Text(VERBATIM_KIND.to_string())),
-                ("vector_text".to_string(), DbValue::Vector(vector.clone())),
+                (
+                    "vector_text".to_string(),
+                    crate::store::Store::digest_row_vector(&physical, &vector),
+                ),
                 (
                     "dimension".to_string(),
                     DbValue::Int64(crate::schema::DIGEST_VECTOR_DIMENSION as i64),
@@ -340,40 +340,12 @@ fn write_verbatim_digest(
             ]),
         )
         .map_err(map_engine)?;
-    let embedding_id = EmbeddingId::new_v7();
-    db.execute_in_tx(
+    store.write_digest_text_vector(
         tx,
-        "INSERT INTO digest_embedding_handles (id, context_id, embedding_space_id, target_id, produced_by, producer_system, created_at) VALUES ($id, $context_id, $embedding_space_id, $target_id, $produced_by, $producer_system, $created_at)",
-        &HashMap::from([
-            ("id".to_string(), DbValue::Uuid(embedding_id.as_uuid())),
-            (
-                "context_id".to_string(),
-                DbValue::Uuid(context_id.as_uuid()),
-            ),
-            (
-                "embedding_space_id".to_string(),
-                DbValue::Text(BuiltinSpaceRegistry::TEXT_DEFAULT_ID.to_string()),
-            ),
-            ("target_id".to_string(), DbValue::Uuid(digest_id.as_uuid())),
-            (
-                "produced_by".to_string(),
-                DbValue::Json(
-                    serde_json::to_value(EvidenceProducer::default())
-                        .map_err(|err| CgError::Engine(format!("producer serialize: {err}")))?,
-                ),
-            ),
-            ("producer_system".to_string(), DbValue::Text(String::new())),
-            ("created_at".to_string(), DbValue::TxId(tx)),
-        ]),
-    )
-    .map_err(map_engine)?;
-    db.insert_vector(
-        tx,
-        VectorIndexRef::new("digests", "vector_text"),
-        row_id,
+        &physical,
+        (digest_id.as_uuid(), context_id, row_id),
         vector,
-    )
-    .map_err(map_engine)?;
+    )?;
     Ok(())
 }
 

@@ -35,6 +35,7 @@ pub(crate) mod relationship;
 pub mod signatures;
 pub(crate) mod source_prefix;
 mod subscriptions;
+pub(crate) mod vector_placement;
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};

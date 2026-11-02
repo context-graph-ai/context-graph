@@ -26,6 +26,7 @@ use super::evidence::{
 };
 use super::graph_rows::GraphRows;
 use super::impact_analysis::decision_invalidation_context;
+use super::vector_placement::{NodeLocalVector, PhysicalVector, physical_vector};
 use super::{evidence_kind_str, retention_status_str};
 
 const ENTITY_REFERENCE_MATCH_THRESHOLD: f32 = 0.8;
@@ -152,7 +153,33 @@ impl Store {
             }
             for route in &embedding_routes {
                 if let EmbeddingTarget::Evidence(id) = route.target {
-                    if let Err(err) = self.insert_embedding_handle_in_tx(tx, route) {
+                    if let PhysicalVector::NodeLocal { table } = &route.physical {
+                        let rebuildable = input.evidence.iter().any(|evidence| {
+                            evidence.id == id
+                                && evidence
+                                    .text_projection
+                                    .as_deref()
+                                    .is_some_and(|text| !text.trim().is_empty())
+                        });
+                        if let Err(err) = self.write_node_local_vector(
+                            tx,
+                            NodeLocalVector {
+                                table,
+                                target_table: "evidence",
+                                target_id: id.as_uuid(),
+                                embedding_space_id: &route.embedding_space_id,
+                                context_id: route.context_id,
+                                source_created_at: tx,
+                                rebuildable,
+                                vector: route.vector.clone(),
+                                produced_by: producer_value(&route.produced_by),
+                                producer_system: &route.produced_by.system,
+                            },
+                        ) {
+                            let _ = self.db.rollback(tx);
+                            return Err(err);
+                        }
+                    } else if let Err(err) = self.insert_embedding_handle_in_tx(tx, route) {
                         let _ = self.db.rollback(tx);
                         return Err(self.map_embedding_route_engine_err(err, route));
                     }
@@ -193,6 +220,44 @@ impl Store {
                             return Err(self.map_embedding_route_engine_err(err, route));
                         }
                         if let Err(err) = self.insert_embedding_vector_in_tx(tx, route, row_id) {
+                            let _ = self.db.rollback(tx);
+                            return Err(err);
+                        }
+                    }
+                    EmbeddingTarget::Digest(id)
+                        if matches!(route.physical, PhysicalVector::NodeLocal { .. }) =>
+                    {
+                        let PhysicalVector::NodeLocal { table } = &route.physical else {
+                            unreachable!("matched node-local above");
+                        };
+                        let created_at = match self.digest_created_at(id) {
+                            Ok(Some(created_at)) => created_at,
+                            Ok(None) => {
+                                let _ = self.db.rollback(tx);
+                                return Err(CgError::EmbeddingTargetNotFound {
+                                    id: EvidenceId::default(),
+                                });
+                            }
+                            Err(err) => {
+                                let _ = self.db.rollback(tx);
+                                return Err(err);
+                            }
+                        };
+                        if let Err(err) = self.write_node_local_vector(
+                            tx,
+                            NodeLocalVector {
+                                table,
+                                target_table: "digests",
+                                target_id: id.as_uuid(),
+                                embedding_space_id: &route.embedding_space_id,
+                                context_id: route.context_id,
+                                source_created_at: created_at,
+                                rebuildable: true,
+                                vector: route.vector.clone(),
+                                produced_by: producer_value(&route.produced_by),
+                                producer_system: &route.produced_by.system,
+                            },
+                        ) {
                             let _ = self.db.rollback(tx);
                             return Err(err);
                         }
@@ -576,6 +641,7 @@ impl Store {
                     validate_space_kind(&space, evidence.kind)?;
                 }
                 let binding = vector_binding_for_target(&space, "evidence")?;
+                let physical = physical_vector(&space);
                 Ok(EmbeddingRoute {
                     id: embedding.id,
                     context_id: input.context_id,
@@ -585,6 +651,7 @@ impl Store {
                     produced_by: embedding.produced_by.clone(),
                     table_name: binding.table_name,
                     vector_column: binding.vector_column,
+                    physical,
                 })
             }
             EmbeddingTarget::EntityReference(_, _) => {
@@ -608,6 +675,7 @@ impl Store {
                         ENTITY_REFERENCE_EMBEDDING_TABLE_PREFIX, space.dimension
                     ),
                     vector_column: "vector".to_string(),
+                    physical: PhysicalVector::InRow,
                 })
             }
             EmbeddingTarget::Digest(_) => {
@@ -621,6 +689,7 @@ impl Store {
                 }
                 validate_space_kind(&space, EvidenceKind::Text)?;
                 let binding = vector_binding_for_target(&space, "digest")?;
+                let physical = physical_vector(&space);
                 Ok(EmbeddingRoute {
                     id: embedding.id,
                     context_id: input.context_id,
@@ -630,6 +699,7 @@ impl Store {
                     produced_by: embedding.produced_by.clone(),
                     table_name: binding.table_name,
                     vector_column: binding.vector_column,
+                    physical,
                 })
             }
             EmbeddingTarget::EventSearchPassage(passage_id) => {
@@ -1628,6 +1698,10 @@ fn evidence_vectors_for_insert(
         let EmbeddingTarget::Evidence(evidence_id) = route.target else {
             continue;
         };
+        // A node-local space's vector is never stored in the synced evidence row.
+        if matches!(route.physical, PhysicalVector::NodeLocal { .. }) {
+            continue;
+        }
         if route.table_name != "evidence" {
             return Err(CgError::Engine(format!(
                 "evidence embedding route points at unexpected table {}",
@@ -1659,6 +1733,8 @@ pub(super) struct EmbeddingRoute {
     pub produced_by: EvidenceProducer,
     pub table_name: String,
     pub vector_column: String,
+    /// Where the route's space stores this vector: in the source row, or node-locally.
+    pub physical: PhysicalVector,
 }
 
 #[derive(Debug, Clone, Copy)]

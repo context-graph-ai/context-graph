@@ -20,6 +20,7 @@ use super::evidence::{
 };
 use super::evidence_kind_str;
 use super::observation::state_delta_from_json;
+use super::vector_placement::{NodeLocalVector, PhysicalVector, physical_vector};
 
 impl Store {
     pub fn create_digest(&self, input: CreateDigest) -> Result<Digest> {
@@ -48,6 +49,7 @@ impl Store {
         }
         validate_space_kind(&space, input.kind)?;
         let binding = vector_binding_for_target(&space, "digest")?;
+        let physical = physical_vector(&space);
         let id = input.id;
         let properties_json = properties_to_json(&input.properties);
         let session_ref_value = match &input.session_ref {
@@ -92,7 +94,10 @@ impl Store {
             ),
             (
                 "vector_text".to_string(),
-                Value::Vector(input.embedding.vector.clone()),
+                match physical {
+                    PhysicalVector::InRow => Value::Vector(input.embedding.vector.clone()),
+                    PhysicalVector::NodeLocal { .. } => Value::Null,
+                },
             ),
             (
                 "dimension".to_string(),
@@ -114,48 +119,69 @@ impl Store {
                 return Err(map_engine_err(e));
             }
         };
-        let handle_params = HashMap::from([
-            ("id".to_string(), Value::Uuid(input.embedding.id.as_uuid())),
-            (
-                "context_id".to_string(),
-                Value::Uuid(input.context_id.as_uuid()),
-            ),
-            (
-                "embedding_space_id".to_string(),
-                Value::Text(input.embedding.embedding_space_id.clone()),
-            ),
-            (
-                "target_id".to_string(),
-                Value::Uuid(embedding_target_uuid(&input.embedding.target)),
-            ),
-            (
-                "produced_by".to_string(),
-                producer_value(&input.embedding.produced_by),
-            ),
-            (
-                "producer_system".to_string(),
-                Value::Text(input.embedding.produced_by.system.clone()),
-            ),
-            ("created_at".to_string(), Value::TxId(tx)),
-        ]);
-        if let Err(e) = self.db.execute_in_tx(
-            tx,
-            "INSERT INTO digest_embedding_handles (id, context_id, embedding_space_id, target_id, produced_by, producer_system, created_at) VALUES ($id, $context_id, $embedding_space_id, $target_id, $produced_by, $producer_system, $created_at)",
-            &handle_params,
-        ) {
-            let _ = self.db.rollback(tx);
-            return Err(map_engine_err(e));
+        if let PhysicalVector::NodeLocal { table } = &physical {
+            if let Err(error) = self.write_node_local_vector(
+                tx,
+                NodeLocalVector {
+                    table,
+                    target_table: "digests",
+                    target_id: id.as_uuid(),
+                    embedding_space_id: &input.embedding.embedding_space_id,
+                    context_id: input.context_id,
+                    source_created_at: tx,
+                    rebuildable: true,
+                    vector: input.embedding.vector.clone(),
+                    produced_by: producer_value(&input.embedding.produced_by),
+                    producer_system: &input.embedding.produced_by.system,
+                },
+            ) {
+                let _ = self.db.rollback(tx);
+                return Err(error);
+            }
+        } else {
+            let handle_params = HashMap::from([
+                ("id".to_string(), Value::Uuid(input.embedding.id.as_uuid())),
+                (
+                    "context_id".to_string(),
+                    Value::Uuid(input.context_id.as_uuid()),
+                ),
+                (
+                    "embedding_space_id".to_string(),
+                    Value::Text(input.embedding.embedding_space_id.clone()),
+                ),
+                (
+                    "target_id".to_string(),
+                    Value::Uuid(embedding_target_uuid(&input.embedding.target)),
+                ),
+                (
+                    "produced_by".to_string(),
+                    producer_value(&input.embedding.produced_by),
+                ),
+                (
+                    "producer_system".to_string(),
+                    Value::Text(input.embedding.produced_by.system.clone()),
+                ),
+                ("created_at".to_string(), Value::TxId(tx)),
+            ]);
+            if let Err(e) = self.db.execute_in_tx(
+                tx,
+                "INSERT INTO digest_embedding_handles (id, context_id, embedding_space_id, target_id, produced_by, producer_system, created_at) VALUES ($id, $context_id, $embedding_space_id, $target_id, $produced_by, $producer_system, $created_at)",
+                &handle_params,
+            ) {
+                let _ = self.db.rollback(tx);
+                return Err(map_engine_err(e));
+            }
+            if let Err(e) = self.db.insert_vector(
+                tx,
+                VectorIndexRef::new(&binding.table_name, &binding.vector_column),
+                row_id,
+                input.embedding.vector.clone(),
+            ) {
+                let _ = self.db.rollback(tx);
+                return Err(map_engine_err(e));
+            }
+            // context_id scoping covers provenance; no audit_log row is written here.
         }
-        if let Err(e) = self.db.insert_vector(
-            tx,
-            VectorIndexRef::new(&binding.table_name, &binding.vector_column),
-            row_id,
-            input.embedding.vector.clone(),
-        ) {
-            let _ = self.db.rollback(tx);
-            return Err(map_engine_err(e));
-        }
-        // context_id scoping covers provenance; no audit_log row is written here.
         self.db.commit(tx).map_err(map_engine_err)?;
 
         Ok(Digest {
@@ -187,7 +213,19 @@ impl Store {
         if result.rows().is_empty() {
             return Ok(None);
         }
-        Ok(Some(decode_digest(result.columns(), &result.rows()[0])?))
+        let mut digest = decode_digest(result.columns(), &result.rows()[0])?;
+        if digest.vector_text.is_none()
+            && let Some(space) = self.space_bound_to("digests", "vector_text")?
+            && let PhysicalVector::NodeLocal { table } = physical_vector(&space)
+        {
+            digest.vector_text = self.read_node_local_vector(
+                &table,
+                "digests",
+                id.as_uuid(),
+                &space.embedding_space_id,
+            )?;
+        }
+        Ok(Some(digest))
     }
 
     pub(crate) fn digest_source_ids_for_context(
@@ -255,7 +293,31 @@ impl Store {
             params.insert("created_before".to_string(), Value::TxId(end));
             where_parts.push("created_at <= $created_before".to_string());
         }
-        let mut sql = "SELECT id, context_id, summary, created_at, score FROM digests".to_string();
+        let node_local = match self.space_bound_to("digests", "vector_text")? {
+            Some(space) => match physical_vector(&space) {
+                PhysicalVector::NodeLocal { table } => Some((table, space.embedding_space_id)),
+                PhysicalVector::InRow => None,
+            },
+            None => None,
+        };
+        let mut sql = if let Some((table, space_id)) = &node_local {
+            params.insert("space".to_string(), Value::Text(space_id.clone()));
+            params.insert(
+                "generation".to_string(),
+                Value::Int64(self.node_local_generation(space_id)?),
+            );
+            for part in &mut where_parts {
+                *part = part.replace("created_at", "source_created_at");
+            }
+            where_parts.insert(
+                0,
+                "target_table = 'digests' AND embedding_space_id = $space AND model_generation = $generation"
+                    .to_string(),
+            );
+            format!("SELECT target_id, context_id, source_created_at, score FROM {table}")
+        } else {
+            "SELECT id, context_id, summary, created_at, score FROM digests".to_string()
+        };
         if !where_parts.is_empty() {
             sql.push_str(" WHERE ");
             sql.push_str(&where_parts.join(" AND "));
@@ -266,8 +328,18 @@ impl Store {
         let result = self.read_query(&sql, &params)?;
         let vector_trace = format!("{:?}", result.trace());
         let mut candidates = Vec::new();
+        let id_column = if node_local.is_some() {
+            "target_id"
+        } else {
+            "id"
+        };
+        let created_column = if node_local.is_some() {
+            "source_created_at"
+        } else {
+            "created_at"
+        };
         for row in result.rows() {
-            let digest_id = DigestId::from(value_uuid(row, result.columns(), "id")?);
+            let digest_id = DigestId::from(value_uuid(row, result.columns(), id_column)?);
             let context_id = ContextId::from(value_uuid(row, result.columns(), "context_id")?);
             let similarity = value_score(row, result.columns(), "score")?;
             if similarity <= 0.0 {
@@ -279,8 +351,12 @@ impl Store {
             {
                 continue;
             }
-            let summary = value_text(row, result.columns(), "summary")?;
-            let created_at = value_txid(row, result.columns(), "created_at")?;
+            let summary = if node_local.is_some() {
+                self.digest_summary(digest_id)?
+            } else {
+                value_text(row, result.columns(), "summary")?
+            };
+            let created_at = value_txid(row, result.columns(), created_column)?;
             candidates.push(DigestCandidate {
                 digest_id,
                 context_id,
@@ -478,6 +554,33 @@ impl Store {
                 .vector);
         }
         Err(CgError::TextEmbedderDisabled)
+    }
+
+    /// One digest's commit identity, if it exists.
+    pub(crate) fn digest_created_at(&self, id: DigestId) -> Result<Option<TxId>> {
+        let result = self.read_query(
+            "SELECT created_at FROM digests WHERE id = $id",
+            &HashMap::from([("id".to_string(), Value::Uuid(id.as_uuid()))]),
+        )?;
+        Ok(match result.rows().first().and_then(|row| row.first()) {
+            Some(Value::TxId(created_at)) => Some(*created_at),
+            _ => None,
+        })
+    }
+
+    /// One digest's summary, read only for a search hit.
+    fn digest_summary(&self, id: DigestId) -> Result<String> {
+        let result = self.read_query(
+            "SELECT summary FROM digests WHERE id = $id",
+            &HashMap::from([("id".to_string(), Value::Uuid(id.as_uuid()))]),
+        )?;
+        match result.rows().first().and_then(|row| row.first()) {
+            Some(Value::Text(summary)) => Ok(summary.clone()),
+            _ => Err(CgError::NotFound {
+                id: Some(id.to_string()),
+                missing: Some("digest"),
+            }),
+        }
     }
 
     fn digest_query_vector(&self, query: &str) -> Result<Vec<f32>> {

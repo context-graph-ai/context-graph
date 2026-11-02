@@ -9,6 +9,9 @@ use crate::{CgError, ContextId, EmbeddingId, EvidenceKind, EvidenceProducer, Res
 
 use super::convert::map_engine_err;
 use super::evidence::producer_value;
+use super::vector_placement::{
+    NODE_LOCAL_HANDLE_TABLE, NodeLocalVector, PhysicalVector, physical_vector,
+};
 use super::{Store, evidence_kind_from_str};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -346,6 +349,56 @@ impl Store {
     )]
     fn commit_reindexed_candidate(&self, commit: ReindexCommit<'_>) -> Result<()> {
         let tx = self.db.begin().map_err(map_engine_err)?;
+        if let Some((table, rebuildable)) = &commit.candidate.node_local {
+            let written = self.write_node_local_vector(
+                tx,
+                NodeLocalVector {
+                    table,
+                    target_table: &commit.candidate.table_name,
+                    target_id: commit.candidate.target_id,
+                    embedding_space_id: commit.embedding_space_id,
+                    context_id: commit.candidate.context_id,
+                    source_created_at: commit.candidate.created_at,
+                    rebuildable: *rebuildable,
+                    vector: commit.vector,
+                    produced_by: producer_value(commit.producer),
+                    producer_system: &commit.producer.system,
+                },
+            );
+            let advanced = written.and_then(|()| {
+                self.db
+                    .execute_in_tx(
+                        tx,
+                        "UPDATE reindex_cursors SET status = $status, last_committed_cursor = $cursor, from_producer = $from_producer, to_producer = $to_producer, last_advanced_at = $advanced_at WHERE embedding_space_id = $space",
+                        &HashMap::from([
+                            (
+                                "space".to_string(),
+                                Value::Text(commit.embedding_space_id.to_string()),
+                            ),
+                            (
+                                "status".to_string(),
+                                Value::Text(commit.status.as_str().to_string()),
+                            ),
+                            (
+                                "cursor".to_string(),
+                                Value::Int64(commit.committed_cursor as i64),
+                            ),
+                            (
+                                "from_producer".to_string(),
+                                producer_value(commit.from_producer),
+                            ),
+                            ("to_producer".to_string(), producer_value(commit.to_producer)),
+                            ("advanced_at".to_string(), Value::TxId(tx)),
+                        ]),
+                    )
+                    .map_err(map_engine_err)
+            });
+            if let Err(err) = advanced {
+                let _ = self.db.rollback(tx);
+                return Err(err);
+            }
+            return self.db.commit(tx).map_err(map_engine_err);
+        }
         let handle_id = EmbeddingId::new_v7();
         let handle_params = HashMap::from([
             ("id".to_string(), Value::Uuid(handle_id.as_uuid())),
@@ -500,7 +553,15 @@ impl Store {
         }
         let snapshot = self.db.snapshot();
         let mut candidates = Vec::new();
-        if bindings.iter().any(|(table, _)| table == "evidence") {
+        if let PhysicalVector::NodeLocal { table } = physical_vector(&space) {
+            candidates.extend(self.reindex_node_local_candidates(
+                embedding_space_id,
+                &table,
+                started_at,
+                snapshot,
+                &bindings,
+            )?);
+        } else if bindings.iter().any(|(table, _)| table == "evidence") {
             candidates.extend(self.reindex_evidence_candidates(
                 embedding_space_id,
                 started_at,
@@ -609,6 +670,140 @@ impl Store {
                 input,
                 produced_by: required_producer(handle.values.get("produced_by"), "produced_by")?,
                 created_at,
+                node_local: None,
+            });
+        }
+        Ok(candidates)
+    }
+
+    /// A node-local space's candidates are this node's stored vectors for the space. They are keyed
+    /// by when their source item was created, which a rebuild never changes, so a paused reindex
+    /// resumes over the same ordered list however many vectors it has already replaced.
+    fn reindex_node_local_candidates(
+        &self,
+        embedding_space_id: &str,
+        table: &str,
+        started_at: TxId,
+        snapshot: contextdb_core::SnapshotId,
+        bindings: &HashSet<(String, String)>,
+    ) -> Result<Vec<ReindexCandidate>> {
+        let mut producers = HashMap::<(String, uuid::Uuid), EvidenceProducer>::new();
+        for handle in self
+            .db
+            .scan(NODE_LOCAL_HANDLE_TABLE, snapshot)
+            .map_err(map_engine_err)?
+        {
+            if handle.values.get("embedding_space_id").and_then(value_str)
+                != Some(embedding_space_id)
+            {
+                continue;
+            }
+            let (Some(target_table), Some(target_id)) = (
+                handle.values.get("target_table").and_then(value_str),
+                handle.values.get("target_id").and_then(value_uuid),
+            ) else {
+                continue;
+            };
+            producers.insert(
+                (target_table.to_string(), target_id),
+                required_producer(handle.values.get("produced_by"), "produced_by")?,
+            );
+        }
+        let mut sources = HashMap::<(String, uuid::Uuid), VersionedRow>::new();
+        for source_table in ["digests", "evidence"] {
+            if !bindings.iter().any(|(table, _)| table == source_table) {
+                continue;
+            }
+            for row in self
+                .db
+                .scan(source_table, snapshot)
+                .map_err(map_engine_err)?
+            {
+                if let Some(id) = row.values.get("id").and_then(value_uuid) {
+                    sources.insert((source_table.to_string(), id), row);
+                }
+            }
+        }
+        let mut candidates = Vec::new();
+        for vector in self.db.scan(table, snapshot).map_err(map_engine_err)? {
+            if vector.values.get("embedding_space_id").and_then(value_str)
+                != Some(embedding_space_id)
+            {
+                continue;
+            }
+            let Some(created_at) = vector
+                .values
+                .get("source_created_at")
+                .and_then(value_txid_raw)
+            else {
+                continue;
+            };
+            if created_at > started_at {
+                continue;
+            }
+            let (Some(target_table), Some(target_id)) = (
+                vector.values.get("target_table").and_then(value_str),
+                vector.values.get("target_id").and_then(value_uuid),
+            ) else {
+                continue;
+            };
+            let key = (target_table.to_string(), target_id);
+            let (Some(source), Some(produced_by)) = (sources.get(&key), producers.get(&key)) else {
+                continue;
+            };
+            let (kind, vector_column, input) = if target_table == "digests" {
+                let text = source
+                    .values
+                    .get("summary")
+                    .and_then(value_str)
+                    .unwrap_or_default()
+                    .to_string();
+                (
+                    EvidenceKind::Text,
+                    "vector_text".to_string(),
+                    EmbeddingInput::Text(text),
+                )
+            } else {
+                let kind = source
+                    .values
+                    .get("kind")
+                    .and_then(value_str)
+                    .map(evidence_kind_from_str)
+                    .transpose()?
+                    .unwrap_or(EvidenceKind::Text);
+                let column = match kind {
+                    EvidenceKind::ImageFrame => "vector_vision",
+                    _ => "vector_text",
+                };
+                (
+                    kind,
+                    column.to_string(),
+                    embedding_input_for_evidence(kind, source)?,
+                )
+            };
+            if !bindings.contains(&(target_table.to_string(), vector_column.clone())) {
+                continue;
+            }
+            let rebuildable = matches!(vector.values.get("rebuildable"), Some(Value::Bool(true)));
+            candidates.push(ReindexCandidate {
+                handle_table: NODE_LOCAL_HANDLE_TABLE,
+                table_name: target_table.to_string(),
+                vector_column,
+                row_id: vector.row_id,
+                target_id,
+                context_id: ContextId::from(
+                    vector.values.get("context_id").and_then(value_uuid).ok_or(
+                        CgError::NotFound {
+                            id: Some(target_id.to_string()),
+                            missing: Some("context_id"),
+                        },
+                    )?,
+                ),
+                kind,
+                input,
+                produced_by: produced_by.clone(),
+                created_at,
+                node_local: Some((table.to_string(), rebuildable)),
             });
         }
         Ok(candidates)
@@ -696,6 +891,7 @@ impl Store {
                 input: EmbeddingInput::Text(text),
                 produced_by: required_producer(handle.values.get("produced_by"), "produced_by")?,
                 created_at,
+                node_local: None,
             });
         }
         Ok(candidates)
@@ -732,6 +928,9 @@ struct ReindexCandidate {
     input: EmbeddingInput,
     produced_by: EvidenceProducer,
     created_at: TxId,
+    /// The node-local vector table this candidate is rebuilt into, and whether its source text can
+    /// rebuild it; `None` for a vector stored in its source row.
+    node_local: Option<(String, bool)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

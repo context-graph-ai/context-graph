@@ -95,8 +95,8 @@ fn writer() -> Written {
     }
 }
 
-/// Reads one row's identifier and vector through a read-only session on the closed store.
-fn read_vector_after_close(path: &Path, table: &str, column: &str, id: uuid::Uuid) -> Vec<f32> {
+/// One row read through a read-only session on the closed store.
+fn read_row_after_close(path: &Path, sql: &str, id: uuid::Uuid, label: &str) -> Vec<Value> {
     // context-graph's own read options, with allowances wide enough that only the stored rows decide
     // the outcome of this proof.
     let mut options = context_graph_read_session_options();
@@ -106,18 +106,48 @@ fn read_vector_after_close(path: &Path, table: &str, column: &str, id: uuid::Uui
     let session = ReadSession::open_with_options(path, options)
         .expect("a read-only session on the closed store");
     let answer = session
-        .execute(
-            &format!("SELECT id, {column} FROM {table} WHERE id = $id"),
-            &HashMap::from([("id".to_string(), Value::Uuid(id))]),
-        )
-        .unwrap_or_else(|error| panic!("{table}.{column} must read after close: {error}"));
-    assert_eq!(answer.rows().len(), 1, "{table} keeps the row it committed");
+        .execute(sql, &HashMap::from([("id".to_string(), Value::Uuid(id))]))
+        .unwrap_or_else(|error| panic!("{label} must read after close: {error}"));
+    assert_eq!(answer.rows().len(), 1, "{label} keeps the row it committed");
     assert_eq!(answer.rows()[0][0], Value::Uuid(id));
-    let Value::Vector(vector) = &answer.rows()[0][1] else {
-        panic!(
-            "{table}.{column} must hold a vector, found {:?}",
-            answer.rows()[0][1]
+    answer.rows()[0].clone()
+}
+
+/// Reads one item's vector through a read-only session on the closed store, from where its space's
+/// placement stores it. The built-in text space is node-local: its vectors live in this node's own
+/// table, keyed by the source table and item, and the source row holds no copy of them.
+fn read_vector_after_close(path: &Path, table: &str, column: &str, id: uuid::Uuid) -> Vec<f32> {
+    let label = format!("{table}.{column}");
+    let row = if column == "vector_text" && matches!(table, "digests" | "evidence") {
+        let source = read_row_after_close(
+            path,
+            &format!("SELECT id, {column} FROM {table} WHERE id = $id"),
+            id,
+            &label,
         );
+        assert_eq!(
+            source[1],
+            Value::Null,
+            "{label} holds no copy of a node-local vector, so it is never stored twice"
+        );
+        read_row_after_close(
+            path,
+            &format!(
+                "SELECT target_id, vector_text FROM reproducible_vectors_768 WHERE target_table = '{table}' AND target_id = $id"
+            ),
+            id,
+            &label,
+        )
+    } else {
+        read_row_after_close(
+            path,
+            &format!("SELECT id, {column} FROM {table} WHERE id = $id"),
+            id,
+            &label,
+        )
+    };
+    let Value::Vector(vector) = &row[1] else {
+        panic!("{label} must hold a vector, found {:?}", row[1]);
     };
     vector.clone()
 }

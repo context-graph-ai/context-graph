@@ -1,5 +1,5 @@
 use chrono::Utc;
-use contextdb_core::{Value as DbValue, VectorIndexRef};
+use contextdb_core::Value as DbValue;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value as JsonValue, json};
 use std::cell::RefCell;
@@ -3326,8 +3326,8 @@ impl<'a> CaptureTxn<'a> {
         vector_text: &str,
     ) -> Result<crate::Digest> {
         let id = DigestId::new_v7();
-        let embedding_id = EmbeddingId::new_v7();
         let vector = self.store.embed_digest_text(vector_text)?;
+        let physical = self.store.digest_text_placement()?;
         let row_id = self
             .store
             .internal_db()
@@ -3346,7 +3346,10 @@ impl<'a> CaptureTxn<'a> {
                     ),
                     ("summary".to_string(), DbValue::Text(summary.to_string())),
                     ("kind".to_string(), DbValue::Text("text".to_string())),
-                    ("vector_text".to_string(), DbValue::Vector(vector.clone())),
+                    (
+                        "vector_text".to_string(),
+                        crate::store::Store::digest_row_vector(&physical, &vector),
+                    ),
                     (
                         "dimension".to_string(),
                         DbValue::Int64(crate::schema::DIGEST_VECTOR_DIMENSION as i64),
@@ -3360,38 +3363,12 @@ impl<'a> CaptureTxn<'a> {
                 ]),
             )
             .map_err(map_engine)?;
-        self.execute(
-            "INSERT INTO digest_embedding_handles (id, context_id, embedding_space_id, target_id, produced_by, producer_system, created_at) VALUES ($id, $context_id, $embedding_space_id, $target_id, $produced_by, $producer_system, $created_at)",
-            HashMap::from([
-                ("id".to_string(), DbValue::Uuid(embedding_id.as_uuid())),
-                (
-                    "context_id".to_string(),
-                    DbValue::Uuid(context_id.as_uuid()),
-                ),
-                (
-                    "embedding_space_id".to_string(),
-                    DbValue::Text(BuiltinSpaceRegistry::TEXT_DEFAULT_ID.to_string()),
-                ),
-                ("target_id".to_string(), DbValue::Uuid(id.as_uuid())),
-                (
-                    "produced_by".to_string(),
-                    DbValue::Json(serde_json::to_value(EvidenceProducer::default()).map_err(
-                        |err| CgError::Engine(format!("producer serialize: {err}")),
-                    )?),
-                ),
-                ("producer_system".to_string(), DbValue::Text(String::new())),
-                ("created_at".to_string(), DbValue::TxId(self.tx)),
-            ]),
+        self.store.write_digest_text_vector(
+            self.tx,
+            &physical,
+            (id.as_uuid(), context_id, row_id),
+            vector.clone(),
         )?;
-        self.store
-            .internal_db()
-            .insert_vector(
-                self.tx,
-                VectorIndexRef::new("digests", "vector_text"),
-                row_id,
-                vector.clone(),
-            )
-            .map_err(map_engine)?;
         Ok(crate::Digest {
             id,
             source: "claude-cli".to_string(),
