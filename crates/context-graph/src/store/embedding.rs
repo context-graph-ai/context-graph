@@ -10,6 +10,9 @@ use crate::{
 use super::convert::map_engine_err;
 use super::encode::{column_index, get_json, get_txid, get_uuid, tags_from_json};
 use super::evidence::vector_binding_for_target;
+use super::vector_placement::{
+    NODE_LOCAL_VECTOR_COLUMN, PhysicalVector, node_local_vector_table, physical_vector,
+};
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct VectorSearchFilters {
@@ -128,6 +131,62 @@ pub fn vector_search(
     let mut hits = Vec::new();
     for binding in &space.bindings {
         if !matches!(binding.table_name.as_str(), "evidence" | "digests") {
+            continue;
+        }
+        if let Some(node_table) = space.node_local_table.clone() {
+            // A node-local space searches this node's own vector table, scoped by the source table,
+            // the space and its model generation, so a Context scope reaches one partition.
+            let generation = store.node_local_generation(embedding_space_id)?;
+            let scope = NodeLocalScope {
+                table: &node_table,
+                target_table: &binding.table_name,
+                embedding_space_id: embedding_space_id,
+                generation,
+            };
+            let (candidate_count_before_filter, candidate_count_after_filter) =
+                if filters.include_planner_trace {
+                    node_local_candidate_counts(store, &scope, allowed_contexts.as_deref())?
+                } else if allowed_contexts
+                    .as_ref()
+                    .is_some_and(|contexts| contexts.is_empty())
+                {
+                    (0, 0)
+                } else {
+                    (0, 1)
+                };
+            if filters.include_planner_trace && candidate_count_after_filter == 0 {
+                continue;
+            }
+            let searched = execute_node_local_vector_queries(
+                store,
+                &scope,
+                query_vector,
+                allowed_contexts.as_deref(),
+                limit,
+                filters.include_planner_trace,
+            )?;
+            for row in searched {
+                let values = &row.values;
+                let Some(target) = target_for_row(&binding.table_name, values) else {
+                    continue;
+                };
+                let context_id = row_context_id(values.get("context_id"));
+                hits.push(VectorSearchResult {
+                    embedding_space_id: embedding_space_id.to_string(),
+                    target,
+                    context_id,
+                    score: row.score,
+                    per_clause_scores: Vec::new(),
+                    // A hit names the binding it answers for, wherever this node stores the vector.
+                    index_ref: format!("{}.{}", binding.table_name, binding.vector_column),
+                    planner_trace: row.planner_trace,
+                    projected_context_labels: context_id
+                        .and_then(|id| context_labels.get(&id).cloned())
+                        .unwrap_or_default(),
+                    candidate_count_before_filter,
+                    candidate_count_after_filter,
+                });
+            }
             continue;
         }
         let Some(handle_table) = handle_table_for_vector_table(&binding.table_name) else {
@@ -280,6 +339,69 @@ fn vector_search_with_count_mode(
         if !matches!(binding.table_name.as_str(), "evidence" | "digests") {
             continue;
         }
+        if let Some(node_table) = match physical_vector(&space) {
+            PhysicalVector::NodeLocal { table } => Some(table),
+            PhysicalVector::InRow => None,
+        } {
+            // A node-local space searches this node's own vector table, scoped by the source table,
+            // the space and its model generation, so a Context scope reaches one partition.
+            let generation = store.node_local_generation(embedding_space_id)?;
+            let scope = NodeLocalScope {
+                table: &node_table,
+                target_table: &binding.table_name,
+                embedding_space_id: embedding_space_id,
+                generation,
+            };
+            let (candidate_count_before_filter, candidate_count_after_filter) = if filters
+                .include_planner_trace
+                && (candidate_count_mode == CandidateCountMode::Full
+                    || (candidate_count_mode == CandidateCountMode::SkipEmptyAdditionalBindings
+                        && binding.table_name != "evidence"))
+            {
+                node_local_candidate_counts(store, &scope, allowed_contexts.as_deref())?
+            } else if allowed_contexts
+                .as_ref()
+                .is_some_and(|contexts| contexts.is_empty())
+            {
+                (0, 0)
+            } else {
+                (0, 1)
+            };
+            if filters.include_planner_trace && candidate_count_after_filter == 0 {
+                continue;
+            }
+            let searched = execute_node_local_vector_queries(
+                store,
+                &scope,
+                query_vector,
+                allowed_contexts.as_deref(),
+                limit,
+                filters.include_planner_trace,
+            )?;
+            for row in searched {
+                let values = &row.values;
+                let Some(target) = target_for_row(&binding.table_name, values) else {
+                    continue;
+                };
+                let context_id = row_context_id(values.get("context_id"));
+                hits.push(VectorSearchResult {
+                    embedding_space_id: embedding_space_id.to_string(),
+                    target,
+                    context_id,
+                    score: row.score,
+                    per_clause_scores: Vec::new(),
+                    // A hit names the binding it answers for, wherever this node stores the vector.
+                    index_ref: format!("{}.{}", binding.table_name, binding.vector_column),
+                    planner_trace: row.planner_trace,
+                    projected_context_labels: context_id
+                        .and_then(|id| context_labels.get(&id).cloned())
+                        .unwrap_or_default(),
+                    candidate_count_before_filter,
+                    candidate_count_after_filter,
+                });
+            }
+            continue;
+        }
         let Some(handle_table) = handle_table_for_vector_table(&binding.table_name) else {
             continue;
         };
@@ -396,7 +518,22 @@ pub fn evidence_search(
             })?;
     let binding = vector_binding_for_target(&space, "evidence")?;
 
-    if evidence_has_persisted_vector(store, evidence.id, &space_id, &binding.vector_column)? {
+    if let PhysicalVector::NodeLocal { table } = physical_vector(&space) {
+        // A node-local stored vector is read from this node's table and searched with as given.
+        if let Some(stored) =
+            store.read_node_local_vector(&table, "evidence", evidence.id.as_uuid(), &space_id)?
+        {
+            return vector_search_with_count_mode(
+                store,
+                &stored,
+                &space_id,
+                filters,
+                CandidateCountMode::Skip,
+                Some("evidence"),
+            );
+        }
+    } else if evidence_has_persisted_vector(store, evidence.id, &space_id, &binding.vector_column)?
+    {
         return row_vector_search_from_evidence(
             store,
             evidence.id,
@@ -598,13 +735,46 @@ pub fn dedup_compare_digest_spaces(
             Value::Uuid(query_digest_id.as_uuid()),
         ),
     ]);
-    let result = store
-        .db
-        .execute(
-            "SELECT id, context_id, score FROM digests WHERE id = $candidate_id ORDER BY vector_text <=> ROW_VECTOR('digests','vector_text',$query_id) LIMIT 1",
-            &params,
-        )
-        .map_err(dedup_engine_err)?;
+    // A node-local space keeps digest vectors in this node's table, whose key is the source table and
+    // item, so the query digest's vector is read there and bound; a travelling space scores against
+    // the query digest's own row.
+    let space = store.embedding_space_for_write(query_space)?;
+    let (result, index_ref) = match super::vector_placement::physical_vector(&space) {
+        super::vector_placement::PhysicalVector::NodeLocal { table } => {
+            let Some(query_vector) = store.read_node_local_vector(
+                &table,
+                "digests",
+                query_digest_id.as_uuid(),
+                query_space,
+            )?
+            else {
+                return Ok(vec![]);
+            };
+            let mut params = params;
+            params.insert("query".to_string(), Value::Vector(query_vector));
+            params.insert("space".to_string(), Value::Text(query_space.to_string()));
+            let result = store
+                .db
+                .execute(
+                    &format!(
+                        "SELECT target_id, context_id, score FROM {table} WHERE target_table = 'digests' AND target_id = $candidate_id AND embedding_space_id = $space ORDER BY vector_text <=> $query LIMIT 1"
+                    ),
+                    &params,
+                )
+                .map_err(dedup_engine_err)?;
+            (result, "digests.vector_text".to_string())
+        }
+        super::vector_placement::PhysicalVector::InRow => {
+            let result = store
+                .db
+                .execute(
+                    "SELECT id, context_id, score FROM digests WHERE id = $candidate_id ORDER BY vector_text <=> ROW_VECTOR('digests','vector_text',$query_id) LIMIT 1",
+                    &params,
+                )
+                .map_err(dedup_engine_err)?;
+            (result, "digests.vector_text".to_string())
+        }
+    };
     let Some(row) = result.rows().first() else {
         return Ok(vec![]);
     };
@@ -624,7 +794,7 @@ pub fn dedup_compare_digest_spaces(
         context_id: Some(candidate_context),
         score,
         per_clause_scores: vec![],
-        index_ref: "digests.vector_text".to_string(),
+        index_ref,
         planner_trace: format!("{:?}", result.trace()),
         projected_context_labels: vec![],
         candidate_count_before_filter: 1,
@@ -661,24 +831,35 @@ fn dedup_refuse_cross_space(
 }
 
 fn latest_digest_embedding_space(store: &Store, digest_id: DigestId) -> Result<Option<String>> {
-    let result = store
-        .db
-        .execute(
-            "SELECT embedding_space_id FROM digest_embedding_handles WHERE target_id = $target_id ORDER BY created_at DESC LIMIT 1",
-            &HashMap::from([(
-                "target_id".to_string(),
-                Value::Uuid(digest_id.as_uuid()),
-            )]),
-        )
-        .map_err(dedup_engine_err)?;
-    let Some(row) = result.rows().first() else {
-        return Ok(None);
-    };
-    let space_index = column_index(result.columns(), "embedding_space_id")?;
-    Ok(match row.get(space_index) {
-        Some(Value::Text(space)) => Some(space.clone()),
-        _ => None,
-    })
+    // A digest's handle lives with its vector: in the per-row handle table for a travelling space,
+    // in this node's handle table for a node-local one. The latest across both names its space.
+    let mut latest: Option<(TxId, String)> = None;
+    for sql in [
+        "SELECT embedding_space_id, created_at FROM digest_embedding_handles WHERE target_id = $target_id ORDER BY created_at DESC LIMIT 1",
+        "SELECT embedding_space_id, created_at FROM reproducible_vector_handles WHERE target_table = 'digests' AND target_id = $target_id ORDER BY created_at DESC LIMIT 1",
+    ] {
+        let result = store
+            .db
+            .execute(
+                sql,
+                &HashMap::from([("target_id".to_string(), Value::Uuid(digest_id.as_uuid()))]),
+            )
+            .map_err(dedup_engine_err)?;
+        let Some(row) = result.rows().first() else {
+            continue;
+        };
+        let space_index = column_index(result.columns(), "embedding_space_id")?;
+        let created_index = column_index(result.columns(), "created_at")?;
+        if let (Some(Value::Text(space)), Some(Value::TxId(created_at))) =
+            (row.get(space_index), row.get(created_index))
+            && latest
+                .as_ref()
+                .is_none_or(|(latest_at, _)| created_at > latest_at)
+        {
+            latest = Some((*created_at, space.clone()));
+        }
+    }
+    Ok(latest.map(|(_, space)| space))
 }
 
 fn dedup_digest_space_has_vector_binding(store: &Store, id: &str) -> Result<bool> {
@@ -1380,6 +1561,151 @@ fn execute_ranked_row_vector_queries(
     Ok(rows)
 }
 
+/// One node-local search scope: this node's vector table, the source table searched, and the space
+/// under its current model generation.
+struct NodeLocalScope<'a> {
+    table: &'a str,
+    target_table: &'a str,
+    embedding_space_id: &'a str,
+    generation: i64,
+}
+
+fn node_local_params(scope: &NodeLocalScope<'_>) -> HashMap<String, Value> {
+    HashMap::from([
+        (
+            "target_table".to_string(),
+            Value::Text(scope.target_table.to_string()),
+        ),
+        (
+            "embedding_space_id".to_string(),
+            Value::Text(scope.embedding_space_id.to_string()),
+        ),
+        ("generation".to_string(), Value::Int64(scope.generation)),
+    ])
+}
+
+const NODE_LOCAL_SCOPE_SQL: &str = "target_table = $target_table AND embedding_space_id = $embedding_space_id AND model_generation = $generation";
+
+fn execute_node_local_vector_queries(
+    store: &Store,
+    scope: &NodeLocalScope<'_>,
+    query_vector: &[f32],
+    contexts: Option<&[ContextId]>,
+    limit: usize,
+    include_planner_trace: bool,
+) -> Result<Vec<RankedVectorRow>> {
+    let scopes = contexts.map_or_else(
+        || vec![VectorQueryScope::Unrestricted],
+        |contexts| {
+            contexts
+                .iter()
+                .copied()
+                .map(VectorQueryScope::Context)
+                .collect()
+        },
+    );
+    let mut rows = Vec::new();
+    for query_scope in scopes {
+        let mut params = node_local_params(scope);
+        params.insert("query".to_string(), Value::Vector(query_vector.to_vec()));
+        let context_clause = match query_scope {
+            VectorQueryScope::Unrestricted => "",
+            VectorQueryScope::Context(context) => {
+                params.insert("context_id".to_string(), Value::Uuid(context.as_uuid()));
+                " AND context_id = $context_id"
+            }
+        };
+        let sql = format!(
+            "SELECT target_id, context_id, score FROM {table} WHERE {NODE_LOCAL_SCOPE_SQL}{context_clause} ORDER BY {NODE_LOCAL_VECTOR_COLUMN} <=> $query LIMIT {limit}",
+            table = scope.table,
+        );
+        let result = store.db.execute(&sql, &params).map_err(map_engine_err)?;
+        let trace = if include_planner_trace {
+            format!("{:?}", result.trace())
+        } else {
+            String::new()
+        };
+        let target_column = column_index(result.columns(), "target_id")?;
+        let score_column = result.columns().iter().position(|column| column == "score");
+        for row in result.rows() {
+            let Some(Value::Uuid(target_id)) = row.get(target_column) else {
+                continue;
+            };
+            let mut values = row_values_by_column(result.columns(), row);
+            values.insert("id".to_string(), Value::Uuid(*target_id));
+            let score = score_column
+                .and_then(|column| row.get(column))
+                .and_then(|value| match value {
+                    Value::Float64(score) => Some(*score as f32),
+                    _ => None,
+                })
+                .unwrap_or(0.0);
+            rows.push(RankedVectorRow {
+                values,
+                score,
+                planner_trace: trace.clone(),
+            });
+        }
+        if matches!(query_scope, VectorQueryScope::Unrestricted) {
+            break;
+        }
+    }
+    rows.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    rows.truncate(limit);
+    Ok(rows)
+}
+
+fn count_node_local_rows(
+    store: &Store,
+    scope: &NodeLocalScope<'_>,
+    context: Option<ContextId>,
+) -> Result<usize> {
+    let mut params = node_local_params(scope);
+    let context_clause = match context {
+        Some(context) => {
+            params.insert("context_id".to_string(), Value::Uuid(context.as_uuid()));
+            " AND context_id = $context_id"
+        }
+        None => "",
+    };
+    let sql = format!(
+        "SELECT COUNT(*) AS n FROM {table} WHERE {NODE_LOCAL_SCOPE_SQL}{context_clause}",
+        table = scope.table,
+    );
+    let result = store.db.execute(&sql, &params).map_err(map_engine_err)?;
+    let Some(row) = result.rows().first() else {
+        return Ok(0);
+    };
+    let count_index = column_index(result.columns(), "n")?;
+    Ok(match row.get(count_index) {
+        Some(Value::Int64(value)) => *value as usize,
+        _ => 0,
+    })
+}
+
+fn node_local_candidate_counts(
+    store: &Store,
+    scope: &NodeLocalScope<'_>,
+    contexts: Option<&[ContextId]>,
+) -> Result<(usize, usize)> {
+    let before = count_node_local_rows(store, scope, None)?;
+    let after = match contexts {
+        Some(contexts) => {
+            let mut total = 0usize;
+            for context in contexts {
+                total += count_node_local_rows(store, scope, Some(*context))?;
+            }
+            total
+        }
+        None => before,
+    };
+    Ok((before, after))
+}
+
 fn handle_table_for_vector_table(table: &str) -> Option<&'static str> {
     match table {
         "evidence" => Some("evidence_embedding_handles"),
@@ -1637,9 +1963,16 @@ fn scanned_embedding_space(store: &Store, id: &str) -> Result<Option<SearchEmbed
             })
             .collect();
     }
+    let node_local_table = match row.values.get("placement") {
+        Some(Value::Text(stored)) => crate::VectorPlacement::from_stored(stored)
+            .filter(|placement| placement.locality == crate::VectorLocality::NodeLocal)
+            .map(|_| node_local_vector_table(dimension)),
+        _ => None,
+    };
     Ok(Some(SearchEmbeddingSpace {
         dimension,
         bindings,
+        node_local_table,
     }))
 }
 
@@ -1647,6 +1980,8 @@ fn scanned_embedding_space(store: &Store, id: &str) -> Result<Option<SearchEmbed
 struct SearchEmbeddingSpace {
     dimension: usize,
     bindings: Vec<SearchBinding>,
+    /// This node's vector table when the space is node-local; `None` when vectors travel in rows.
+    node_local_table: Option<String>,
 }
 
 #[derive(Debug, Clone)]
