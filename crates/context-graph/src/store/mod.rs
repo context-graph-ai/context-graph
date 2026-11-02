@@ -32,8 +32,10 @@ mod outcome;
 mod precedent_match;
 pub(crate) mod rebuild_queue;
 mod rebuild_turn;
+#[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
+pub use rebuild_turn::before_next_rebuild_commit_for_test;
 pub use rebuild_turn::{
-    REBUILD_PAGE_BYTES, REBUILD_PAGE_ROWS, REBUILD_REFUSED_TOO_LARGE,
+    REBUILD_PAGE_BYTES, REBUILD_PAGE_ROWS, REBUILD_REFUSED_NO_TEXT, REBUILD_REFUSED_TOO_LARGE,
     REBUILD_REFUSED_TOO_LARGE_TO_READ, RebuildQueueCounts, RebuildTurnOutcome,
 };
 mod reindex;

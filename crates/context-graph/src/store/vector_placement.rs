@@ -309,20 +309,6 @@ impl Store {
         }
     }
 
-    /// The space that owns one logical vector binding, if any.
-    pub(crate) fn space_bound_to(
-        &self,
-        table: &str,
-        column: &str,
-    ) -> Result<Option<EmbeddingSpace>> {
-        Ok(self.list_embedding_spaces()?.into_iter().find(|space| {
-            space
-                .bindings
-                .iter()
-                .any(|binding| binding.table_name == table && binding.vector_column == column)
-        }))
-    }
-
     /// The model generation a space is embedded under on this node, read outside a transaction.
     pub(crate) fn node_local_generation(&self, embedding_space_id: &str) -> Result<i64> {
         let result = self.read_query(

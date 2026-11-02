@@ -25,10 +25,30 @@ pub const REBUILD_PAGE_ROWS: usize = 32;
 pub const REBUILD_PAGE_BYTES: usize = 4 * 1024 * 1024;
 /// Why an item too large for the page bound is not rebuilt.
 pub const REBUILD_REFUSED_TOO_LARGE: &str = "the item's text exceeds the 4 MiB embedding admission";
+/// Why an item with no text is not rebuilt: there is nothing to embed.
+pub const REBUILD_REFUSED_NO_TEXT: &str = "the item has no text to embed";
+/// The source rows one generation reset reads per page while it re-queues them.
+const RESET_PAGE_ROWS: usize = 256;
 /// Why an item larger than one read page of this store is not rebuilt: its text cannot be read
 /// within the store's cursor page bound, so it cannot be embedded here.
 pub const REBUILD_REFUSED_TOO_LARGE_TO_READ: &str =
     "the item's text exceeds what one read page of this store can carry";
+
+#[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
+type RebuildHook = Box<dyn FnOnce(&Store)>;
+#[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
+thread_local! {
+    static BEFORE_REBUILD_COMMIT: std::cell::RefCell<Option<RebuildHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run one deterministic interleaving after the next rebuild page is embedded and before its
+/// transaction begins.
+#[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
+#[doc(hidden)]
+pub fn before_next_rebuild_commit_for_test(hook: impl FnOnce(&Store) + 'static) {
+    BEFORE_REBUILD_COMMIT.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
 
 /// What one rebuild turn did for one space.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -159,6 +179,10 @@ impl Store {
                     item.source_created_at = created_at;
                     item.refusal = REBUILD_REFUSED_TOO_LARGE_TO_READ;
                 }
+                RebuildSource::Text { text, created_at } if text.trim().is_empty() => {
+                    item.source_created_at = created_at;
+                    item.refusal = REBUILD_REFUSED_NO_TEXT;
+                }
                 RebuildSource::Text { text, created_at } => {
                     item.source_created_at = created_at;
                     if text.len() <= REBUILD_PAGE_BYTES {
@@ -193,6 +217,10 @@ impl Store {
                 });
             }
             vectors.push((item, output));
+        }
+        #[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
+        if let Some(hook) = BEFORE_REBUILD_COMMIT.with(|slot| slot.borrow_mut().take()) {
+            hook(self);
         }
         let tx = self.db.begin().map_err(map_engine_err)?;
         let committed = (|| -> Result<bool> {
@@ -240,6 +268,126 @@ impl Store {
             }
         }
         Ok(outcome)
+    }
+
+    /// Starts a new model generation for a node-local reproducible space and re-queues, under it,
+    /// every item the space binds that has text to embed. The bump commits first, so a rebuild page
+    /// embedded under the earlier generation can no longer publish; the re-queue then runs in
+    /// bounded keyset pages over each source table's key, and an item already queued is left as is.
+    pub(crate) fn reset_node_local_generation(&self, space: &crate::EmbeddingSpace) -> Result<i64> {
+        let space_id = space.embedding_space_id.as_str();
+        let tx = self.db.begin().map_err(map_engine_err)?;
+        let bumped = (|| -> Result<i64> {
+            let next = model_generation(&self.db, tx, space_id).map_err(map_engine_err)? + 1;
+            let updated = self
+                .db
+                .execute_in_tx(
+                    tx,
+                    "UPDATE reindex_cursors SET model_generation = $generation WHERE embedding_space_id = $space",
+                    &HashMap::from([
+                        ("space".to_string(), Value::Text(space_id.to_string())),
+                        ("generation".to_string(), Value::Int64(next)),
+                    ]),
+                )
+                .map_err(map_engine_err)?;
+            if updated.rows_affected() != 1 {
+                return Err(CgError::Engine(format!(
+                    "the model generation of {space_id} has no reindex cursor to advance"
+                )));
+            }
+            Ok(next)
+        })();
+        let generation = match bumped {
+            Ok(generation) => {
+                self.db.commit(tx).map_err(map_engine_err)?;
+                generation
+            }
+            Err(error) => {
+                let _ = self.db.rollback(tx);
+                return Err(error);
+            }
+        };
+        for binding in &space.bindings {
+            let (table, extra_columns) = match binding.table_name.as_str() {
+                "digests" => ("digests", ""),
+                "evidence" => ("evidence", ", kind"),
+                _ => continue,
+            };
+            let text_column = if table == "digests" {
+                "summary"
+            } else {
+                "text_projection"
+            };
+            let mut after: Option<uuid::Uuid> = None;
+            loop {
+                let mut params = HashMap::new();
+                let after_clause = match after {
+                    Some(after) => {
+                        params.insert("after".to_string(), Value::Uuid(after));
+                        " AND id > $after"
+                    }
+                    None => "",
+                };
+                let page = self.read_query(
+                    &format!(
+                        "SELECT id, context_id{extra_columns} FROM {table} WHERE {text_column} IS NOT NULL AND {text_column} != ''{after_clause} ORDER BY id LIMIT {RESET_PAGE_ROWS}"
+                    ),
+                    &params,
+                )?;
+                let Some(last) = page.rows().last().and_then(|row| match row.first() {
+                    Some(Value::Uuid(id)) => Some(*id),
+                    _ => None,
+                }) else {
+                    break;
+                };
+                let tx = self.db.begin().map_err(map_engine_err)?;
+                let queued = (|| -> Result<()> {
+                    for row in page.rows() {
+                        let (Some(Value::Uuid(target_id)), Some(Value::Uuid(context_id))) =
+                            (row.first(), row.get(1))
+                        else {
+                            continue;
+                        };
+                        if table == "evidence" {
+                            let kind = match row.get(2) {
+                                Some(Value::Text(kind)) => super::evidence_kind_from_str(kind).ok(),
+                                _ => None,
+                            };
+                            if !kind
+                                .is_some_and(|kind| space.supported_evidence_kinds.contains(&kind))
+                            {
+                                continue;
+                            }
+                        }
+                        super::rebuild_queue::enqueue(
+                            &self.db,
+                            tx,
+                            super::rebuild_queue::PendingItem {
+                                target_table: table,
+                                target_id: *target_id,
+                                context_id: *context_id,
+                                embedding_space_id: space_id,
+                                generation,
+                            },
+                        )
+                        .map_err(map_engine_err)?;
+                    }
+                    Ok(())
+                })();
+                match queued {
+                    Ok(()) => self.db.commit(tx).map_err(map_engine_err)?,
+                    Err(error) => {
+                        let _ = self.db.rollback(tx);
+                        return Err(error);
+                    }
+                }
+                after = Some(last);
+                if page.rows().len() < RESET_PAGE_ROWS {
+                    break;
+                }
+            }
+        }
+        Ok(generation)
     }
 
     /// The text an item is rebuilt from and when its source row was created. The text is read on

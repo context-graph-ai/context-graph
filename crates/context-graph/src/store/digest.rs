@@ -215,16 +215,29 @@ impl Store {
             return Ok(None);
         }
         let mut digest = decode_digest(result.columns(), &result.rows()[0])?;
-        if digest.vector_text.is_none()
-            && let Some(space) = self.space_bound_to("digests", "vector_text")?
-            && let PhysicalVector::NodeLocal { table } = physical_vector(&space)
-        {
-            digest.vector_text = self.read_node_local_vector(
-                &table,
-                "digests",
-                id.as_uuid(),
-                &space.embedding_space_id,
-            )?;
+        if digest.vector_text.is_none() {
+            // A digest embedded in a node-local space keeps its vector in this node's table; it may
+            // be any node-local space bound to digests.
+            for space in self.list_embedding_spaces()? {
+                let bound = space.bindings.iter().any(|binding| {
+                    binding.table_name == "digests" && binding.vector_column == "vector_text"
+                });
+                let PhysicalVector::NodeLocal { table } = physical_vector(&space) else {
+                    continue;
+                };
+                if !bound {
+                    continue;
+                }
+                if let Some(vector) = self.read_node_local_vector(
+                    &table,
+                    "digests",
+                    id.as_uuid(),
+                    &space.embedding_space_id,
+                )? {
+                    digest.vector_text = Some(vector);
+                    break;
+                }
+            }
         }
         Ok(Some(digest))
     }
@@ -294,12 +307,13 @@ impl Store {
             params.insert("created_before".to_string(), Value::TxId(end));
             where_parts.push("created_at <= $created_before".to_string());
         }
-        let node_local = match self.space_bound_to("digests", "vector_text")? {
-            Some(space) => match physical_vector(&space) {
-                PhysicalVector::NodeLocal { table } => Some((table, space.embedding_space_id)),
-                PhysicalVector::InRow => None,
-            },
-            None => None,
+        // The query is embedded with the built-in text space, so the search reads where that space
+        // keeps its digest vectors.
+        let node_local = match self.digest_text_placement()? {
+            PhysicalVector::NodeLocal { table } => {
+                Some((table, BuiltinSpaceRegistry::TEXT_DEFAULT_ID.to_string()))
+            }
+            PhysicalVector::InRow => None,
         };
         let mut sql = if let Some((table, space_id)) = &node_local {
             params.insert("space".to_string(), Value::Text(space_id.clone()));

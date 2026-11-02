@@ -72,8 +72,8 @@ pub use producer::CG_EDGE_SYSTEM_TAG;
 pub use store::{
     ConsumerSchema, ConsumerTable, DigestGraphWalkBoundary, DigestSearchFilter, DigestSearchHit,
     EntityMatch, EntityReferenceMatchOptions, REBUILD_PAGE_BYTES, REBUILD_PAGE_ROWS,
-    REBUILD_REFUSED_TOO_LARGE, REBUILD_REFUSED_TOO_LARGE_TO_READ, RebuildQueueCounts,
-    RebuildTurnOutcome, ReindexEvent, ReindexOptions, Store,
+    REBUILD_REFUSED_NO_TEXT, REBUILD_REFUSED_TOO_LARGE, REBUILD_REFUSED_TOO_LARGE_TO_READ,
+    RebuildQueueCounts, RebuildTurnOutcome, ReindexEvent, ReindexOptions, Store,
 };
 pub use store::{
     EventHistoryContextStatus, EventHistoryInterpretationHead, EventHistoryMemoryCounts,
@@ -118,6 +118,9 @@ pub mod test_support {
     };
     /// How many Stores the event-search runner has opened on the calling thread.
     pub use crate::store::event_search_store_opens_for_test;
+
+    /// One deterministic interleaving between a rebuild page's embedding and its commit.
+    pub use crate::store::before_next_rebuild_commit_for_test;
 
     /// Every statement the event-history reads issue on this thread, so a proof can assert what a
     /// `find`, a `status` or a projection pass COSTS in statements -- never how long it took.

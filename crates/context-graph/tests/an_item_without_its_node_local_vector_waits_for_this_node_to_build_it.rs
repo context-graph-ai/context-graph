@@ -452,3 +452,106 @@ fn a_space_without_its_model_here_is_unavailable_and_nothing_is_written_for_it()
     assert_eq!((turn.rebuilt, turn.refused), (0, 0));
     assert!(handles(&store).is_empty(), "nothing is written for it");
 }
+
+/// The model generation of each stored node-local text vector, by item.
+fn vector_generations(store: &Store) -> Vec<i64> {
+    store
+        .sync_database()
+        .execute(
+            "SELECT model_generation FROM reproducible_vectors_768 WHERE embedding_space_id = $space ORDER BY target_id",
+            &HashMap::from([("space".to_string(), Value::Text(TEXT_SPACE.to_string()))]),
+        )
+        .expect("the node table reads")
+        .rows()
+        .iter()
+        .map(|row| match row.first() {
+            Some(Value::Int64(generation)) => *generation,
+            other => panic!("a generation is an integer, found {other:?}"),
+        })
+        .collect()
+}
+
+#[cfg(context_graph_internal_test_support)]
+#[test]
+fn a_model_switch_starts_a_new_generation_and_a_page_embedded_under_the_old_one_cannot_publish() {
+    let node = node_with_its_model();
+    let earlier_model = EvidenceProducer {
+        model_version: "earlier".to_string(),
+        ..producer()
+    };
+    let written = DigestId::new_v7();
+    node.store
+        .create_digest(CreateDigest {
+            id: written,
+            source: "rebuild-generation".to_string(),
+            session_ref: None,
+            summary: "a digest embedded by the earlier model".to_string(),
+            kind: EvidenceKind::Text,
+            embedding: PrecomputedEmbedding {
+                id: EmbeddingId::new_v7(),
+                embedding_space_id: TEXT_SPACE.to_string(),
+                vector: axis(5),
+                target: EmbeddingTarget::Digest(written),
+                produced_by: earlier_model,
+            },
+            context_id: node.context_id,
+            properties: BTreeMap::new(),
+        })
+        .expect("a digest under the earlier model");
+    for index in 0..3 {
+        land_digest(
+            &node.store,
+            node.context_id,
+            format!("a landed digest {index}"),
+        );
+    }
+    assert_eq!(
+        node.store
+            .rebuild_queue_counts(TEXT_SPACE)
+            .expect("counts")
+            .model_generation,
+        1
+    );
+
+    // The node switches model after this page is embedded and before it commits.
+    context_graph::test_support::before_next_rebuild_commit_for_test(|store| {
+        store
+            .reindex_space(TEXT_SPACE, context_graph::ReindexOptions::default())
+            .expect("the reindex under the new model");
+    });
+    let stale = node.store.rebuild_turn(TEXT_SPACE).expect("the stale turn");
+    assert!(stale.generation_moved, "the page saw the generation move");
+    assert_eq!(
+        stale.rebuilt, 0,
+        "a page embedded under the earlier generation publishes nothing"
+    );
+
+    let counts = node.store.rebuild_queue_counts(TEXT_SPACE).expect("counts");
+    assert_eq!(
+        counts.model_generation, 2,
+        "the model switch started generation 2"
+    );
+    assert_eq!(
+        counts.waiting, 3,
+        "every item without a generation-2 vector is owed again"
+    );
+    assert_eq!(
+        vector_generations(&node.store),
+        vec![2],
+        "only the reindexed digest has a vector, and it is under the new generation"
+    );
+
+    while node.store.rebuild_turn(TEXT_SPACE).expect("a turn").rebuilt > 0 {}
+    assert_eq!(
+        node.store
+            .rebuild_queue_counts(TEXT_SPACE)
+            .expect("counts")
+            .waiting,
+        0
+    );
+    assert_eq!(
+        vector_generations(&node.store),
+        vec![2, 2, 2, 2],
+        "the rebuild completes under the new generation"
+    );
+}

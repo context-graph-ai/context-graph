@@ -79,6 +79,14 @@ impl Store {
         }
 
         let mut to_producer = lease.to_producer.clone();
+        // A node-local reproducible space that switches model starts a new model generation, so its
+        // earlier model's vectors stop answering and every item it binds is owed again.
+        let resets_generation = matches!(physical_vector(&space), PhysicalVector::NodeLocal { .. })
+            && space
+                .placement
+                .is_some_and(|placement| placement.rebuild == crate::VectorRebuild::Reproducible)
+            && lease.resumed_at_cursor == 0;
+        let mut generation_reset = false;
         let start = lease.resumed_at_cursor.min(candidates.len());
         let mut last_committed_cursor = lease.resumed_at_cursor;
         for (index, candidate) in candidates.iter().enumerate().skip(start) {
@@ -137,6 +145,10 @@ impl Store {
                 return Err(err);
             }
 
+            if resets_generation && !generation_reset && output.producer != from_producer {
+                self.reset_node_local_generation(&space)?;
+                generation_reset = true;
+            }
             if to_producer.is_none() {
                 to_producer = Some(output.producer.clone());
             }
