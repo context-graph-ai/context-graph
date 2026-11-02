@@ -16,8 +16,9 @@
 //!   after "process N" finds the process that is really holding their store.
 //! - A free store opens before any reader is parked, so the typed refusal belongs to live reader
 //!   contention rather than the harness or a stale registry entry.
-//! - A shared writer waits while those readers hold the store, without holding the registry mutex:
-//!   its retry observer opens an unrelated store before either reader is released.
+//! - A shared writer waits inside the engine while those readers hold the store: the engine reports
+//!   it waiting on that store and on exactly the two parked readers, and an unrelated store opens
+//!   while it waits, so the wait does not hold context-graph's store registry.
 //! - Releasing both readers admits that waiting writer, and a later open of the original path
 //!   reuses its registered database handle.
 //!
@@ -45,8 +46,12 @@ use std::process::{Child, ChildStdout, Command, Stdio};
 use std::sync::mpsc::channel;
 
 use context_graph::{CgError, Store, StoreConfig};
+use contextdb_core::read_contract::{ProcessStartIdentity, ReaderBreadcrumb};
 use contextdb_engine::ReadSession;
-use contextdb_engine::persistence::read_persistence_test_scaffold::arm_read_image_hydration_pause_for_test;
+use contextdb_engine::persistence::read_persistence_test_scaffold::{
+    WriterAdmissionEvent, arm_read_image_hydration_pause_for_test,
+    watch_writer_admission_in_runtime_dir_for_test,
+};
 
 /// Which role a re-invocation of this test binary is playing. Absent in the parent.
 const CHILD_ROLE_ENV: &str = "CG_READER_CONTENTION_CHILD_ROLE";
@@ -493,29 +498,54 @@ fn a_real_context_graph_open_is_refused_by_the_live_readers_holding_the_store() 
          published — the process an operator goes and finds, what it is, and which run of it"
     );
 
-    let (waiting, observed) = channel();
+    // The engine's own record of this store's writable opens, armed before the writer starts, and
+    // told where the parked readers published who they are: the `contextdb` directory inside the
+    // runtime root they were given.
+    let admission = watch_writer_admission_in_runtime_dir_for_test(
+        &store_path,
+        Some(&runtime.path().join("contextdb")),
+    );
     let (finish, finished) = channel();
     let writer_path = store_path.clone();
     let writer = std::thread::spawn(move || {
-        context_graph::test_support::observe_store_open_retries_for_test(move |error| {
-            assert!(matches!(error, CgError::StoreHeldByReaders { .. }));
-            drop(
-                Store::open(store_config(unrelated.clone()))
-                    .expect("registry is released while waiting"),
-            );
-            waiting.send(()).unwrap();
-        });
         let store = Store::open(store_config(writer_path)).expect("reader release admits writer");
         finish.send(()).unwrap();
         store
     });
-    observed
-        .recv()
-        .expect("real reader refusal reached the shared Store wait");
-    assert!(finished.try_recv().is_err());
+    let mut parked_identities = vec![first_parked.clone(), second_parked.clone()]
+        .into_iter()
+        .map(|reader| ReaderBreadcrumb {
+            process_id: reader.process_id,
+            process_name: reader.process_name,
+            process_start: ProcessStartIdentity(reader.process_start),
+        })
+        .collect::<Vec<_>>();
+    parked_identities.sort_by_key(|reader| (reader.process_id, reader.process_start.0));
+    assert_eq!(
+        admission.next_event(),
+        WriterAdmissionEvent::Waiting {
+            store: store_path.clone(),
+            readers: parked_identities,
+        },
+        "the shared writer waits inside the engine on this store, and on exactly the two readers \
+         parked on it, each named by every field it published"
+    );
+    drop(
+        Store::open(store_config(unrelated))
+            .expect("an unrelated store opens while the writer waits: the wait holds no registry"),
+    );
+    assert!(
+        finished.try_recv().is_err(),
+        "the writer is still waiting while both readers hold the store"
+    );
     first.release();
     second.release();
     finished.recv().expect("writer opens after reader release");
+    assert_eq!(
+        admission.next_event(),
+        WriterAdmissionEvent::Acquired,
+        "releasing both readers admits the waiting writer"
+    );
     let store = writer.join().unwrap();
     let shared = Store::open(store_config(store_path)).expect("reuse registered writer");
     assert!(std::sync::Arc::ptr_eq(
