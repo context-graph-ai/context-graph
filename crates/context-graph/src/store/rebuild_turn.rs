@@ -55,8 +55,9 @@ pub struct RebuildQueueCounts {
     /// Items this node will not build under this generation, with the reason for each reason.
     pub refused: u64,
     pub refused_reasons: Vec<String>,
-    /// Whether this node has the space's model, and so can build anything at all.
-    pub available: bool,
+    /// Whether this node has the space's model, and so can build anything at all; `None` when the
+    /// read that produced these counts holds no models and so cannot say.
+    pub available: Option<bool>,
 }
 
 /// One waiting item and the text it is embedded from, or why it is refused.
@@ -79,72 +80,16 @@ enum RebuildSource {
 impl Store {
     /// The spaces this node rebuilds vectors for: every node-local reproducible space.
     pub fn node_local_rebuild_spaces(&self) -> Result<Vec<String>> {
-        Ok(self
-            .list_embedding_spaces()?
-            .into_iter()
-            .filter(|space| {
-                matches!(physical_vector(space), PhysicalVector::NodeLocal { .. })
-                    && space
-                        .placement
-                        .is_some_and(|placement| placement.rebuild == VectorRebuild::Reproducible)
-            })
-            .map(|space| space.embedding_space_id)
-            .collect())
+        rebuild_spaces_via(&|sql, params| self.read_query(sql, params))
     }
 
-    /// What a node-local reproducible space still owes this node, read in one snapshot.
+    /// What a node-local reproducible space still owes this node.
     pub fn rebuild_queue_counts(&self, embedding_space_id: &str) -> Result<RebuildQueueCounts> {
-        let generation = self.node_local_generation(embedding_space_id)?;
-        let count = |state: &str| -> Result<u64> {
-            let result = self.read_query(
-                "SELECT COUNT(*) AS n FROM rebuild_pending WHERE embedding_space_id = $space AND model_generation = $generation AND state = $state",
-                &HashMap::from([
-                    (
-                        "space".to_string(),
-                        Value::Text(embedding_space_id.to_string()),
-                    ),
-                    ("generation".to_string(), Value::Int64(generation)),
-                    ("state".to_string(), Value::Text(state.to_string())),
-                ]),
-            )?;
-            match result.rows().first().and_then(|row| row.first()) {
-                Some(Value::Int64(count)) => Ok(*count as u64),
-                other => Err(CgError::Engine(format!(
-                    "the rebuild queue count for {embedding_space_id} came back as {other:?}"
-                ))),
-            }
-        };
-        let waiting = count(PENDING_WAITING)?;
-        let refused = count(PENDING_REFUSED)?;
-        let mut refused_reasons = Vec::new();
-        if refused > 0 {
-            let result = self.read_query(
-                "SELECT reason FROM rebuild_pending WHERE embedding_space_id = $space AND model_generation = $generation AND state = $state ORDER BY target_table, target_id LIMIT 32",
-                &HashMap::from([
-                    (
-                        "space".to_string(),
-                        Value::Text(embedding_space_id.to_string()),
-                    ),
-                    ("generation".to_string(), Value::Int64(generation)),
-                    ("state".to_string(), Value::Text(PENDING_REFUSED.to_string())),
-                ]),
-            )?;
-            for row in result.rows() {
-                if let Some(Value::Text(reason)) = row.first()
-                    && !refused_reasons.contains(reason)
-                {
-                    refused_reasons.push(reason.clone());
-                }
-            }
-        }
-        Ok(RebuildQueueCounts {
-            embedding_space_id: embedding_space_id.to_string(),
-            model_generation: generation,
-            waiting,
-            refused,
-            refused_reasons,
-            available: self.embedders.contains_key(embedding_space_id),
-        })
+        queue_counts_via(
+            &|sql, params| self.read_query(sql, params),
+            embedding_space_id,
+            Some(self.embedders.contains_key(embedding_space_id)),
+        )
     }
 
     /// Builds one page of the vectors this node owes a node-local reproducible space.
@@ -401,4 +346,95 @@ fn read_page_too_small(error: &contextdb_core::Error) -> bool {
                     if detail.limit == contextdb_core::read_contract::ReadFailureLimit::CursorPageBytes
             )
     )
+}
+
+type ReadVia<'a> =
+    dyn Fn(&str, &HashMap<String, Value>) -> Result<crate::consumer_read::ConsumerQueryResult> + 'a;
+
+/// Every node-local reproducible space, read through one executor.
+pub(crate) fn rebuild_spaces_via(read: &ReadVia<'_>) -> Result<Vec<String>> {
+    let result = read(
+        "SELECT embedding_space_id, placement FROM embedding_spaces",
+        &HashMap::new(),
+    )?;
+    Ok(result
+        .rows()
+        .iter()
+        .filter_map(|row| match (row.first(), row.get(1)) {
+            (Some(Value::Text(id)), Some(Value::Text(stored))) => {
+                crate::VectorPlacement::from_stored(stored)
+                    .filter(|placement| {
+                        placement.locality == crate::VectorLocality::NodeLocal
+                            && placement.rebuild == VectorRebuild::Reproducible
+                    })
+                    .map(|_| id.clone())
+            }
+            _ => None,
+        })
+        .collect())
+}
+
+/// A space's waiting and refused counts under its current generation, read through one executor.
+pub(crate) fn queue_counts_via(
+    read: &ReadVia<'_>,
+    embedding_space_id: &str,
+    available: Option<bool>,
+) -> Result<RebuildQueueCounts> {
+    let space = Value::Text(embedding_space_id.to_string());
+    let generation = match read(
+        "SELECT model_generation FROM reindex_cursors WHERE embedding_space_id = $space",
+        &HashMap::from([("space".to_string(), space.clone())]),
+    )?
+    .rows()
+    .first()
+    .and_then(|row| row.first())
+    {
+        Some(Value::Int64(generation)) => *generation,
+        _ => 1,
+    };
+    let params = |state: &str| {
+        HashMap::from([
+            ("space".to_string(), space.clone()),
+            ("generation".to_string(), Value::Int64(generation)),
+            ("state".to_string(), Value::Text(state.to_string())),
+        ])
+    };
+    let count = |state: &str| -> Result<u64> {
+        let result = read(
+            "SELECT COUNT(*) AS n FROM rebuild_pending WHERE embedding_space_id = $space AND model_generation = $generation AND state = $state",
+            &params(state),
+        )?;
+        match result.rows().first().and_then(|row| row.first()) {
+            Some(Value::Int64(count)) => Ok(*count as u64),
+            other => Err(CgError::Engine(format!(
+                "the rebuild queue count for {embedding_space_id} came back as {other:?}"
+            ))),
+        }
+    };
+    let waiting = count(PENDING_WAITING)?;
+    let refused = count(PENDING_REFUSED)?;
+    let mut refused_reasons = Vec::new();
+    if refused > 0 {
+        let result = read(
+            &format!(
+                "SELECT reason FROM rebuild_pending WHERE embedding_space_id = $space AND model_generation = $generation AND state = $state ORDER BY target_table, target_id LIMIT {REBUILD_PAGE_ROWS}"
+            ),
+            &params(PENDING_REFUSED),
+        )?;
+        for row in result.rows() {
+            if let Some(Value::Text(reason)) = row.first()
+                && !refused_reasons.contains(reason)
+            {
+                refused_reasons.push(reason.clone());
+            }
+        }
+    }
+    Ok(RebuildQueueCounts {
+        embedding_space_id: embedding_space_id.to_string(),
+        model_generation: generation,
+        waiting,
+        refused,
+        refused_reasons,
+        available,
+    })
 }

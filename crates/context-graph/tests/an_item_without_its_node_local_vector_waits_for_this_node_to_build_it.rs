@@ -289,7 +289,11 @@ fn received_digests_are_rebuilt_a_page_at_a_time_with_exact_waiting_counts() {
         counts.waiting, received as u64,
         "every received digest waits"
     );
-    assert!(counts.available, "this node has the space's model");
+    assert_eq!(
+        counts.available,
+        Some(true),
+        "this node has the space's model"
+    );
 
     let first = node.store.rebuild_turn(TEXT_SPACE).expect("a turn");
     assert_eq!(first.rebuilt, REBUILD_PAGE_ROWS, "one turn builds one page");
@@ -442,7 +446,7 @@ fn a_space_without_its_model_here_is_unavailable_and_nothing_is_written_for_it()
         "a digest this node cannot embed".to_string(),
     );
     let counts = store.rebuild_queue_counts(TEXT_SPACE).expect("counts");
-    assert_eq!((counts.waiting, counts.available), (1, false));
+    assert_eq!((counts.waiting, counts.available), (1, Some(false)));
     let turn = store.rebuild_turn(TEXT_SPACE).expect("a turn");
     assert!(turn.unavailable, "the space is reported unavailable");
     assert_eq!((turn.rebuilt, turn.refused), (0, 0));

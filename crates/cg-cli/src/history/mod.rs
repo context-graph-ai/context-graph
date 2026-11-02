@@ -32,7 +32,7 @@ use super::OutputFormat;
 
 pub(crate) use forget::handle_forget;
 pub(crate) use import::handle_import;
-pub(crate) use read::{handle_find, handle_show, handle_status};
+pub(crate) use read::{handle_find, handle_show, handle_status, vectors_owed};
 #[cfg(any(
     feature = "event-search-test-support",
     feature = "store-contention-test-support"

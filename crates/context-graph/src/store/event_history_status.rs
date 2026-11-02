@@ -45,6 +45,9 @@ const EVENT_HISTORY_READ_TABLES: &[&str] = &[
     "event_search_session_progress",
     "event_search_passages",
     "event_search_passage_sources",
+    "embedding_spaces",
+    "reindex_cursors",
+    "rebuild_pending",
     "event_search_embedding_handles",
     "event_search_heads",
     "event_search_work_policies",
@@ -276,6 +279,24 @@ impl ConsumerReader {
     /// The same status fold as [`Store::event_history_status`], through the read-only session.
     pub fn event_history_status(&self, selector: ContextSelector) -> Result<EventHistoryStatusSet> {
         event_history_status(self, selector)
+    }
+
+    /// Every node-local reproducible space, which this node rebuilds vectors for.
+    pub fn node_local_rebuild_spaces(&self) -> Result<Vec<String>> {
+        super::rebuild_turn::rebuild_spaces_via(&|sql, params| self.execute(sql, params))
+    }
+
+    /// What a node-local reproducible space still owes this node. A read-only session holds no
+    /// models, so whether this node can build them is not answered here.
+    pub fn rebuild_queue_counts(
+        &self,
+        embedding_space_id: &str,
+    ) -> Result<super::rebuild_turn::RebuildQueueCounts> {
+        super::rebuild_turn::queue_counts_via(
+            &|sql, params| self.execute(sql, params),
+            embedding_space_id,
+            None,
+        )
     }
 
     /// The Store-level placement alone, for a status caller that selected no Context.

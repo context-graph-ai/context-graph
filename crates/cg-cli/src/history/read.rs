@@ -29,12 +29,39 @@ fn reader_or_refusal(
     read_memory_limit_bytes: std::num::NonZeroUsize,
 ) -> Result<ConsumerReader, i32> {
     match open_reader(root, read_memory_limit_bytes) {
-        Ok(reader) => Ok(reader),
+        Ok(reader) => {
+            note_vectors_owed(&reader);
+            Ok(reader)
+        }
         Err(CgError::StoreMissing { .. }) => {
             Err(store_not_found(format, &db_path(root), with_next))
         }
         Err(error) => Err(library_refusal(format, &error)),
     }
+}
+
+/// Whether a read command found this node owing vectors to a node-local space, so the command's
+/// dispatch can start the shared worker that builds them.
+static VECTORS_OWED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Notes whether any node-local reproducible space has items waiting for this node. Best effort:
+/// a refused read notes nothing here, and `cg status` reports such a refusal itself.
+fn note_vectors_owed(reader: &ConsumerReader) {
+    let owed = reader.node_local_rebuild_spaces().is_ok_and(|spaces| {
+        spaces.iter().any(|space| {
+            reader
+                .rebuild_queue_counts(space)
+                .is_ok_and(|counts| counts.waiting > 0)
+        })
+    });
+    if owed {
+        VECTORS_OWED.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Whether the read command just run found vectors this node owes.
+pub(crate) fn vectors_owed() -> bool {
+    VECTORS_OWED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 fn state_name(state: EventHistorySearchState) -> &'static str {
@@ -179,6 +206,33 @@ pub(crate) fn handle_status(
         Ok(None) => None,
         Err(error) => return library_refusal(format, &error),
     };
+    // What each node-local reproducible space still owes this node. A refused count is shown as a
+    // refusal for that space, never as zero.
+    let vector_rebuild = match reader.node_local_rebuild_spaces() {
+        Ok(spaces) => spaces
+            .into_iter()
+            .map(|space| match reader.rebuild_queue_counts(&space) {
+                Ok(counts) => json!({
+                    "embedding_space_id": counts.embedding_space_id,
+                    "model_generation": counts.model_generation,
+                    "waiting": counts.waiting,
+                    "refused": counts.refused,
+                    "refused_reasons": counts.refused_reasons,
+                }),
+                Err(error) => json!({
+                    "embedding_space_id": space,
+                    "read_refused": error.to_string(),
+                }),
+            })
+            .collect::<Vec<_>>(),
+        Err(error) => return status_read_refusal(format, &db_path_text, &error),
+    };
+    if vector_rebuild
+        .iter()
+        .any(|space| space["waiting"].as_u64().unwrap_or(0) > 0)
+    {
+        VECTORS_OWED.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
     let last_injection = super::super::read_last_injection(&root);
     drop(reader);
     let helpers = selection
@@ -204,6 +258,33 @@ pub(crate) fn handle_status(
             context_graph::write_budget::human_bytes(writer_memory.bytes.get() as u64),
             writer_memory.origin()
         );
+        for space in &vector_rebuild {
+            let id = space["embedding_space_id"].as_str().unwrap_or_default();
+            if let Some(refusal) = space["read_refused"].as_str() {
+                println!("vectors this node owes {id}: the count read was refused: {refusal}");
+                continue;
+            }
+            let reasons = space["refused_reasons"]
+                .as_array()
+                .map(|reasons| {
+                    reasons
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                })
+                .unwrap_or_default();
+            println!(
+                "vectors this node owes {id}: {} waiting, {} refused{}",
+                space["waiting"],
+                space["refused"],
+                if reasons.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({reasons})")
+                }
+            );
+        }
         return 0;
     }
     let contexts = set
@@ -229,6 +310,7 @@ pub(crate) fn handle_status(
         "contexts": contexts,
         "last_understanding_run": last_understanding_run,
         "last_injection": last_injection,
+        "vector_rebuild": vector_rebuild,
     });
     if let Some(fabric) = fabric {
         value["fabric"] = fabric;

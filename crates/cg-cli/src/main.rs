@@ -199,8 +199,12 @@ fn run(args: Vec<String>) -> i32 {
         Some("model") => handle_model(&args[1..], read_memory_limit_bytes),
         Some("record") => handle_record(&args[1..], read_memory_limit_bytes),
         Some("import") => history::handle_import(&args[1..], read_memory_limit_bytes),
-        Some("find") => history::handle_find(&args[1..], read_memory_limit_bytes),
-        Some("show") => history::handle_show(&args[1..], read_memory_limit_bytes),
+        Some("find") => {
+            kick_if_vectors_owed(history::handle_find(&args[1..], read_memory_limit_bytes))
+        }
+        Some("show") => {
+            kick_if_vectors_owed(history::handle_show(&args[1..], read_memory_limit_bytes))
+        }
         Some("forget") => history::handle_forget(&args[1..], read_memory_limit_bytes),
         Some(command) if command == history::WORKER_COMMAND => {
             history::handle_event_search_worker(&args[1..], read_memory_limit_bytes)
@@ -213,7 +217,9 @@ fn run(args: Vec<String>) -> i32 {
         Some("changed") => handle_changed(&args[1..], read_memory_limit_bytes),
         Some("by-intention") => handle_by_intention(&args[1..], read_memory_limit_bytes),
         Some("by-entity") => handle_by_entity(&args[1..], read_memory_limit_bytes),
-        Some("status") => history::handle_status(&args[1..], read_memory_limit_bytes),
+        Some("status") => {
+            kick_if_vectors_owed(history::handle_status(&args[1..], read_memory_limit_bytes))
+        }
         Some("selftest") => handle_selftest(&args[1..], SelftestSurface::HostSessionLegacy),
         Some("doctor") => handle_doctor(&args[1..]),
         Some("disconnect") => handle_disconnect(&args[1..]),
@@ -481,6 +487,54 @@ fn maybe_kick_understanding_worker(args: &[String]) {
         .spawn();
 }
 
+/// After a read command, start the shared worker when the command found this node owing vectors to
+/// a node-local space and no worker holds the lock. Never waits; suppressed by
+/// `CG_NO_UNDERSTAND_KICK=1` as the capture kick is.
+fn kick_if_vectors_owed(code: i32) -> i32 {
+    if !history::vectors_owed() || env::var_os("CG_NO_UNDERSTAND_KICK").is_some() {
+        return code;
+    }
+    // A live holder is never taken over: the probe takes the lock only to see it is free.
+    match acquire_worker_lock(&data_root()) {
+        Some(probe) => drop(probe),
+        None => return code,
+    }
+    if let Ok(exe) = env::current_exe() {
+        let _ = std::process::Command::new(exe)
+            .args(["understand", "--worker"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+    }
+    code
+}
+
+/// Build, a bounded page at a time, every vector this node owes its node-local reproducible spaces.
+/// A space without its model here is skipped; a failed turn stops that space until the next run.
+fn rebuild_owed_vectors(store: &Store) {
+    let Ok(spaces) = store.node_local_rebuild_spaces() else {
+        return;
+    };
+    for space in spaces {
+        let mut generation_moves = 0;
+        loop {
+            match store.rebuild_turn(&space) {
+                Ok(turn) if turn.unavailable => break,
+                Ok(turn) if turn.generation_moved => {
+                    generation_moves += 1;
+                    if generation_moves > 3 {
+                        break;
+                    }
+                }
+                Ok(turn) if turn.rebuilt + turn.refused == 0 => break,
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+    }
+}
+
 /// Current wall-clock time in unix epoch milliseconds, for the retention window comparison.
 fn now_millis() -> i64 {
     std::time::SystemTime::now()
@@ -567,13 +621,15 @@ fn understand_worker(args: &[String], read_memory_limit_bytes: std::num::NonZero
         // Another worker already holds the drain lock; exactly one drains at a time.
         return 0;
     };
+    let Ok(store) = open_memory_store(&root, read_memory_limit_bytes) else {
+        return 0;
+    };
+    // The vectors this node owes need only each space's own model, not a connected one.
+    rebuild_owed_vectors(&store);
     // No connected model: understanding is a silent no-op (model-free capture already succeeded).
     if memory_capture_connection_name(&root).is_none() {
         return 0;
     }
-    let Ok(store) = open_memory_store(&root, read_memory_limit_bytes) else {
-        return 0;
-    };
     let budget = parse_understand_budget(args).unwrap_or_default();
     let contexts = store.list_contexts().unwrap_or_default();
     let mut spent: Vec<ModelCallUsage> = Vec::new();
