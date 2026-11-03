@@ -44,11 +44,11 @@ candle-core = { path = "vendor/candle-core", version = "=0.10.2" }
 candle-nn = { path = "vendor/candle-nn", version = "=0.10.2" }
 candle-transformers = { path = "vendor/candle-transformers", version = "=0.10.2" }
 criterion = { version = "0.8", features = ["html_reports"] }
-contextdb-core = { git = "https://github.com/context-graph-ai/contextdb", rev = "e9c67dcf0f803597ad6abd1b1a825706d9d2c9b8" }
-contextdb-engine = { git = "https://github.com/context-graph-ai/contextdb", rev = "e9c67dcf0f803597ad6abd1b1a825706d9d2c9b8" }
-contextdb-parser = { git = "https://github.com/context-graph-ai/contextdb", rev = "e9c67dcf0f803597ad6abd1b1a825706d9d2c9b8" }
-contextdb-tx = { git = "https://github.com/context-graph-ai/contextdb", rev = "e9c67dcf0f803597ad6abd1b1a825706d9d2c9b8" }
-contextdb-vector = { git = "https://github.com/context-graph-ai/contextdb", rev = "e9c67dcf0f803597ad6abd1b1a825706d9d2c9b8" }
+contextdb-core = { git = "https://github.com/context-graph-ai/contextdb", rev = "6de2b105a740ef1d4765411792742ed7d01790a7" }
+contextdb-engine = { git = "https://github.com/context-graph-ai/contextdb", rev = "6de2b105a740ef1d4765411792742ed7d01790a7" }
+contextdb-parser = { git = "https://github.com/context-graph-ai/contextdb", rev = "6de2b105a740ef1d4765411792742ed7d01790a7" }
+contextdb-tx = { git = "https://github.com/context-graph-ai/contextdb", rev = "6de2b105a740ef1d4765411792742ed7d01790a7" }
+contextdb-vector = { git = "https://github.com/context-graph-ai/contextdb", rev = "6de2b105a740ef1d4765411792742ed7d01790a7" }
 safetensors = "0.7.0"
 sha2 = { version = "0.10.9", features = ["compress"] }
 tempfile = "3.23.0"
@@ -66,15 +66,3 @@ which = "8.0.0"
 pollster = "0.4.0"
 rayon = "1.12.0"
 
-[patch."https://github.com/context-graph-ai/contextdb"]
-contextdb-cli = { path = "../consumer-cg-engine-e9c67dcf/crates/contextdb-cli" }
-contextdb-core = { path = "../consumer-cg-engine-e9c67dcf/crates/contextdb-core" }
-contextdb-engine = { path = "../consumer-cg-engine-e9c67dcf/crates/contextdb-engine" }
-contextdb-graph = { path = "../consumer-cg-engine-e9c67dcf/crates/contextdb-graph" }
-contextdb-parser = { path = "../consumer-cg-engine-e9c67dcf/crates/contextdb-parser" }
-contextdb-planner = { path = "../consumer-cg-engine-e9c67dcf/crates/contextdb-planner" }
-contextdb-redb = { path = "../consumer-cg-engine-e9c67dcf/crates/contextdb-redb" }
-contextdb-relational = { path = "../consumer-cg-engine-e9c67dcf/crates/contextdb-relational" }
-contextdb-server = { path = "../consumer-cg-engine-e9c67dcf/crates/contextdb-server" }
-contextdb-tx = { path = "../consumer-cg-engine-e9c67dcf/crates/contextdb-tx" }
-contextdb-vector = { path = "../consumer-cg-engine-e9c67dcf/crates/contextdb-vector" }
