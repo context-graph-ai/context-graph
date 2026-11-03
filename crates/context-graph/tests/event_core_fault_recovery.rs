@@ -225,7 +225,9 @@ impl EventSourceAdapter for OneRecordSource {
 struct ContentionProbe {
     planned_conflicts: usize,
     target_thread: Mutex<Option<ThreadId>>,
-    arrived: mpsc::Sender<usize>,
+    /// Closed by the target thread when its import returns, so a target that never reaches a
+    /// real event insert ends the controller's wait with an error instead of a hang.
+    arrived: Mutex<Option<mpsc::Sender<usize>>>,
     release: Mutex<mpsc::Receiver<()>>,
     observed_event_insert: AtomicUsize,
     observed_engine_conflict: AtomicUsize,
@@ -239,7 +241,7 @@ impl ContentionProbe {
             Arc::new(Self {
                 planned_conflicts,
                 target_thread: Mutex::new(None),
-                arrived: arrived_tx,
+                arrived: Mutex::new(Some(arrived_tx)),
                 release: Mutex::new(release_rx),
                 observed_event_insert: AtomicUsize::new(0),
                 observed_engine_conflict: AtomicUsize::new(0),
@@ -249,8 +251,21 @@ impl ContentionProbe {
         )
     }
 
+    fn finish_target(&self) {
+        self.arrived.lock().expect("arrived lock").take();
+    }
+
     fn target_current_thread(&self) {
         *self.target_thread.lock().expect("target thread lock") = Some(thread::current().id());
+    }
+}
+
+/// Closes the controller's wait however the target thread ends, including a panic.
+struct FinishTargetOnDrop(Arc<ContentionProbe>);
+
+impl Drop for FinishTargetOnDrop {
+    fn drop(&mut self) {
+        self.0.finish_target();
     }
 }
 
@@ -270,6 +285,10 @@ impl DatabasePlugin for ContentionProbe {
         let attempt = self.observed_event_insert.fetch_add(1, Ordering::SeqCst) + 1;
         if attempt <= self.planned_conflicts {
             self.arrived
+                .lock()
+                .expect("arrived lock")
+                .as_ref()
+                .expect("target has not finished")
                 .send(attempt)
                 .expect("controller receives target pause");
             self.release
@@ -390,9 +409,10 @@ fn run_append_race(conflicts: usize) -> RaceObservation {
     let target_store = store.clone();
     let target_probe = probe.clone();
     let target = thread::spawn(move || {
+        let _finished = FinishTargetOnDrop(target_probe.clone());
         target_probe.target_current_thread();
         let mut adapter = OneRecordSource::target();
-        target_store.import_event_stream(
+        let imported = target_store.import_event_stream(
             &mut adapter,
             &mut Cursor::new(TARGET_BYTES.to_vec()),
             ImportEventOptions {
@@ -404,12 +424,23 @@ fn run_append_race(conflicts: usize) -> RaceObservation {
                     max_normalized_bytes: NonZeroUsize::new(1024).expect("nonzero"),
                 },
             },
-        )
+        );
+        imported
     });
 
     for attempt in 1..=conflicts {
+        let arrival = match arrived.recv() {
+            Ok(arrival) => arrival,
+            Err(_) => {
+                let early = target.join().expect("target thread does not panic");
+                panic!(
+                    "the target import returned without reaching a real INSERT INTO events attempt the probe observed; it returned {:?}",
+                    early.as_ref().map(|_| "an import report").map_err(|error| error.to_string())
+                );
+            }
+        };
         assert_eq!(
-            arrived.recv().expect("target reaches real event insert"),
+            arrival,
             attempt,
             "the controller releases each target attempt only after its INSERT INTO events is staged"
         );

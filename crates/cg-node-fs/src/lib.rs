@@ -350,15 +350,43 @@ pub fn write_test_file_for_test(
 }
 
 /// Drive the existing release predicate after explicit writes, without timer polling.
+///
+/// The test that controls this wait holds the listening end of `control.sock` beside its state
+/// event socket (`CG_TEST_STATE_EVENTS`) for as long as the test thread lives. This wait connects
+/// to it and leaves as soon as that connection ends, so a test that finishes, panics or is killed
+/// before it sends the release never leaves a detached worker waiting with no sender. A fixture
+/// directory that is already gone, or a controller that is already gone, refuses at startup.
 #[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
 #[doc(hidden)]
 pub fn wait_for_test_release_for_test(directory: &Path, mut released: impl FnMut() -> bool) {
     if released() {
         return;
     }
+    if !directory.is_dir() {
+        return;
+    }
+    let controller_gone = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let socket_dir = tempfile::tempdir_in("/tmp").expect("short release socket directory");
     let address = socket_dir.path().join("release.sock");
     let socket = std::os::unix::net::UnixDatagram::bind(&address).expect("release event socket");
+    if let Some(state) = std::env::var_os("CG_TEST_STATE_EVENTS")
+        && let Some(control) = Path::new(&state).parent().map(|dir| dir.join("control.sock"))
+    {
+        let Ok(mut stream) = std::os::unix::net::UnixStream::connect(&control) else {
+            return;
+        };
+        let gone = controller_gone.clone();
+        let wake = address.clone();
+        std::thread::spawn(move || {
+            use std::io::Read;
+            // Ends on EOF or a reset: the controlling test dropped its listening end.
+            let _ = stream.read(&mut [0u8; 1]);
+            gone.store(true, std::sync::atomic::Ordering::SeqCst);
+            if let Ok(waker) = std::os::unix::net::UnixDatagram::unbound() {
+                let _ = waker.send_to(&[1], wake);
+            }
+        });
+    }
     // Publish before rechecking, closing the race with a parent that has already released.
     std::fs::write(
         directory.join(".release-event-address"),
@@ -366,6 +394,9 @@ pub fn wait_for_test_release_for_test(directory: &Path, mut released: impl FnMut
     )
     .expect("publish release address");
     while !released() {
+        if controller_gone.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
         socket
             .recv(&mut [0])
             .expect("explicit fixture release event");

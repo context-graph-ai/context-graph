@@ -111,6 +111,9 @@ struct StateEvents {
     _directory: tempfile::TempDir,
     path: PathBuf,
     receiver: std::os::unix::net::UnixDatagram,
+    /// Never accepted: a worker waiting on a release connects here and sees the connection end
+    /// when this test thread's fixture drops, however the test ends.
+    _control: std::os::unix::net::UnixListener,
 }
 
 impl StateEvents {
@@ -118,10 +121,13 @@ impl StateEvents {
         let directory = tempfile::tempdir_in("/tmp").expect("short state event directory");
         let path = directory.path().join("state.sock");
         let receiver = std::os::unix::net::UnixDatagram::bind(&path).expect("state event socket");
+        let control = std::os::unix::net::UnixListener::bind(directory.path().join("control.sock"))
+            .expect("release control socket");
         Self {
             _directory: directory,
             path,
             receiver,
+            _control: control,
         }
     }
 }
