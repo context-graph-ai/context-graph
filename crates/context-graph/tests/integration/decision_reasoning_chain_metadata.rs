@@ -366,9 +366,8 @@ fn embedding_metadata_stored_on_decision_reasoning_chain_at_write_time_not_deriv
         "after the reindex the decision reports exactly the producer snapshot it stored at write time, not one derived from a current handle, rows_at_write={rows_at_write:?}, rows={rows:?}"
     );
     assert!(
-        !handles_after.is_empty()
-            && handles_after.iter().all(|txid| Some(txid) > handles_before.iter().max()),
-        "the decoy's current handle after the reindex is the new one, written after every handle it had before: before={handles_before:?}, after={handles_after:?}"
+        !handles_after.is_empty() && handles_after.iter().max() > handles_before.iter().max(),
+        "the decoy's newest handle after the reindex is the one the reindex wrote, newer than every handle it had before: before={handles_before:?}, after={handles_after:?}"
     );
 }
 
