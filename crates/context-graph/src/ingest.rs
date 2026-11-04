@@ -9,6 +9,10 @@ use std::time::Instant;
 use crate::capture_sync_status::{ModelCallUsage, UsageReportState};
 use crate::embedding_space::BuiltinSpaceRegistry;
 use crate::grounding;
+use crate::producer::{
+    DecisionReasoningProducerSnapshot, attach_decision_reasoning_producer_snapshots,
+    decode_producer_snapshot_handle_row, evidence_producer_handle_query,
+};
 use crate::{
     AgentId, AuditId, BasisDiffResult, CgError, ContextId, CreateContext, CreateDecision,
     CreateDigest, Decision, DecisionId, DecisionStatus, DigestId, Embedder, EmbeddingId,
@@ -4241,6 +4245,60 @@ impl<'a> CaptureTxn<'a> {
         Ok(())
     }
 
+    fn decision_producer_snapshots(
+        &self,
+        basis_snapshot_ids: &[EntitySnapshotId],
+    ) -> Result<Vec<DecisionReasoningProducerSnapshot>> {
+        if basis_snapshot_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = (0..basis_snapshot_ids.len())
+            .map(|idx| format!("$snapshot_id_{idx}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = evidence_producer_handle_query(
+            "",
+            "entity_snapshot_observations \
+             INNER JOIN evidence ON evidence.context_id = entity_snapshot_observations.context_id AND evidence.observation_id = entity_snapshot_observations.observation_id",
+            &format!("entity_snapshot_observations.snapshot_id IN ({placeholders})"),
+        );
+        let params = basis_snapshot_ids
+            .iter()
+            .enumerate()
+            .map(|(idx, id)| (format!("snapshot_id_{idx}"), DbValue::Uuid(id.as_uuid())))
+            .collect();
+        // Use the decision transaction, including basis/evidence rows inserted
+        // earlier in this same atomic capture.
+        let result = self
+            .store
+            .internal_db()
+            .execute_in_tx(self.tx, &sql, &params)
+            .map_err(map_engine)?;
+        let mut latest_by_evidence_space =
+            HashMap::<(uuid::Uuid, String), DecisionReasoningProducerSnapshot>::new();
+        for row in result.rows() {
+            let snapshot = decode_producer_snapshot_handle_row(row)?;
+            let key = (snapshot.evidence_id, snapshot.embedding_space_id.clone());
+            latest_by_evidence_space
+                .entry(key)
+                .and_modify(|existing| {
+                    if snapshot.created_at > existing.created_at {
+                        *existing = snapshot.clone();
+                    }
+                })
+                .or_insert(snapshot);
+        }
+        let mut snapshots = latest_by_evidence_space.into_values().collect::<Vec<_>>();
+        snapshots.sort_by_key(|snapshot| {
+            (
+                snapshot.evidence_id,
+                snapshot.embedding_space_id.clone(),
+                snapshot.created_at,
+            )
+        });
+        Ok(snapshots)
+    }
+
     fn insert_decision_row(
         &mut self,
         id: DecisionId,
@@ -4269,6 +4327,9 @@ impl<'a> CaptureTxn<'a> {
         }
         let reasoning_json = serde_json::to_value(&input.reasoning)
             .map_err(|err| CgError::Engine(format!("decision reasoning serialize: {err}")))?;
+        let producer_snapshots = self.decision_producer_snapshots(&basis_snapshot_ids)?;
+        let reasoning_json =
+            attach_decision_reasoning_producer_snapshots(reasoning_json, &producer_snapshots)?;
         let tags_json = JsonValue::Array(
             input
                 .tags

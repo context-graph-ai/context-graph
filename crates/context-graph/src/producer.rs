@@ -110,13 +110,8 @@ impl Store {
             .map(|idx| format!("$decision_id_{idx}"))
             .collect::<Vec<_>>()
             .join(", ");
-        let sql = evidence_producer_handle_query(
-            "decision_basis_snapshots.decision_id, ",
-            "decision_basis_snapshots \
-             INNER JOIN entity_snapshot_observations ON entity_snapshot_observations.context_id = decision_basis_snapshots.context_id AND entity_snapshot_observations.entity_id = decision_basis_snapshots.entity_id AND entity_snapshot_observations.snapshot_id = decision_basis_snapshots.snapshot_id \
-             INNER JOIN evidence ON evidence.context_id = entity_snapshot_observations.context_id AND evidence.observation_id = entity_snapshot_observations.observation_id",
-            &format!("decision_basis_snapshots.decision_id IN ({placeholders})"),
-        );
+        // The author's capture stays authoritative after handle replacement or sync.
+        let sql = format!("SELECT id, reasoning FROM decisions WHERE id IN ({placeholders})");
         let mut params = HashMap::new();
         for (idx, decision_id) in decision_ids.iter().enumerate() {
             params.insert(
@@ -129,11 +124,10 @@ impl Store {
             .execute(&sql, &params)
             .map_err(|err| CgError::Engine(format!("unexpected engine error: {err}")))?;
         self.set_trace(sql);
-        let mut records = result
-            .rows()
-            .iter()
-            .map(|row| decode_lineage_record(row))
-            .collect::<Result<Vec<_>>>()?;
+        let mut records = Vec::new();
+        for row in result.rows() {
+            records.extend(decode_lineage_records(row)?);
+        }
         records.sort_by_key(|record| {
             (
                 record.decision_id.as_uuid(),
@@ -155,54 +149,66 @@ struct LineageRecord {
     write_txid: TxId,
 }
 
-fn decode_lineage_record(row: &[Value]) -> Result<LineageRecord> {
-    let decision_id = match row.first() {
-        Some(Value::Uuid(value)) => DecisionId::from(*value),
-        value => {
-            return Err(CgError::Engine(format!(
-                "expected decision id in lineage row, got {value:?}"
-            )));
-        }
+fn decode_lineage_records(row: &[Value]) -> Result<Vec<LineageRecord>> {
+    let Some(Value::Uuid(id)) = row.first() else {
+        return Err(CgError::Engine(
+            "data-integrity: expected decision id in lineage row".to_string(),
+        ));
     };
-    let evidence_id = match row.get(1) {
-        Some(Value::Uuid(value)) => *value,
-        value => {
-            return Err(CgError::Engine(format!(
-                "expected evidence id in lineage row, got {value:?}"
-            )));
-        }
+    let decision_id = DecisionId::from(*id);
+    let invalid_capture = |detail: &str| {
+        CgError::Engine(format!(
+            "data-integrity: decision {decision_id} has {detail} write-time producer snapshot"
+        ))
     };
-    let embedding_space_id = match row.get(2) {
-        Some(Value::Text(value)) => value.clone(),
-        value => {
-            return Err(CgError::Engine(format!(
-                "expected embedding space in lineage row, got {value:?}"
-            )));
-        }
+    let Some(Value::Json(JsonValue::Array(steps))) = row.get(1) else {
+        return Err(invalid_capture("missing or malformed"));
     };
-    let producer = match row.get(3) {
-        Some(Value::Json(value)) => serde_json::from_value::<EvidenceProducer>(value.clone())
-            .map_err(|err| CgError::Engine(format!("invalid producer lineage json: {err}")))?,
-        value => {
-            return Err(CgError::Engine(format!(
-                "expected producer json in lineage row, got {value:?}"
-            )));
-        }
+    let snapshots_json = steps
+        .first()
+        .and_then(JsonValue::as_object)
+        .and_then(|step| step.get(DECISION_REASONING_PRODUCER_SNAPSHOTS_KEY))
+        .ok_or_else(|| invalid_capture("missing"))?;
+    // An explicit empty array records no embedded evidence at write time.
+    // Absence cannot be reconstructed from today's handles.
+    let snapshots: Vec<DecisionReasoningProducerSnapshot> =
+        serde_json::from_value(snapshots_json.clone())
+            .map_err(|err| invalid_capture(&format!("malformed ({err})")))?;
+    Ok(snapshots
+        .into_iter()
+        .map(|snapshot| LineageRecord {
+            decision_id,
+            evidence_id: snapshot.evidence_id,
+            embedding_space_id: snapshot.embedding_space_id,
+            producer: snapshot.produced_by,
+            write_txid: snapshot.created_at,
+        })
+        .collect())
+}
+
+pub(crate) fn decode_producer_snapshot_handle_row(
+    row: &[Value],
+) -> Result<DecisionReasoningProducerSnapshot> {
+    let [
+        Value::Uuid(evidence_id),
+        Value::Text(embedding_space_id),
+        Value::Json(producer),
+        Value::TxId(created_at),
+    ] = row
+    else {
+        return Err(CgError::Engine(
+            "data-integrity: malformed decision producer handle row".to_string(),
+        ));
     };
-    let write_txid = match row.get(4) {
-        Some(Value::TxId(value)) => *value,
-        value => {
-            return Err(CgError::Engine(format!(
-                "expected txid in lineage row, got {value:?}"
-            )));
-        }
-    };
-    Ok(LineageRecord {
-        decision_id,
-        evidence_id,
-        embedding_space_id,
-        producer,
-        write_txid,
+    Ok(DecisionReasoningProducerSnapshot {
+        evidence_id: *evidence_id,
+        embedding_space_id: embedding_space_id.clone(),
+        produced_by: serde_json::from_value(producer.clone()).map_err(|err| {
+            CgError::Engine(format!(
+                "data-integrity: invalid producer snapshot json: {err}"
+            ))
+        })?,
+        created_at: *created_at,
     })
 }
 
@@ -210,16 +216,22 @@ pub(crate) fn attach_decision_reasoning_producer_snapshots(
     mut reasoning_json: JsonValue,
     snapshots: &[DecisionReasoningProducerSnapshot],
 ) -> Result<JsonValue> {
-    if snapshots.is_empty() {
-        return Ok(reasoning_json);
-    }
     let snapshots_json = serde_json::to_value(snapshots)
         .map_err(|err| CgError::Engine(format!("producer snapshot serialize: {err}")))?;
     let JsonValue::Array(steps) = &mut reasoning_json else {
-        return Ok(reasoning_json);
+        return Err(CgError::Engine(
+            "data-integrity: decision reasoning is not an array".to_string(),
+        ));
     };
+    if steps.is_empty() {
+        // A metadata-only carrier preserves an empty user reasoning chain. It
+        // deliberately has none of ReasoningStep's required user fields.
+        steps.push(JsonValue::Object(serde_json::Map::new()));
+    }
     let Some(JsonValue::Object(first_step)) = steps.first_mut() else {
-        return Ok(reasoning_json);
+        return Err(CgError::Engine(
+            "data-integrity: first decision reasoning step is not an object".to_string(),
+        ));
     };
     first_step.insert(
         DECISION_REASONING_PRODUCER_SNAPSHOTS_KEY.to_string(),
