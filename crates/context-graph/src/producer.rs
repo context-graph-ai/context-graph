@@ -45,6 +45,25 @@ impl fmt::Display for EvidenceProducer {
     }
 }
 
+// Drive both placements from one evidence/space pair, so a match in both handle
+// tables still produces one lineage row. Only evidence handles may match locally.
+pub(crate) fn evidence_producer_handle_query(
+    leading_projection: &str,
+    evidence_join: &str,
+    filter: &str,
+) -> String {
+    format!(
+        "SELECT {leading_projection}evidence.id, embedding_spaces.embedding_space_id, \
+         COALESCE(evidence_embedding_handles.produced_by, reproducible_vector_handles.produced_by), \
+         COALESCE(evidence_embedding_handles.created_at, reproducible_vector_handles.created_at) \
+         FROM {evidence_join} \
+         INNER JOIN embedding_spaces ON 1 = 1 \
+         LEFT JOIN evidence_embedding_handles ON evidence_embedding_handles.context_id = evidence.context_id AND evidence_embedding_handles.target_id = evidence.id AND evidence_embedding_handles.embedding_space_id = embedding_spaces.embedding_space_id \
+         LEFT JOIN reproducible_vector_handles ON reproducible_vector_handles.context_id = evidence.context_id AND reproducible_vector_handles.target_id = evidence.id AND reproducible_vector_handles.embedding_space_id = embedding_spaces.embedding_space_id AND reproducible_vector_handles.target_table = 'evidence' \
+         WHERE {filter} AND (evidence_embedding_handles.target_id IS NOT NULL OR reproducible_vector_handles.target_id IS NOT NULL)"
+    )
+}
+
 impl Store {
     pub fn decision_lineage_producer_systems(
         &self,
@@ -91,13 +110,12 @@ impl Store {
             .map(|idx| format!("$decision_id_{idx}"))
             .collect::<Vec<_>>()
             .join(", ");
-        let sql = format!(
-            "SELECT decision_basis_snapshots.decision_id, evidence_embedding_handles.target_id, evidence_embedding_handles.embedding_space_id, evidence_embedding_handles.produced_by, evidence_embedding_handles.created_at \
-             FROM decision_basis_snapshots \
+        let sql = evidence_producer_handle_query(
+            "decision_basis_snapshots.decision_id, ",
+            "decision_basis_snapshots \
              INNER JOIN entity_snapshot_observations ON entity_snapshot_observations.context_id = decision_basis_snapshots.context_id AND entity_snapshot_observations.entity_id = decision_basis_snapshots.entity_id AND entity_snapshot_observations.snapshot_id = decision_basis_snapshots.snapshot_id \
-             INNER JOIN evidence ON evidence.context_id = entity_snapshot_observations.context_id AND evidence.observation_id = entity_snapshot_observations.observation_id \
-             INNER JOIN evidence_embedding_handles ON evidence_embedding_handles.context_id = evidence.context_id AND evidence_embedding_handles.target_id = evidence.id \
-             WHERE decision_basis_snapshots.decision_id IN ({placeholders})"
+             INNER JOIN evidence ON evidence.context_id = entity_snapshot_observations.context_id AND evidence.observation_id = entity_snapshot_observations.observation_id",
+            &format!("decision_basis_snapshots.decision_id IN ({placeholders})"),
         );
         let mut params = HashMap::new();
         for (idx, decision_id) in decision_ids.iter().enumerate() {

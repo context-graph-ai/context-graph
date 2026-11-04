@@ -6,6 +6,7 @@ use serde_json::Value as JsonValue;
 use crate::error::CgError;
 use crate::producer::{
     DecisionReasoningProducerSnapshot, attach_decision_reasoning_producer_snapshots,
+    evidence_producer_handle_query,
 };
 use crate::types::*;
 use crate::{Result, TxId};
@@ -379,12 +380,11 @@ impl Store {
             .map(|idx| format!("$snapshot_id_{idx}"))
             .collect::<Vec<_>>()
             .join(", ");
-        let sql = format!(
-            "SELECT evidence_embedding_handles.target_id, evidence_embedding_handles.embedding_space_id, evidence_embedding_handles.produced_by, evidence_embedding_handles.created_at \
-             FROM entity_snapshot_observations \
-             INNER JOIN evidence ON evidence.context_id = entity_snapshot_observations.context_id AND evidence.observation_id = entity_snapshot_observations.observation_id \
-             INNER JOIN evidence_embedding_handles ON evidence_embedding_handles.context_id = evidence.context_id AND evidence_embedding_handles.target_id = evidence.id \
-             WHERE entity_snapshot_observations.snapshot_id IN ({placeholders})"
+        let sql = evidence_producer_handle_query(
+            "",
+            "entity_snapshot_observations \
+             INNER JOIN evidence ON evidence.context_id = entity_snapshot_observations.context_id AND evidence.observation_id = entity_snapshot_observations.observation_id",
+            &format!("entity_snapshot_observations.snapshot_id IN ({placeholders})"),
         );
         let mut params = HashMap::new();
         for (idx, snapshot) in basis_snapshots.iter().enumerate() {
