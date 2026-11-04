@@ -18,12 +18,16 @@ use contextdb_engine::Database;
 const TEXT_SPACE: &str = "text_default_nomic_v1_5_768";
 
 fn store() -> Store {
+    store_at(std::env::temp_dir().join(format!(
+        "decision-reasoning-metadata-{}.db",
+        uuid::Uuid::now_v7()
+    )))
+}
+
+fn store_at(db_path: std::path::PathBuf) -> Store {
     Store::open_with_embedder_registrations(
         StoreConfig {
-            db_path: std::env::temp_dir().join(format!(
-                "decision-reasoning-metadata-{}.db",
-                uuid::Uuid::now_v7()
-            )),
+            db_path,
             ..Default::default()
         },
         vec![EmbedderRegistration {
@@ -227,6 +231,35 @@ fn record_same_entity_decoy_embedding(store: &Store, fixture: &DecisionProducerF
     );
 }
 
+/// The write transactions of the handles a producer currently holds, read from wherever the space
+/// keeps them: the per-row evidence handle table for a travelling space and this node's handle
+/// table for a node-local one (the test space is node-local, which replaces a handle in place when
+/// it embeds again). What the test asks is whether the CURRENT handle is the new one, never how
+/// many rows a placement keeps.
+fn current_handle_write_txids(db_path: &Path, version: &str) -> Vec<u64> {
+    let db = Database::open(db_path).expect("raw db");
+    let mut txids = Vec::new();
+    for table in ["evidence_embedding_handles", "reproducible_vector_handles"] {
+        let result = db
+            .execute(
+                &format!("SELECT created_at FROM {table} WHERE produced_by = $producer"),
+                &HashMap::from([(
+                    "producer".to_string(),
+                    Value::Json(serde_json::to_value(producer(version)).expect("producer json")),
+                )]),
+            )
+            .expect("producer handles");
+        for row in result.rows() {
+            match row.first() {
+                Some(Value::TxId(txid)) => txids.push(txid.0),
+                other => panic!("unexpected handle write cell: {other:?}"),
+            }
+        }
+    }
+    txids.sort_unstable();
+    txids
+}
+
 /// Handle rows a producer wrote, counted where the space keeps them: the per-row evidence handle
 /// table for a travelling space and this node's handle table for a node-local one. The test space
 /// is node-local, so the count must read both.
@@ -250,6 +283,36 @@ fn persisted_handle_rows_for_version(db_path: &Path, version: &str) -> i64 {
             }
         })
         .sum()
+}
+
+/// Build the decision and its same-entity decoy, read the decision's lineage at write time, then
+/// reindex the space on a reopened store. Returns the db path, the decision, the lineage read
+/// before the reindex, and the decoy's current handle write transactions before and after it.
+fn decision_then_reindex() -> (
+    std::path::PathBuf,
+    context_graph::DecisionId,
+    Vec<context_graph::producer::DecisionProducerLineageRow>,
+    Vec<u64>,
+    Vec<u64>,
+) {
+    let (db_path, decision_id, rows_at_write) = {
+        let store = store();
+        let fixture = create_decision_with_seeded_embedding(&store, "1");
+        record_same_entity_decoy_embedding(&store, &fixture);
+        let rows = store
+            .decision_lineage_producer_systems(&[fixture.decision.id])
+            .expect("lineage at write time");
+        (store.db_path().to_path_buf(), fixture.decision.id, rows)
+    };
+    let handles_before = current_handle_write_txids(&db_path, "2");
+    {
+        let store = store_at(db_path.clone());
+        store
+            .reindex_space(TEXT_SPACE, ReindexOptions::default())
+            .expect("reindex the space");
+    }
+    let handles_after = current_handle_write_txids(&db_path, "2");
+    (db_path, decision_id, rows_at_write, handles_before, handles_after)
 }
 
 #[test]
@@ -285,14 +348,8 @@ fn embedder_metadata_stored_on_decision() {
 #[test]
 fn embedding_metadata_stored_on_decision_reasoning_chain_at_write_time_not_derived_at_read() {
     let _alongside = crate::runs_alone::alongside_siblings();
-    let (db_path, decision_id) = {
-        let store = store();
-        let fixture = create_decision_with_seeded_embedding(&store, "1");
-        record_same_entity_decoy_embedding(&store, &fixture);
-        let _reindex = store.reindex_space(TEXT_SPACE, ReindexOptions::default());
-        (store.db_path().to_path_buf(), fixture.decision.id)
-    };
-    let decoy_rows = persisted_handle_rows_for_version(&db_path, "2");
+    let (db_path, decision_id, rows_at_write, handles_before, handles_after) =
+        decision_then_reindex();
     let store = Store::open(StoreConfig {
         db_path,
         ..Default::default()
@@ -301,26 +358,25 @@ fn embedding_metadata_stored_on_decision_reasoning_chain_at_write_time_not_deriv
     let rows = store.decision_lineage_producer_systems(&[decision_id]);
 
     assert!(
-        decoy_rows == 2
-            && rows.as_ref().is_ok_and(|rows| rows.len() == 1
-                && rows[0].model_version == "1"
-                && !rows[0].write_txid.is_empty()
-                && rows[0].embedding_space_id == TEXT_SPACE),
-        "decision reasoning must keep the write-time producer snapshot across the decoy's original and post-reindex producer rows, decoy_rows={decoy_rows}, rows={rows:?}"
+        rows.as_ref().is_ok_and(|rows| rows == &rows_at_write
+            && rows.len() == 1
+            && rows[0].model_version == "1"
+            && !rows[0].write_txid.is_empty()
+            && rows[0].embedding_space_id == TEXT_SPACE),
+        "after the reindex the decision reports exactly the producer snapshot it stored at write time, not one derived from a current handle, rows_at_write={rows_at_write:?}, rows={rows:?}"
+    );
+    assert!(
+        !handles_after.is_empty()
+            && handles_after.iter().all(|txid| Some(txid) > handles_before.iter().max()),
+        "the decoy's current handle after the reindex is the new one, written after every handle it had before: before={handles_before:?}, after={handles_after:?}"
     );
 }
 
 #[test]
 fn decision_reasoning_chain_producer_remains_queryable_after_subsequent_reindex() {
     let _alongside = crate::runs_alone::alongside_siblings();
-    let (db_path, decision_id) = {
-        let store = store();
-        let fixture = create_decision_with_seeded_embedding(&store, "1");
-        record_same_entity_decoy_embedding(&store, &fixture);
-        let _reindex = store.reindex_space(TEXT_SPACE, ReindexOptions::default());
-        (store.db_path().to_path_buf(), fixture.decision.id)
-    };
-    let decoy_rows = persisted_handle_rows_for_version(&db_path, "2");
+    let (db_path, decision_id, rows_at_write, handles_before, handles_after) =
+        decision_then_reindex();
     let store = Store::open(StoreConfig {
         db_path,
         ..Default::default()
@@ -329,14 +385,13 @@ fn decision_reasoning_chain_producer_remains_queryable_after_subsequent_reindex(
     let rows = store.decision_lineage_producer_systems(&[decision_id]);
 
     assert!(
-        decoy_rows == 2
-            && rows
-                .as_ref()
-                .is_ok_and(|rows| rows.iter().any(|row| row.decision_id == decision_id
-                    && row.producer_system == context_graph::CG_EDGE_SYSTEM_TAG
-                    && row.audit_grade == "first-party"
-                    && row.model_version == "1"
-                    && row.embedding_space_id == TEXT_SPACE)),
-        "producer metadata must remain queryable from stored decision lineage after the decoy's original and post-reindex producer rows, decoy_rows={decoy_rows}, rows={rows:?}"
+        rows.as_ref()
+            .is_ok_and(|rows| rows.iter().any(|row| row.decision_id == decision_id
+                && row.producer_system == context_graph::CG_EDGE_SYSTEM_TAG
+                && row.audit_grade == "first-party"
+                && row.model_version == "1"
+                && row.embedding_space_id == TEXT_SPACE)
+                && rows.iter().all(|row| rows_at_write.contains(row))),
+        "producer metadata stays queryable from the decision's stored lineage after the reindex and matches what was read at write time, rows_at_write={rows_at_write:?}, rows={rows:?}"
     );
 }
