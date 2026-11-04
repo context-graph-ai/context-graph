@@ -227,21 +227,29 @@ fn record_same_entity_decoy_embedding(store: &Store, fixture: &DecisionProducerF
     );
 }
 
+/// Handle rows a producer wrote, counted where the space keeps them: the per-row evidence handle
+/// table for a travelling space and this node's handle table for a node-local one. The test space
+/// is node-local, so the count must read both.
 fn persisted_handle_rows_for_version(db_path: &Path, version: &str) -> i64 {
     let db = Database::open(db_path).expect("raw db");
-    let result = db
-        .execute(
-            "SELECT COUNT(*) AS n FROM evidence_embedding_handles WHERE produced_by = $producer",
-            &HashMap::from([(
-                "producer".to_string(),
-                Value::Json(serde_json::to_value(producer(version)).expect("producer json")),
-            )]),
-        )
-        .expect("producer count");
-    match result.rows().first().and_then(|row| row.first()) {
-        Some(Value::Int64(n)) => *n,
-        other => panic!("unexpected producer count cell: {other:?}"),
-    }
+    ["evidence_embedding_handles", "reproducible_vector_handles"]
+        .iter()
+        .map(|table| {
+            let result = db
+                .execute(
+                    &format!("SELECT COUNT(*) AS n FROM {table} WHERE produced_by = $producer"),
+                    &HashMap::from([(
+                        "producer".to_string(),
+                        Value::Json(serde_json::to_value(producer(version)).expect("producer json")),
+                    )]),
+                )
+                .expect("producer count");
+            match result.rows().first().and_then(|row| row.first()) {
+                Some(Value::Int64(n)) => *n,
+                other => panic!("unexpected producer count cell: {other:?}"),
+            }
+        })
+        .sum()
 }
 
 #[test]

@@ -132,19 +132,39 @@ fn vector() -> Vec<f32> {
     vector
 }
 
+/// The oracle's lineage SQL over the per-row evidence handle table (a travelling space).
 #[cfg(context_graph_internal_test_support)]
 fn raw_lineage_query(decision_ids: &[DecisionId]) -> String {
+    raw_lineage_query_over(
+        decision_ids,
+        "evidence_embedding_handles",
+        "evidence_embedding_handles.target_id = evidence.id",
+    )
+}
+
+/// The same oracle over this node's handle table (a node-local space, such as TEXT_SPACE here).
+#[cfg(context_graph_internal_test_support)]
+fn raw_node_local_lineage_query(decision_ids: &[DecisionId]) -> String {
+    raw_lineage_query_over(
+        decision_ids,
+        "reproducible_vector_handles",
+        "reproducible_vector_handles.target_table = 'evidence' AND reproducible_vector_handles.target_id = evidence.id",
+    )
+}
+
+#[cfg(context_graph_internal_test_support)]
+fn raw_lineage_query_over(decision_ids: &[DecisionId], handles: &str, target: &str) -> String {
     let decision_placeholders = (0..decision_ids.len())
         .map(|idx| format!("$decision_id_{idx}"))
         .collect::<Vec<_>>()
         .join(", ");
     format!(
-        "SELECT decision_basis_snapshots.decision_id, evidence_embedding_handles.embedding_space_id, evidence_embedding_handles.produced_by, evidence_embedding_handles.created_at \
+        "SELECT decision_basis_snapshots.decision_id, {handles}.embedding_space_id, {handles}.produced_by, {handles}.created_at \
      FROM decision_basis_snapshots \
      INNER JOIN entity_snapshot_observations ON entity_snapshot_observations.context_id = decision_basis_snapshots.context_id AND entity_snapshot_observations.entity_id = decision_basis_snapshots.entity_id AND entity_snapshot_observations.snapshot_id = decision_basis_snapshots.snapshot_id \
      INNER JOIN evidence ON evidence.context_id = entity_snapshot_observations.context_id AND evidence.observation_id = entity_snapshot_observations.observation_id \
-     INNER JOIN evidence_embedding_handles ON evidence_embedding_handles.context_id = evidence.context_id AND evidence_embedding_handles.target_id = evidence.id \
-     WHERE decision_basis_snapshots.decision_id IN ({decision_placeholders}) AND evidence_embedding_handles.embedding_space_id = $space"
+     INNER JOIN {handles} ON {handles}.context_id = evidence.context_id AND {target} \
+     WHERE decision_basis_snapshots.decision_id IN ({decision_placeholders}) AND {handles}.embedding_space_id = $space"
     )
 }
 
@@ -183,24 +203,46 @@ fn raw_decision_producer_display(
     space: &str,
 ) -> Option<String> {
     let db = Database::open(db_path).expect("raw db");
-    let result = db
-        .execute(
-            "SELECT evidence_embedding_handles.embedding_space_id, evidence_embedding_handles.produced_by, evidence_embedding_handles.created_at \
+    // A space keeps its handles per row (travelling) or on this node (node-local); the oracle asks both.
+    let params = HashMap::from([
+        (
+            "decision_id".to_string(),
+            Value::Uuid(decision_id.as_uuid()),
+        ),
+        ("space".to_string(), Value::Text(space.to_string())),
+    ]);
+    let lineage_sql = |handles: &str, target: &str| {
+        format!(
+            "SELECT {handles}.embedding_space_id, {handles}.produced_by, {handles}.created_at \
              FROM decision_basis_snapshots \
              INNER JOIN entity_snapshot_observations ON entity_snapshot_observations.context_id = decision_basis_snapshots.context_id AND entity_snapshot_observations.entity_id = decision_basis_snapshots.entity_id AND entity_snapshot_observations.snapshot_id = decision_basis_snapshots.snapshot_id \
              INNER JOIN evidence ON evidence.context_id = entity_snapshot_observations.context_id AND evidence.observation_id = entity_snapshot_observations.observation_id \
-             INNER JOIN evidence_embedding_handles ON evidence_embedding_handles.context_id = evidence.context_id AND evidence_embedding_handles.target_id = evidence.id \
-             WHERE decision_basis_snapshots.decision_id = $decision_id AND evidence_embedding_handles.embedding_space_id = $space",
-            &HashMap::from([
-                (
-                    "decision_id".to_string(),
-                    Value::Uuid(decision_id.as_uuid()),
-                ),
-                ("space".to_string(), Value::Text(space.to_string())),
-            ]),
+             INNER JOIN {handles} ON {handles}.context_id = evidence.context_id AND {target} \
+             WHERE decision_basis_snapshots.decision_id = $decision_id AND {handles}.embedding_space_id = $space"
+        )
+    };
+    let in_row = db
+        .execute(
+            &lineage_sql(
+                "evidence_embedding_handles",
+                "evidence_embedding_handles.target_id = evidence.id",
+            ),
+            &params,
         )
         .expect("raw decision producer query");
-    let row = result.rows().first()?;
+    let node_local = db
+        .execute(
+            &lineage_sql(
+                "reproducible_vector_handles",
+                "reproducible_vector_handles.target_table = 'evidence' AND reproducible_vector_handles.target_id = evidence.id",
+            ),
+            &params,
+        )
+        .expect("raw node-local decision producer query");
+    let row = in_row
+        .rows()
+        .first()
+        .or_else(|| node_local.rows().first())?;
     let space = match row.first() {
         Some(Value::Text(space)) => space,
         _ => return None,
@@ -499,11 +541,21 @@ fn regulator_one_query_joins_decision_lineage_to_producer_system_across_n_observ
     let sql = raw_lineage_query(&decision_ids);
     let raw_params = raw_lineage_params(&decision_ids, TEXT_SPACE);
     let raw_result = db.execute(&sql, &raw_params);
+    let node_local_sql = raw_node_local_lineage_query(&decision_ids);
+    let node_local_result = db.execute(&node_local_sql, &raw_params);
     let explain = db.explain(&sql).unwrap_or_default();
     let rows = raw_result
         .as_ref()
         .map(|result| decode_raw_lineage_rows(&result.rows()))
-        .unwrap_or_default();
+        .unwrap_or_default()
+        .into_iter()
+        .chain(
+            node_local_result
+                .as_ref()
+                .map(|result| decode_raw_lineage_rows(&result.rows()))
+                .unwrap_or_default(),
+        )
+        .collect::<Vec<_>>();
     let expected = decision_ids
         .iter()
         .enumerate()
@@ -529,6 +581,7 @@ fn regulator_one_query_joins_decision_lineage_to_producer_system_across_n_observ
 
     assert!(
         raw_result.is_ok()
+            && node_local_result.is_ok()
             && rows.len() == 20
             && public_result.as_ref().is_ok_and(|public_rows| {
                 public_rows.len() == 20
