@@ -843,6 +843,7 @@ impl Store {
             "evidence_embedding_handles",
             "entity_reference_embedding_handles",
             "digest_embedding_handles",
+            "reproducible_vector_handles",
         ] {
             let Some(_) = self.db.table_meta(table) else {
                 continue;
