@@ -44,7 +44,7 @@ chrono = { workspace = true, features = ["serde"] }
 contextdb-core.workspace = true
 contextdb-engine.workspace = true
 contextdb-parser.workspace = true
-contextdb-server = { git = "https://github.com/context-graph-ai/contextdb", rev = "94cf4f32df25ec3cb2fbaf90ea0a152537bf44a0", features = ["iroh"], optional = true }
+contextdb-server = { git = "https://github.com/context-graph-ai/contextdb", rev = "e9d4e6a1db351137916a9006a21660a2ff4b3d83", features = ["iroh"], optional = true }
 fs4.workspace = true
 pollster.workspace = true
 rayon.workspace = true
@@ -71,7 +71,7 @@ candle-nn.workspace = true
 candle-transformers.workspace = true
 cg-catalog = { path = "../cg-catalog", features = ["embeddinggemma-test-support"] }
 cg-connector-claude-code.workspace = true
-contextdb-server = { git = "https://github.com/context-graph-ai/contextdb", rev = "94cf4f32df25ec3cb2fbaf90ea0a152537bf44a0", features = ["iroh", "test-seams"] }
+contextdb-server = { git = "https://github.com/context-graph-ai/contextdb", rev = "e9d4e6a1db351137916a9006a21660a2ff4b3d83", features = ["iroh", "test-seams"] }
 contextdb-engine = { workspace = true, features = ["test-seams"] }
 contextdb-tx.workspace = true
 contextdb-vector = { workspace = true, features = ["test-seams"] }
