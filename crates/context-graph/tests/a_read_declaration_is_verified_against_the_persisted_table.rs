@@ -187,7 +187,7 @@ fn ids_in(reader: &ConsumerReader, table: &str) -> Vec<String> {
     let answered = reader
         .execute(&format!("SELECT id FROM {table} ORDER BY id"), &no_params())
         .expect("the declared table answers the reader that declared it");
-    text_column(&answered.rows)
+    text_column(answered.rows())
 }
 
 /// What an open on a forged declaration actually did — refused, or opened and served rows.

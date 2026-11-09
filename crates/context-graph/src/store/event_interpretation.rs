@@ -1,3 +1,7 @@
+#![allow(
+    clippy::result_large_err,
+    reason = "The engine's public error carries its refusal diagnostics inline (160+ bytes); this module passes it through unchanged."
+)]
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::num::NonZeroUsize;
 
@@ -345,30 +349,30 @@ pub(crate) fn list_coverage_gaps(
         let context_start = rows.len();
         let read = (|| -> Result<()> {
             let first = cursor.first_page();
-            let mut has_more = first.has_more;
+            let mut has_more = first.has_more();
             append_gap_page(
                 store,
                 &connector_id,
                 page.affected_event_handle_limit.get(),
                 context_start,
                 per_context_limit,
-                &first.columns,
-                &first.rows,
+                first.columns(),
+                first.rows(),
                 &mut rows,
             )?;
             while has_more && rows.len().saturating_sub(context_start) < per_context_limit {
                 let next = cursor
                     .fetch(NonZeroUsize::new(GAP_SCAN_PAGE_ROWS as usize))
                     .map_err(map_engine_err)?;
-                has_more = next.has_more;
+                has_more = next.has_more();
                 append_gap_page(
                     store,
                     &connector_id,
                     page.affected_event_handle_limit.get(),
                     context_start,
                     per_context_limit,
-                    &next.columns,
-                    &next.rows,
+                    next.columns(),
+                    next.rows(),
                     &mut rows,
                 )?;
             }
@@ -454,20 +458,26 @@ fn materialize_coverage_gaps(
             .map_err(map_engine_err)?;
         let scanned = (|| -> Result<()> {
             let first = cursor.first_page();
-            let mut has_more = first.has_more;
+            let mut has_more = first.has_more();
             persist_gap_page(
                 store,
                 *context_id,
                 connector_id,
-                &first.columns,
-                &first.rows,
+                first.columns(),
+                first.rows(),
             )?;
             while has_more {
                 let next = cursor
                     .fetch(NonZeroUsize::new(GAP_SCAN_PAGE_ROWS as usize))
                     .map_err(map_engine_err)?;
-                has_more = next.has_more;
-                persist_gap_page(store, *context_id, connector_id, &next.columns, &next.rows)?;
+                has_more = next.has_more();
+                persist_gap_page(
+                    store,
+                    *context_id,
+                    connector_id,
+                    next.columns(),
+                    next.rows(),
+                )?;
             }
             Ok(())
         })();
@@ -528,7 +538,7 @@ fn persist_gap_link(
             &link_params,
         )
         .map_err(map_engine_err)?
-        .rows
+        .rows()
         .is_empty()
     {
         return Ok(());
@@ -555,7 +565,7 @@ fn persist_gap_link(
             "SELECT id FROM adapter_coverage_gaps WHERE context_id = $context_id AND id = $id",
             &gap_params,
         )?;
-        if existing.rows.is_empty() {
+        if existing.rows().is_empty() {
             db.execute_in_tx(
                 tx,
                 "INSERT INTO adapter_coverage_gaps (id, context_id, connector_id, captured_adapter_version, fingerprint_sha256, first_seen_at, last_seen_at) VALUES ($id, $context_id, $connector_id, $captured_adapter_version, $fingerprint_sha256, $seen_at, $seen_at)",
@@ -640,14 +650,14 @@ fn gap_events(
     let mut all_complete = true;
     let read = (|| -> Result<()> {
         let first = cursor.first_page();
-        let mut has_more = first.has_more;
+        let mut has_more = first.has_more();
         visit_gap_event_page(
             store,
             context_id,
             active_generation,
             affected_limit,
-            &first.columns,
-            &first.rows,
+            first.columns(),
+            first.rows(),
             &mut affected,
             &mut count,
             &mut all_complete,
@@ -656,14 +666,14 @@ fn gap_events(
             let page = cursor
                 .fetch(NonZeroUsize::new(GAP_SCAN_PAGE_ROWS as usize))
                 .map_err(map_engine_err)?;
-            has_more = page.has_more;
+            has_more = page.has_more();
             visit_gap_event_page(
                 store,
                 context_id,
                 active_generation,
                 affected_limit,
-                &page.columns,
-                &page.rows,
+                page.columns(),
+                page.rows(),
                 &mut affected,
                 &mut count,
                 &mut all_complete,
@@ -725,10 +735,10 @@ fn active_generation(
             ]),
         )?;
     result
-        .rows
+        .rows()
         .first()
         .map(|row| {
-            get_uuid(row, &result.columns, "generation_id").map(InterpretationGenerationId::from)
+            get_uuid(row, result.columns(), "generation_id").map(InterpretationGenerationId::from)
         })
         .transpose()
 }
@@ -753,10 +763,9 @@ fn event_has_complete_active_value(
                 ("event_id".into(), Value::Uuid(event_id.as_uuid())),
             ]),
         )?;
-    Ok(result
-        .rows
-        .first()
-        .is_some_and(|row| get_text(row, &result.columns, "coverage").as_deref() == Ok("complete")))
+    Ok(result.rows().first().is_some_and(|row| {
+        get_text(row, result.columns(), "coverage").as_deref() == Ok("complete")
+    }))
 }
 
 fn context_status(
@@ -804,26 +813,26 @@ fn count_uncovered_gaps(store: &Store, context_id: ContextId, connector_id: &str
     let mut uncovered = 0_u64;
     let counted = (|| -> Result<()> {
         let first = cursor.first_page();
-        let mut has_more = first.has_more;
+        let mut has_more = first.has_more();
         count_uncovered_gap_page(
             store,
             context_id,
             connector_id,
-            &first.columns,
-            &first.rows,
+            first.columns(),
+            first.rows(),
             &mut uncovered,
         )?;
         while has_more {
             let page = cursor
                 .fetch(NonZeroUsize::new(GAP_SCAN_PAGE_ROWS as usize))
                 .map_err(map_engine_err)?;
-            has_more = page.has_more;
+            has_more = page.has_more();
             count_uncovered_gap_page(
                 store,
                 context_id,
                 connector_id,
-                &page.columns,
-                &page.rows,
+                page.columns(),
+                page.rows(),
                 &mut uncovered,
             )?;
         }
@@ -882,10 +891,10 @@ fn generation_status_row(
             "SELECT target_interpretation_version, event_count, ordered_source_set_sha256, interpreted_event_count, state, sanitized_failure FROM event_interpretation_generations WHERE context_id = $context_id AND connector_id = $connector_id AND id = $generation_id",
             &params,
         )?;
-    let Some(row) = result.rows.first() else {
+    let Some(row) = result.rows().first() else {
         return Ok(None);
     };
-    decode_generation_status_row(row, &result.columns).map(Some)
+    decode_generation_status_row(row, result.columns()).map(Some)
 }
 
 type RetainedGenerationStatusRow = (crate::TxId, Uuid, Vec<String>, Vec<Value>);
@@ -913,14 +922,14 @@ fn latest_generation_status_row(
     let mut latest = None;
     let read = (|| -> Result<()> {
         let first = cursor.first_page();
-        let mut has_more = first.has_more;
-        retain_latest_generation_status(&first.columns, &first.rows, &mut latest)?;
+        let mut has_more = first.has_more();
+        retain_latest_generation_status(first.columns(), first.rows(), &mut latest)?;
         while has_more {
             let page = cursor
                 .fetch(NonZeroUsize::new(GAP_SCAN_PAGE_ROWS as usize))
                 .map_err(map_engine_err)?;
-            has_more = page.has_more;
-            retain_latest_generation_status(&page.columns, &page.rows, &mut latest)?;
+            has_more = page.has_more();
+            retain_latest_generation_status(page.columns(), page.rows(), &mut latest)?;
         }
         Ok(())
     })();
@@ -1158,8 +1167,8 @@ fn activate_in_tx(
             ]),
         )
         .map_err(map_engine_err)?;
-    let columns = &generation.columns;
-    let row = match generation.rows.as_slice() {
+    let columns = &generation.columns();
+    let row = match generation.rows() {
         [row] if get_text(row, columns, "connector_id")? == request.connector_id => row,
         _ => {
             return Err(CgError::NotFound {
@@ -1202,12 +1211,12 @@ fn activate_in_tx(
         )
         .map_err(map_engine_err)?;
     let previous_head = head
-        .rows
+        .rows()
         .first()
         .map(|row| {
             Ok::<_, CgError>((
-                InterpretationGenerationId::from(get_uuid(row, &head.columns, "generation_id")?),
-                get_txid(row, &head.columns, "activated_at")?,
+                InterpretationGenerationId::from(get_uuid(row, head.columns(), "generation_id")?),
+                get_txid(row, head.columns(), "activated_at")?,
             ))
         })
         .transpose()?;
@@ -1386,7 +1395,7 @@ fn activate_in_tx(
     let switched = db
         .execute_in_tx(tx, head_sql, &head_params)
         .map_err(map_engine_err)?;
-    if switched.rows_affected != 1 {
+    if switched.rows_affected() != 1 {
         return Ok(ActivationAttempt::Retry);
     }
     activate_staged_search_in_tx(store, tx, &search)?;
@@ -1408,7 +1417,7 @@ fn activate_in_tx(
             ]),
         )
         .map_err(map_engine_err)?;
-    if recorded.rows_affected != 1 {
+    if recorded.rows_affected() != 1 {
         return Ok(ActivationAttempt::Retry);
     }
     Ok(ActivationAttempt::Commit(Box::new(receipt)))

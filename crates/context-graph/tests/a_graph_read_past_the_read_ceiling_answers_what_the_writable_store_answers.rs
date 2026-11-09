@@ -330,7 +330,7 @@ fn a_cursor_asked_for_its_first_page_after_close_never_panics() {
         .fetch(None)
         .expect("the cursor pages the site's observations");
     assert!(
-        !page.rows.is_empty(),
+        !page.rows().is_empty(),
         "the cursor must have rows to page, or closing it proves nothing",
     );
     assert!(

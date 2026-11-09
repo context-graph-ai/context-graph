@@ -181,14 +181,14 @@ fn fill(store: &Store) -> MixedStore {
 
 /// The `kind` capture stamped on a digest it wrote.
 fn captured_kind(store: &Store, digest: DigestId) -> String {
-    let rows = store
+    let answer = store
         .sync_database()
         .execute(
             "SELECT kind FROM digests WHERE id = $id",
             &HashMap::from([("id".to_string(), DbValue::Uuid(digest.as_uuid()))]),
         )
-        .expect("read a captured digest's kind")
-        .rows;
+        .expect("read a captured digest's kind");
+    let rows = answer.rows();
     match rows.first().and_then(|row| row.first()) {
         Some(DbValue::Text(kind)) => kind.clone(),
         other => panic!("a captured digest carries a text kind, not {other:?}"),
@@ -278,7 +278,7 @@ fn completion_exists(store: &Store, digest: DigestId) -> bool {
             &HashMap::from([("id".to_string(), DbValue::Text(digest.to_string()))]),
         )
         .expect("read the understanding completions")
-        .rows
+        .rows()
         .is_empty()
 }
 

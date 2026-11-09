@@ -67,7 +67,7 @@
 //!   `CG_EVENT_BENCH_FRESH_GRAPH_SOURCE` (the `P10000-K1-sessions` directory) into a fresh
 //!   single-partition store at `CG_EVENT_BENCH_FRESH_GRAPH_DIR` (an absent directory). It asserts
 //!   no graph/base generation exists, times one caller-driven production maintenance call under
-//!   a fixed 1.5 GiB writer ceiling, then checks durable readiness and indexed search after restart.
+//!   a fixed 1.5 GiB writer ceiling, then checks exact search after restart (no vector index ships, so no graph exists).
 //!   Emits `fixture.fresh_graph_build_seconds`; the sessions fixture's final maintenance timer is
 //!   `post_projection_maintenance_seconds`. This graph cell does not replace capture/projection;
 //! - `event_fixture_vector_geometry` reads a sealed fixture and measures exact neighbour
@@ -83,8 +83,7 @@
 //!   drop, including the engine read session's charged bytes after open.
 //!   A missing/invalid fixture panics with the exact preparation command; it never builds one.
 //! - `event_find_recall_at_10_against_exact_on_the_real_model_fixture` the search-quality gate on
-//!   real-model vectors: recall@10 of the declared route (and, in the single-Context cell, of
-//!   explicit INDEXED) against EXACT over the same stored vectors, for held-out real-text queries,
+//!   real-model vectors: recall@10 of the declared route against EXACT over the same stored vectors, for held-out real-text queries,
 //!   with distance evaluations per cell. The gate runs it on the real-session corpus
 //!   (`CG_EVENT_BENCH_CORPUS_JSONL_DIR`); without one it uses the `nomic` generated-text fixtures
 //!   as a smoke and says so. `CG_EVENT_BENCH_TOTALS` / `CG_EVENT_BENCH_CONTEXTS` are single values
@@ -660,7 +659,7 @@ fn stream_tail_trace(store: &Store, context_id: ContextId) {
         traces.push(json!({
             "source_instance_ref": source,
             "ms": ms(started.elapsed()),
-            "trace": format!("{:?}", result.trace),
+            "trace": format!("{:?}", result.trace()),
         }));
     }
     emit(json!({"bench": APPEND_NAME, "stream_tail_statement": TAIL, "traces": traces}));
@@ -979,7 +978,7 @@ mod fixture {
                 &HashMap::new(),
             )
             .expect("count current passage vectors")
-            .rows[0][0]
+            .rows()[0][0]
         {
             Value::Int64(n) => u64::try_from(n).expect("nonnegative vector count"),
             ref other => panic!("expected vector count, got {other:?}"),
@@ -1023,7 +1022,7 @@ mod fixture {
                 .execute(sql, &HashMap::new())
                 .expect("read fixture content");
             let mut rows = result
-                .rows
+                .rows()
                 .iter()
                 .map(|row| format!("{row:?}"))
                 .collect::<Vec<_>>();
@@ -1977,7 +1976,7 @@ mod fixture {
                 &HashMap::from([("current".into(), Value::Bool(true))]),
             )
             .expect("count active passages")
-            .rows
+            .rows()
             .len();
         assert_eq!(counted, total_passages, "every synthetic passage is active");
         let distinct = contexts.iter().copied().collect::<BTreeSet<_>>().len();
@@ -2014,10 +2013,10 @@ mod fixture {
             let generations = read(
                 "SELECT context_id, event_count, searchable_event_count FROM event_search_generations",
             );
-            let context_at = column(&generations.columns, "context_id");
-            let events_at = column(&generations.columns, "event_count");
-            let searchable_at = column(&generations.columns, "searchable_event_count");
-            for row in &generations.rows {
+            let context_at = column(&generations.columns(), "context_id");
+            let events_at = column(&generations.columns(), "event_count");
+            let searchable_at = column(&generations.columns(), "searchable_event_count");
+            for row in generations.rows() {
                 assert_eq!(
                     number(row, searchable_at),
                     number(row, events_at),
@@ -2029,13 +2028,13 @@ mod fixture {
             let progress = read(
                 "SELECT context_id, connector_id, session_ref, searchable_event_count, is_published FROM event_search_session_progress",
             );
-            let context_at = column(&progress.columns, "context_id");
-            let connector_at = column(&progress.columns, "connector_id");
-            let session_at = column(&progress.columns, "session_ref");
-            let searchable_at = column(&progress.columns, "searchable_event_count");
-            let published_at = column(&progress.columns, "is_published");
+            let context_at = column(&progress.columns(), "context_id");
+            let connector_at = column(&progress.columns(), "connector_id");
+            let session_at = column(&progress.columns(), "session_ref");
+            let searchable_at = column(&progress.columns(), "searchable_event_count");
+            let published_at = column(&progress.columns(), "is_published");
             let published = progress
-                .rows
+                .rows()
                 .iter()
                 .filter(|row| matches!(row[published_at], Value::Bool(true)))
                 .map(|row| {
@@ -2053,11 +2052,11 @@ mod fixture {
             let sessions = read(
                 "SELECT context_id, connector_id, session_ref, event_count FROM event_context_sessions",
             );
-            let context_at = column(&sessions.columns, "context_id");
-            let connector_at = column(&sessions.columns, "connector_id");
-            let session_at = column(&sessions.columns, "session_ref");
-            let events_at = column(&sessions.columns, "event_count");
-            for row in &sessions.rows {
+            let context_at = column(&sessions.columns(), "context_id");
+            let connector_at = column(&sessions.columns(), "connector_id");
+            let session_at = column(&sessions.columns(), "session_ref");
+            let events_at = column(&sessions.columns(), "event_count");
+            for row in sessions.rows() {
                 let key = (
                     id(row, context_at),
                     text(row, connector_at),
@@ -2325,7 +2324,7 @@ mod sessions {
                 ("current".into(), Value::Bool(true)),
             ]),
         )
-        .rows
+        .rows()
         .len()
     }
 
@@ -2351,7 +2350,7 @@ mod sessions {
             HashMap::from([("current".into(), Value::Bool(true))]),
         );
         let mut rows = result
-            .rows
+            .rows()
             .iter()
             .map(|row| {
                 let ordinal = match &row[1] {
@@ -2505,7 +2504,7 @@ mod sessions {
             HashMap::new(),
         );
         let generations = heads
-            .rows
+            .rows()
             .iter()
             .map(|row| {
                 (
@@ -2524,9 +2523,9 @@ mod sessions {
             "SELECT context_id, id FROM event_search_passages WHERE is_current = $current",
             HashMap::from([("current".into(), Value::Bool(true))]),
         );
-        let actual_passages = passages.rows.len();
+        let actual_passages = passages.rows().len();
         let sample_passages = passages
-            .rows
+            .rows()
             .iter()
             .step_by(97)
             .take(4_000)
@@ -2538,7 +2537,7 @@ mod sessions {
             })
             .collect::<Vec<_>>();
         let total_events =
-            match sql(&store, "SELECT COUNT(*) AS n FROM events", HashMap::new()).rows[0][0] {
+            match sql(&store, "SELECT COUNT(*) AS n FROM events", HashMap::new()).rows()[0][0] {
                 Value::Int64(n) => n as usize,
                 ref other => panic!("expected a count, got {other:?}"),
             };
@@ -2818,10 +2817,10 @@ pub fn event_fresh_graph_build(_c: &mut Criterion) {
             "SELECT id, context_id, generation_id, content_sha256, vector_text, is_searchable FROM event_search_passages WHERE is_current = TRUE AND id > $after ORDER BY id ASC LIMIT 128",
             &HashMap::from([("after".into(), Value::Uuid(after))]),
         ).expect("read one bounded page of current source vectors");
-        if page.rows.is_empty() {
+        if page.rows().is_empty() {
             break;
         }
-        for row in page.rows {
+        for row in page.rows() {
             let Value::Uuid(id) = row[0] else {
                 panic!("source passage UUID")
             };
@@ -2868,13 +2867,13 @@ pub fn event_fresh_graph_build(_c: &mut Criterion) {
             &HashMap::new(),
         )
         .expect("source search heads");
-    assert_eq!(heads.rows.len(), 1);
+    assert_eq!(heads.rows().len(), 1);
     assert_eq!(
         source_partition,
-        Some((heads.rows[0][0].clone(), heads.rows[0][1].clone()))
+        Some((heads.rows()[0][0].clone(), heads.rows()[0][1].clone()))
     );
     let mut heads = heads
-        .rows
+        .rows()
         .iter()
         .map(|row| format!("{row:?}"))
         .collect::<Vec<_>>();
@@ -2929,97 +2928,54 @@ pub fn event_fresh_graph_build(_c: &mut Criterion) {
         .expect("seed real Nomic vector under unchanged writer ceiling");
     }
     // The source session and application-owned input vector collection are gone before timing.
-    let index = VectorIndexRef::new("passages", "embedding");
-    let before = db
-        .vector_store_for_test()
-        .partition_infos(&index)
-        .expect("fresh partition facts");
-    assert_eq!(before.len(), 1);
-    let partition = &before[0];
-    assert_eq!(partition.live_rows, ROWS);
-    assert_eq!(partition.retained_rows, 0);
-    assert!(!partition.graph_available);
-    assert!(partition.base_generation.is_none());
-    assert!(
-        partition.maintenance_progress.is_none(),
-        "no build may be in flight"
-    );
-    assert!(partition.maintenance_failure.is_none());
-    assert!(partition.maintenance_failure_details.is_none());
-    assert_eq!(partition.pending_inserts, ROWS);
-    assert_eq!(partition.tombstones, 0);
     assert_eq!(db.memory_limit(), Some(WRITER_LIMIT));
+    // This release ships exact vector search only, so there is no maintained graph to build: the
+    // maintenance call is timed as the production call it is, and the cell checks that the exact
+    // route answers the same stored vectors after a restart.
     let precondition = json!({
-        "asserted": true, "partitions": before.len(), "live_rows": partition.live_rows,
-        "retained_rows": partition.retained_rows, "graph_available": partition.graph_available,
-        "base_generation": partition.base_generation, "build_in_flight": false,
-        "pending_inserts": partition.pending_inserts, "tombstones": partition.tombstones,
-        "maintenance_policy": "caller_driven", "writer_memory_limit_bytes": WRITER_LIMIT,
-        "desired_policy": format!("{:?}", partition.desired_policy),
+        "asserted": true, "maintenance_policy": "caller_driven",
+        "writer_memory_limit_bytes": WRITER_LIMIT, "seeded_vectors": ROWS,
     });
     emit(json!({"bench": NAME, "fresh_graph_precondition": precondition}));
     let started = Instant::now();
     let report = db
         .run_maintenance_cycle()
-        .expect("one production fresh graph maintenance call");
+        .expect("one production maintenance call");
     let seconds = started.elapsed().as_secs_f64();
-    // Emit failure details before asserting: a retained route never counts as a fresh build.
     emit(json!({"bench": NAME, "fresh_graph_maintenance": {
         "seconds": seconds, "report": format!("{report:?}"),
         "built_partitions": report.vector.built_partitions,
         "remaining_partitions": report.vector.remaining_partitions,
         "first_failure": report.vector.first_failure.as_ref().map(|failure| format!("{failure:?}")),
     }}));
-    assert_eq!(report.vector.built_partitions, 1);
-    assert_eq!(report.vector.remaining_partitions, 0);
     assert!(report.vector.first_failure.is_none());
     assert!(report.vector.first_failure_details.is_none());
-    let after = db
-        .vector_store_for_test()
-        .partition_infos(&index)
-        .expect("published graph facts");
-    assert_eq!(after.len(), 1);
-    assert!(after[0].graph_available);
-    assert!(after[0].base_generation.is_some());
-    assert_eq!(after[0].pending_inserts, 0);
-    assert!(after[0].maintenance_failure.is_none());
-    assert!(after[0].maintenance_failure_details.is_none());
-    db.close().expect("close published graph");
+    db.close().expect("close the seeded store");
     let reopened = Database::open_with_options(&path, open_options())
-        .expect("restart published graph at same ceiling");
-    let ready = reopened
-        .vector_store_for_test()
-        .partition_infos(&index)
-        .expect("restart graph facts");
-    assert_eq!(ready.len(), 1);
-    assert!(ready[0].graph_available);
-    assert_eq!(ready[0].base_generation, after[0].base_generation);
+        .expect("restart the seeded store at the same ceiling");
     let query = reopened
         .execute(
             "SELECT embedding FROM passages WHERE id = $id",
             &HashMap::from([("id".into(), Value::Uuid(Uuid::from_u128(100)))]),
         )
         .expect("read restart query vector")
-        .rows[0][0]
+        .rows()[0][0]
         .clone();
     let result = reopened.execute(
-        "SELECT id FROM passages WHERE context_id = $context AND generation_id = $generation AND is_current = TRUE ORDER BY embedding <=> $query USE VECTOR INDEXED LIMIT 10",
+        "SELECT id FROM passages WHERE context_id = $context AND generation_id = $generation AND is_current = TRUE ORDER BY embedding <=> $query USE VECTOR EXACT LIMIT 10",
         &HashMap::from([("context".into(), Value::Uuid(context)), ("generation".into(), Value::Uuid(generation)), ("query".into(), query)]),
-    ).expect("indexed search reads durable graph after restart");
-    assert_eq!(result.rows.len(), 10);
+    ).expect("exact search reads the durable vectors after restart");
+    assert_eq!(result.rows().len(), 10);
     let trace = result
-        .trace
+        .trace()
         .vector_search
         .as_ref()
-        .expect("restart indexed trace");
+        .expect("restart exact trace");
     assert!(
-        trace.route.is_some_and(|route| route.as_str() != "exact")
-            || trace.partition_hnsw.iter().any(|partition| partition
-                .route
-                .is_some_and(|route| route.as_str() != "exact")),
-        "restart search must use the persisted index"
+        trace.route.is_some_and(|route| route.as_str() == "exact"),
+        "restart search serves the exact route, the only one this release ships"
     );
-    let restart_route = route::disclosure(&result.trace);
+    let restart_route = route::disclosure(&result.trace());
     reopened.close().expect("close restarted graph");
     emit(json!({"bench": NAME, "fixture": {
         "fresh_graph_build_seconds": seconds, "contexts": 1, "current_passages": ROWS,
@@ -3648,7 +3604,7 @@ mod route {
                     let result = session.execute(&sql, &params);
                     let read = *totals.0.lock().expect("totals");
                     runs.push(serde_json::json!({
-                        "answered": result.as_ref().map(|r| r.rows.len()).map_err(|e| e.to_string()),
+                        "answered": result.as_ref().map(|r| r.rows().len()).map_err(|e| e.to_string()),
                         "work": read.map(|t| t.work),
                         "active_ms": read.map(|t| t.active_ms),
                     }));
@@ -3673,12 +3629,12 @@ mod route {
     /// The passage ids a vector statement returned, in rank order.
     pub fn ids(result: &contextdb_engine::QueryResult) -> Vec<uuid::Uuid> {
         let id = result
-            .columns
+            .columns()
             .iter()
             .position(|column| column == "id")
             .expect("id column");
         result
-            .rows
+            .rows()
             .iter()
             .map(|row| match &row[id] {
                 Value::Uuid(id) => *id,
@@ -3690,12 +3646,12 @@ mod route {
     /// Count the returned winners by stored Context, preserving the partition they came from.
     pub fn winners_by_context(result: &contextdb_engine::QueryResult) -> BTreeMap<String, usize> {
         let context = result
-            .columns
+            .columns()
             .iter()
             .position(|column| column == "context_id")
             .expect("context_id column");
         let mut counts = BTreeMap::new();
-        for row in &result.rows {
+        for row in result.rows() {
             let Value::Uuid(id) = &row[context] else {
                 panic!("context id is not a UUID: {:?}", row[context]);
             };
@@ -3714,7 +3670,7 @@ mod route {
             "rows_examined": trace.rows_examined,
             "partition_key": vector.map(|v| v.partition_key_columns.clone()),
             "partition_scope": vector.map(|v| v.scope.as_str()),
-            "selected_partitions_disclosed": vector.map(|v| v.partition_hnsw.len()),
+            "selected_partitions_disclosed": vector.map(|v| v.partitions.len()),
             "requested_mode": vector.map(|v| format!("{:?}", v.requested_mode)),
             "resolved_mode": vector.map(|v| format!("{:?}", v.resolved_mode)),
             "route": vector.and_then(|v| v.route).map(|r| r.as_str()),
@@ -3818,7 +3774,7 @@ pub fn event_find_meets_scale_on_the_selected_contextdb_route_without_cg_side_in
                         None,
                     )
                     .expect("passage schema metadata");
-                let DirectMetadataBody::Schema { schema } = schema.body else {
+                let DirectMetadataBody::Schema { schema } = &schema.body else {
                     panic!("schema metadata answered another kind");
                 };
                 let persisted = schema
@@ -3852,7 +3808,7 @@ pub fn event_find_meets_scale_on_the_selected_contextdb_route_without_cg_side_in
                     let planned = session.execute(&sql, &params);
                     // The partition route: the declared (context_id, generation_id) key, one
                     // partition for one Context and a finite selected set for several.
-                    let partition_route = planned.as_ref().map(|r| route::disclosure(&r.trace));
+                    let partition_route = planned.as_ref().map(|r| route::disclosure(&r.trace()));
                     let expected_shape = if scope.len() == 1 { "one" } else { "several" };
                     match &partition_route {
                         Ok(route)
@@ -3893,18 +3849,18 @@ pub fn event_find_meets_scale_on_the_selected_contextdb_route_without_cg_side_in
                 );
                     per_scope.push(json!({
                     "source_links_first_context": {
-                        "trace": linked.as_ref().map(|r| format!("{:?}", r.trace)).map_err(|e| e.to_string()),
-                        "rows": linked.as_ref().map(|r| r.rows.len()).ok(),
+                        "trace": linked.as_ref().map(|r| format!("{:?}", r.trace())).map_err(|e| e.to_string()),
+                        "rows": linked.as_ref().map(|r| r.rows().len()).ok(),
                     },
                     "scope": scope_name,
                     "scope_contexts": scope.len(),
                     "vector_statement": sql,
                     "partition_route": partition_route.map_err(|e| e.to_string()),
-                    "trace": planned.as_ref().map(|r| format!("{:?}", r.trace)).map_err(|e| e.to_string()),
-                    "rows_returned": planned.as_ref().map(|r| r.rows.len()).ok(),
+                    "trace": planned.as_ref().map(|r| format!("{:?}", r.trace())).map_err(|e| e.to_string()),
+                    "rows_returned": planned.as_ref().map(|r| r.rows().len()).ok(),
                     "coverage_count_first_context": {
-                        "trace": counted.as_ref().map(|r| format!("{:?}", r.trace)).map_err(|e| e.to_string()),
-                        "value": counted.as_ref().ok().and_then(|r| r.rows.first().cloned()).map(|row| format!("{row:?}")),
+                        "trace": counted.as_ref().map(|r| format!("{:?}", r.trace())).map_err(|e| e.to_string()),
+                        "value": counted.as_ref().ok().and_then(|r| r.rows().first().cloned()).map(|row| format!("{row:?}")),
                     },
                 }));
                 }
@@ -4031,11 +3987,11 @@ pub fn event_find_meets_scale_on_the_selected_contextdb_route_without_cg_side_in
                         .expect("vector statement alone");
                     let elapsed = started.elapsed();
                     assert_eq!(
-                        result.rows.len(),
+                        result.rows().len(),
                         10,
                         "a full page from the vector statement"
                     );
-                    writable_trace.get_or_insert_with(|| format!("{:?}", result.trace));
+                    writable_trace.get_or_insert_with(|| format!("{:?}", result.trace()));
                     let started = Instant::now();
                     for context_id in &scope {
                         let counted = store
@@ -4112,23 +4068,23 @@ pub fn event_find_meets_scale_on_the_selected_contextdb_route_without_cg_side_in
                         .execute_sql_for_test(&route::with_mode(&sql, "EXACT"), &params)
                         .expect("exact answer over the whole scope");
                     exact_ms.push(started.elapsed());
-                    route_facts.get_or_insert_with(|| route::disclosure(&selected.trace));
+                    route_facts.get_or_insert_with(|| route::disclosure(&selected.trace()));
                     let exact_ids = route::ids(&exact);
                     let selected_counts = route::winners_by_context(&selected);
                     let exact_counts = route::winners_by_context(&exact);
                     let exact_id_set = exact_ids.iter().copied().collect::<BTreeSet<_>>();
                     let context_column = selected
-                        .columns
+                        .columns()
                         .iter()
                         .position(|column| column == "context_id")
                         .expect("context_id column");
                     let id_column = selected
-                        .columns
+                        .columns()
                         .iter()
                         .position(|column| column == "id")
                         .expect("id column");
                     let mut hit_counts = BTreeMap::<String, usize>::new();
-                    for row in &selected.rows {
+                    for row in selected.rows() {
                         if let (Value::Uuid(context), Value::Uuid(id)) =
                             (&row[context_column], &row[id_column])
                             && exact_id_set.contains(id)
@@ -4280,12 +4236,7 @@ pub fn event_find_meets_scale_on_the_selected_contextdb_route_without_cg_side_in
                             );
                             [
                                 (scope_name, "AUTO (declared)", sql.clone(), params.clone()),
-                                (
-                                    scope_name,
-                                    "INDEXED",
-                                    route::with_mode(&sql, "INDEXED"),
-                                    params,
-                                ),
+                                (scope_name, "EXACT", route::with_mode(&sql, "EXACT"), params),
                             ]
                         })
                         .collect::<Vec<_>>();
@@ -4296,18 +4247,18 @@ pub fn event_find_meets_scale_on_the_selected_contextdb_route_without_cg_side_in
                                       result: Result<&contextdb_engine::QueryResult, String>,
                                       elapsed: Duration| {
                         if let Ok(result) = &result
-                            && mode == "INDEXED"
-                            && result.trace.physical_plan.starts_with("Scan")
+                            && mode == "EXACT"
+                            && result.trace().physical_plan.starts_with("Scan")
                         {
                             failures.push(format!(
-                                "removed {name}: INDEXED on the {path} scanned the table for {scope_name}"
+                                "removed {name}: EXACT on the {path} scanned the table for {scope_name}"
                             ));
                         }
                         arm.push(json!({
                             "path": path,
                             "scope": scope_name,
                             "mode": mode,
-                            "route": result.map(|r| route::disclosure(&r.trace)),
+                            "route": result.map(|r| route::disclosure(&r.trace())),
                             "vector_statement_ms": ms(elapsed),
                         }));
                     };
@@ -4424,7 +4375,7 @@ mod binding {
             )
             .expect("read the stored corpus");
         let mut rows = passages
-            .rows
+            .rows()
             .iter()
             .map(|row| {
                 let mut bytes = Vec::new();
@@ -4450,7 +4401,7 @@ mod binding {
             )
             .expect("read search heads");
         let mut heads = heads
-            .rows
+            .rows()
             .iter()
             .map(|row| format!("{row:?}"))
             .collect::<Vec<_>>();
@@ -4706,10 +4657,19 @@ mod gate {
         pub label: String,
         pub requirement: Requirement,
         pub exact_p95: Option<Duration>,
+        /// EXACT's own latency spread in this cell (its p95 less its p50): the measured noise an
+        /// exact-routed mode's p95 is allowed beyond EXACT's.
+        pub exact_noise: Option<Duration>,
         pub exact_errors: usize,
         /// EXACT statements that answered with no native score observed.
         pub exact_blind: usize,
         pub modes: Vec<ModeResult>,
+    }
+
+    /// Whether the route record shows the mode used exact comparison for every query: no
+    /// maintained graph was walked. This release ships exact search only, so AUTO resolves to it.
+    pub fn is_exact_routed(mode: &ModeResult) -> bool {
+        !mode.queries.is_empty() && mode.queries.iter().all(|query| !query.used_graph)
     }
 
     pub fn recall_misses_floor(recall: f64) -> bool {
@@ -4757,6 +4717,29 @@ mod gate {
                 failures.push(format!(
                     "{label} {name}: {below_floor} queries have recall@10 against EXACT below {RECALL_FLOOR}"
                 ));
+            }
+            if is_exact_routed(mode) {
+                // An exact-routed mode is not required to beat EXACT: it does the same work. The
+                // cell is decided by equal distance-evaluation counts on every query and by the
+                // mode's p95 staying within EXACT's measured noise.
+                let unequal = mode
+                    .queries
+                    .iter()
+                    .filter(|query| query.evaluations != query.exact_evaluations)
+                    .count();
+                if unequal > 0 {
+                    failures.push(format!(
+                        "{label} {name}: {unequal} exact-routed queries did a different amount of distance work than EXACT"
+                    ));
+                }
+                let noise = cell.exact_noise.unwrap_or_default();
+                if !matches!((mode.p95, cell.exact_p95), (Some(p95), Some(exact)) if p95 <= exact + noise)
+                {
+                    failures.push(format!(
+                        "{label} {name}: p95 is beyond EXACT's measured noise"
+                    ));
+                }
+                continue;
             }
             // Every required scope and mode must have mean distance evaluations strictly below
             // EXACT over its fixed paired query set. The single-Context cell must also walk the
@@ -4934,9 +4917,6 @@ mod recall {
 
     use contextdb_core::Value;
     use contextdb_engine::read_session::ReadSession;
-    use contextdb_vector::hnsw::{
-        HnswCandidateDistanceEvent, HnswCandidateObserver, with_hnsw_candidate_observer,
-    };
     use contextdb_vector::mem::{
         NativeVectorScoreObserver, with_native_vector_score_observer_for_test,
     };
@@ -4945,12 +4925,6 @@ mod recall {
     use super::Rng;
 
     struct Counter(AtomicU64);
-
-    impl HnswCandidateObserver for Counter {
-        fn before_candidate_distance(&self, _: HnswCandidateDistanceEvent) {
-            self.0.fetch_add(1, Ordering::Relaxed);
-        }
-    }
 
     impl NativeVectorScoreObserver for Counter {
         fn before_native_vector_score(&self) {
@@ -4977,12 +4951,12 @@ mod recall {
             let Ok(result) = &self.result else {
                 return false;
             };
-            let Some(vector) = result.trace.vector_search.as_ref() else {
+            let Some(vector) = result.trace().vector_search.as_ref() else {
                 return false;
             };
             vector.route.is_some_and(|route| route.as_str() != "exact")
                 || vector
-                    .partition_hnsw
+                    .partitions
                     .iter()
                     .any(|partition| partition.route.is_some_and(|r| r.as_str() != "exact"))
         }
@@ -4993,18 +4967,17 @@ mod recall {
             match &self.result {
                 Err(error) => serde_json::json!({"error": error}),
                 Ok(result) => {
-                    let vector = result.trace.vector_search.as_ref();
+                    let vector = result.trace().vector_search.as_ref();
                     serde_json::json!({
-                        "physical_plan": result.trace.physical_plan,
+                        "physical_plan": result.trace().physical_plan,
                         "route": vector.and_then(|v| v.route).map(|r| r.as_str()),
                         "resolved_mode": vector.map(|v| format!("{:?}", v.resolved_mode)),
                         "route_evidence": vector.map(|v| v.route_evidence.as_str()),
-                        "partitions": vector.map(|v| v.partition_hnsw.iter().map(|p| serde_json::json!({
+                        "partitions": vector.map(|v| v.partitions.iter().map(|p| serde_json::json!({
                             "route": p.route.map(|r| r.as_str()),
                             "reason": p.reason,
-                            "hnsw_m": p.hnsw_m,
-                            "hnsw_ef_search": p.hnsw_ef_search,
-                            "ef_search_source": p.ef_search_source,
+                            "lists": p.lists,
+                            "probes": p.probes,
                         })).collect::<Vec<_>>()),
                         "fallback": vector.and_then(|v| v.fallback.clone()),
                         "refusal": vector.and_then(|v| v.refusal.clone()),
@@ -5018,12 +4991,10 @@ mod recall {
         let graph = Arc::new(Counter(AtomicU64::new(0)));
         let native = Arc::new(Counter(AtomicU64::new(0)));
         let started = Instant::now();
-        let result = with_hnsw_candidate_observer(graph.clone(), || {
-            with_native_vector_score_observer_for_test(native.clone(), || {
-                session
-                    .execute(sql, params)
-                    .map_err(|error| error.to_string())
-            })
+        let result = with_native_vector_score_observer_for_test(native.clone(), || {
+            session
+                .execute(sql, params)
+                .map_err(|error| error.to_string())
         });
         let elapsed = started.elapsed();
         Counted {
@@ -5058,11 +5029,11 @@ mod recall {
             )
             .expect("read stored passages");
         let contexts = result
-            .rows
+            .rows()
             .iter()
             .map(|row| format!("{:?}", row[0]))
             .collect::<HashSet<_>>();
-        (result.rows.len(), contexts.len())
+        (result.rows().len(), contexts.len())
     }
 
     /// Every stored passage text's digest, to prove each held-out query is not a corpus passage.
@@ -5074,7 +5045,7 @@ mod recall {
             )
             .expect("read passage digests");
         result
-            .rows
+            .rows()
             .into_iter()
             .map(|row| match &row[0] {
                 Value::Text(digest) => digest.clone(),
@@ -5256,7 +5227,7 @@ mod recall {
 /// single-Context cell. Draws `CG_EVENT_BENCH_RECALL_QUERIES` (default 100) held-out real-text
 /// queries (held-out session passages for the session corpus), embeds each with the same model's query role, and runs, on the file route `cg find`
 /// reads through with its own read budget, the declared route (AUTO) of each scope -- and in the
-/// single-Context cell explicit `USE VECTOR INDEXED` too -- against `USE VECTOR EXACT` over the
+/// single-Context cell too -- against `USE VECTOR EXACT` over the
 /// same stored vectors. Reports recall@10, distance evaluations and a pass/fail verdict per cell
 /// (`gate::cell_failures`); the run fails when any query misses recall@10 >= 0.95, when any required
 /// scope/mode's mean distance evaluations are not strictly below EXACT's, when a
@@ -5368,7 +5339,7 @@ pub fn event_find_recall_at_10_against_exact_on_the_real_model_fixture(_c: &mut 
             scopes(&fixture.contexts)
         };
         let modes: &[&str] = if contexts_in_fixture == 1 {
-            &["AUTO", "INDEXED"]
+            &["AUTO"]
         } else {
             &["AUTO"]
         };
@@ -5454,6 +5425,10 @@ pub fn event_find_recall_at_10_against_exact_on_the_real_model_fixture(_c: &mut 
                 label: label.clone(),
                 requirement,
                 exact_p95: p95(&exact.elapsed),
+                exact_noise: (!exact.elapsed.is_empty()).then(|| {
+                    let summary = Summary::of(&exact.elapsed);
+                    summary.p95.saturating_sub(summary.p50)
+                }),
                 exact_errors: exact.errors.len(),
                 exact_blind,
                 modes: modes
@@ -5476,6 +5451,8 @@ pub fn event_find_recall_at_10_against_exact_on_the_real_model_fixture(_c: &mut 
                 mode_json["work_against_exact"] = gate::work_comparison_json(&work[index]);
                 mode_json["p95_ms"] = json!(result.modes[index].p95.map(ms));
                 mode_json["exact_p95_ms"] = json!(result.exact_p95.map(ms));
+                mode_json["exact_noise_ms"] = json!(result.exact_noise.map(ms));
+                mode_json["exact_routed"] = json!(gate::is_exact_routed(&result.modes[index]));
                 per_mode.insert(mode.to_string(), mode_json);
             }
             per_mode.insert("EXACT".into(), exact.json());
@@ -5700,6 +5677,7 @@ pub fn event_recall_gate_controls(_c: &mut Criterion) {
         label: "control".into(),
         requirement,
         exact_p95: ms(40),
+        exact_noise: ms(5),
         exact_errors: 0,
         exact_blind: 0,
         modes: vec![ModeResult {
@@ -5716,16 +5694,51 @@ pub fn event_recall_gate_controls(_c: &mut Criterion) {
         "several_contexts_good_recall_but_slower_auto_fails",
         !cell_failures(&cell(Requirement::SeveralContexts, 1.0, 41, good())).is_empty(),
     ));
-    outcomes.push((
-        "several_contexts_equal_mean_work_refuses",
-        !cell_failures(&cell(
-            Requirement::SeveralContexts,
-            1.0,
-            30,
-            vec![work(false, false, true); 100],
-        ))
-        .is_empty(),
-    ));
+    // An exact-routed mode does the same work as EXACT and is decided by equal work and by p95
+    // within EXACT's measured noise (5 ms here), not by beating EXACT.
+    for requirement in [Requirement::SeveralContexts, Requirement::SingleContext] {
+        let exact_work = vec![work(false, false, true); 100];
+        let name = |several: &'static str, single: &'static str| match requirement {
+            Requirement::SeveralContexts => several,
+            Requirement::SingleContext => single,
+        };
+        outcomes.push((
+            name(
+                "several_contexts_exact_routed_equal_work_within_noise_passes",
+                "single_context_exact_routed_equal_work_within_noise_passes",
+            ),
+            cell_failures(&cell(requirement, 1.0, 45, exact_work.clone())).is_empty(),
+        ));
+        outcomes.push((
+            name(
+                "several_contexts_exact_routed_p95_beyond_noise_fails",
+                "single_context_exact_routed_p95_beyond_noise_fails",
+            ),
+            cell_failures(&cell(requirement, 1.0, 46, exact_work.clone()))
+                .iter()
+                .any(|failure| failure.contains("beyond EXACT's measured noise")),
+        ));
+        let mut more_work = exact_work.clone();
+        more_work[0].evaluations = 1_251;
+        outcomes.push((
+            name(
+                "several_contexts_exact_routed_different_work_fails",
+                "single_context_exact_routed_different_work_fails",
+            ),
+            cell_failures(&cell(requirement, 1.0, 30, more_work))
+                .iter()
+                .any(|failure| failure.contains("different amount of distance work")),
+        ));
+        outcomes.push((
+            name(
+                "several_contexts_exact_routed_recall_below_the_floor_fails",
+                "single_context_exact_routed_recall_below_the_floor_fails",
+            ),
+            cell_failures(&cell(requirement, 0.94, 30, exact_work))
+                .iter()
+                .any(|failure| failure.contains("recall@10")),
+        ));
+    }
     let higher_mean = vec![
         QueryWork {
             evaluations: 1_251,
@@ -6018,7 +6031,7 @@ fn event_fixture_vector_geometry(_c: &mut Criterion) {
         &HashMap::new(),
     ).expect("read stored passage vectors");
     let corpus = rows
-        .rows
+        .rows()
         .into_iter()
         .map(|row| {
             let Value::Uuid(context) = row[1] else {

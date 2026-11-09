@@ -255,7 +255,7 @@ fn status_totals_stay_correct_and_bounded_on_a_store_no_single_read_can_cross() 
                 .open_cursor("SELECT id FROM digests", &HashMap::new())
                 .expect("hold one of the owner's readers open");
             assert!(
-                cursor.first_page().has_more,
+                cursor.first_page().has_more(),
                 "a reader that finished at open would hand its slot straight back"
             );
             cursor

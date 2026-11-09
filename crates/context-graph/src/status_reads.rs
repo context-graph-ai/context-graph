@@ -194,14 +194,14 @@ impl<'observer> StatusReads<'observer> {
         // a refused fold, a refused fetch, or the last page — leaves through the same close.
         let paged = (|| -> Result<()> {
             let first = cursor.first_page();
-            let mut has_more = first.has_more;
-            self.record(statement, first.rows.len());
-            fold(&first.rows)?;
+            let mut has_more = first.has_more();
+            self.record(statement, first.rows().len());
+            fold(first.rows())?;
             while has_more {
                 let page = cursor.fetch(None).map_err(map_engine)?;
-                self.record(statement, page.rows.len());
-                fold(&page.rows)?;
-                has_more = page.has_more;
+                self.record(statement, page.rows().len());
+                fold(page.rows())?;
+                has_more = page.has_more();
             }
             Ok(())
         })();

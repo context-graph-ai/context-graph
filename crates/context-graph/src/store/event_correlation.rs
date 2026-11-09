@@ -383,13 +383,13 @@ fn visit_cursor_rows(
         let (mut has_more, first_result) = {
             let page = cursor.first_page();
             (
-                page.has_more,
+                page.has_more(),
                 visit_cursor_page(
-                    &page.columns,
-                    &page.rows,
+                    page.columns(),
+                    page.rows(),
                     expected_columns,
                     false,
-                    page.has_more,
+                    page.has_more(),
                     #[cfg(context_graph_internal_test_support)]
                     test_observers,
                     &mut visit,
@@ -403,13 +403,13 @@ fn visit_cursor_rows(
             let page = cursor
                 .fetch(Some(NonZeroUsize::MIN))
                 .map_err(map_engine_err)?;
-            has_more = page.has_more;
+            has_more = page.has_more();
             if visit_cursor_page(
-                &page.columns,
-                &page.rows,
+                page.columns(),
+                page.rows(),
                 expected_columns,
                 true,
-                page.has_more,
+                page.has_more(),
                 #[cfg(context_graph_internal_test_support)]
                 test_observers,
                 &mut visit,

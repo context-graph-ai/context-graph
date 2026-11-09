@@ -474,7 +474,8 @@ async fn authenticated_hub(name: &str, discard: &str) -> AuthenticatedHub {
             tenant.clone(),
             hub_node,
             identity,
-        ),
+        )
+        .expect("sync fixture call is accepted by the engine"),
     );
     for (table, policy) in [
         ("events", event_policy(discard)),
@@ -521,7 +522,8 @@ async fn bind(store: &Store, hub: &AuthenticatedHub, discard: &str) -> SyncClien
         hub.broker.client_as(&node_id),
         hub.tenant.clone(),
         identity,
-    );
+    )
+    .expect("sync fixture call is accepted by the engine");
     let connected_hub = client
         .connected_hub_node_id()
         .expect("authenticated fixture client has a connected hub");
@@ -596,7 +598,8 @@ async fn unbound_store_exposes_only_bootstrap_and_binding_publishes_the_complete
         rejected_hub.broker.client_as(&rejected_node),
         rejected_hub.tenant.clone(),
         rejected_identity,
-    );
+    )
+    .expect("sync fixture call is accepted by the engine");
     assert!(
         rejected_client
             .bind_application_table_policy(policy_expectation("ALWAYS"))
@@ -700,7 +703,7 @@ async fn unbound_store_exposes_only_bootstrap_and_binding_publishes_the_complete
             .sync_database()
             .execute("SELECT version FROM cg_schema_version", &HashMap::new())
             .expect("ready schema version is readable")
-            .rows
+            .rows()
             == vec![vec![DbValue::Int64(CG_SCHEMA_VERSION.into())]],
         "Ready publishes the reserved schema version, not an arbitrary version row"
     );
@@ -765,7 +768,7 @@ async fn authenticated_discard_modes_are_enforced_from_the_bound_engine_policy()
                             &params,
                         )
                         .expect("inspect rows preserved while outcome is pending")
-                        .rows
+                        .rows()
                         .len(),
                     1,
                     "AFTER OUTCOME preserves its {table} row while the authenticated delivery remains pending"
@@ -814,7 +817,7 @@ async fn authenticated_discard_modes_are_enforced_from_the_bound_engine_policy()
                         &params,
                     )
                     .expect("inspect selected rows after discard")
-                    .rows
+                    .rows()
                     .len(),
                 usize::from(rows_remain),
                 "{name} follows the authenticated policy for its {table} row"

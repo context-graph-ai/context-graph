@@ -32,7 +32,7 @@ impl Store {
                     .collect::<HashMap<_, _>>(),
             )
             .map_err(map_engine_err)?;
-        if !existing.rows.is_empty() {
+        if !existing.rows().is_empty() {
             return Err(CgError::UniqueViolation {
                 entity: "context",
                 id: None,
@@ -121,9 +121,9 @@ pub(crate) fn list_contexts(rows: &dyn GraphRows) -> Result<Vec<Context>> {
         "SELECT id, name, labels, properties, created_at FROM contexts",
         &HashMap::new(),
     )?;
-    let mut out = Vec::with_capacity(result.rows.len());
-    for row in &result.rows {
-        out.push(decode_context(&result.columns, row)?);
+    let mut out = Vec::with_capacity(result.rows().len());
+    for row in result.rows() {
+        out.push(decode_context(result.columns(), row)?);
     }
     Ok(out)
 }
@@ -145,10 +145,10 @@ pub(crate) fn get_context(rows: &dyn GraphRows, id: ContextId) -> Result<Option<
         "SELECT id, name, labels, properties, created_at FROM contexts WHERE id = $id",
         &params,
     )?;
-    if result.rows.is_empty() {
+    if result.rows().is_empty() {
         return Ok(None);
     }
-    Ok(Some(decode_context(&result.columns, &result.rows[0])?))
+    Ok(Some(decode_context(result.columns(), &result.rows()[0])?))
 }
 
 pub(super) fn deterministic_context_id(name: &str) -> ContextId {

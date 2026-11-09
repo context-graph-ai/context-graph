@@ -16,8 +16,9 @@
 //!   after "process N" finds the process that is really holding their store.
 //! - A free store opens before any reader is parked, so the typed refusal belongs to live reader
 //!   contention rather than the harness or a stale registry entry.
-//! - A shared writer waits while those readers hold the store, without holding the registry mutex:
-//!   its retry observer opens an unrelated store before either reader is released.
+//! - A shared writer waits while those readers hold the store, without holding the store registry:
+//!   an unrelated store opens while that writer's open is still waiting, and only releasing the
+//!   readers (or the caller's deadline, covered above) ends the wait.
 //! - Releasing both readers admits that waiting writer, and a later open of the original path
 //!   reuses its registered database handle.
 //!
@@ -52,6 +53,8 @@ use contextdb_engine::persistence::read_persistence_test_scaffold::arm_read_imag
 const CHILD_ROLE_ENV: &str = "CG_READER_CONTENTION_CHILD_ROLE";
 /// The store every child works on.
 const CHILD_STORE_ENV: &str = "CG_READER_CONTENTION_STORE_PATH";
+/// How long, in milliseconds, the writer child allows its open to wait on readers.
+const CHILD_WAIT_MS_ENV: &str = "CG_READER_CONTENTION_WAIT_MS";
 
 /// contextdb's own hydration-checkpoint marker. The parked reader does not print this itself —
 /// the shipped checkpoint inside `ReadSession::open` does, after the reader's breadcrumb exists
@@ -132,9 +135,14 @@ fn a_context_graph_writer_open_child() {
     if std::env::var(CHILD_ROLE_ENV).ok().as_deref() != Some("context-graph-writer-open") {
         return;
     }
-    // Exercise the typed exhaustion result without holding two reader processes for 60 seconds.
+    // The caller's deadline for the wait is already spent, so the engine answers at once with the
+    // typed held-by-readers refusal instead of waiting for the readers to finish.
+    let wait_ms = std::env::var(CHILD_WAIT_MS_ENV)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
     context_graph::test_support::set_store_open_retry_allowance_for_test(Some(
-        std::time::Duration::ZERO,
+        std::time::Duration::from_millis(wait_ms),
     ));
     match Store::open(store_config(child_store_path())) {
         Ok(store) => {
@@ -308,12 +316,22 @@ enum WriterOpenOutcome {
 }
 
 fn open_a_context_graph_writer(store_path: &Path, runtime_directory: &Path) -> WriterOpenOutcome {
+    open_a_context_graph_writer_waiting(store_path, runtime_directory, 0)
+}
+
+/// The same open, given `wait_ms` as the caller's deadline for waiting on readers.
+fn open_a_context_graph_writer_waiting(
+    store_path: &Path,
+    runtime_directory: &Path,
+    wait_ms: u64,
+) -> WriterOpenOutcome {
     let output =
         Command::new(std::env::current_exe().expect("the current integration-test binary"))
             .arg("--exact")
             .arg("a_context_graph_writer_open_child")
             .arg("--nocapture")
             .env(CHILD_ROLE_ENV, "context-graph-writer-open")
+            .env(CHILD_WAIT_MS_ENV, wait_ms.to_string())
             .env(CHILD_STORE_ENV, store_path)
             .env("XDG_RUNTIME_DIR", runtime_directory)
             .stdin(Stdio::null())
@@ -493,16 +511,26 @@ fn a_real_context_graph_open_is_refused_by_the_live_readers_holding_the_store() 
          published — the process an operator goes and finds, what it is, and which run of it"
     );
 
+    // A deadline that is not yet spent is a bounded wait: the open waits on the live readers until
+    // that deadline, then gives the same typed refusal. The test asserts the refusal, never the
+    // elapsed time.
+    let bounded = open_a_context_graph_writer_waiting(&store_path, runtime.path(), 400);
+    assert!(
+        matches!(
+            bounded,
+            WriterOpenOutcome::HeldByReaders {
+                observed_direct_readers: 2,
+                ..
+            }
+        ),
+        "a bounded wait that expires with the readers still holding gives the held-by-readers refusal: {bounded:?}"
+    );
+
     let (waiting, observed) = channel();
     let (finish, finished) = channel();
     let writer_path = store_path.clone();
     let writer = std::thread::spawn(move || {
-        context_graph::test_support::observe_store_open_retries_for_test(move |error| {
-            assert!(matches!(error, CgError::StoreHeldByReaders { .. }));
-            drop(
-                Store::open(store_config(unrelated.clone()))
-                    .expect("registry is released while waiting"),
-            );
+        context_graph::test_support::observe_store_open_reader_wait_for_test(move || {
             waiting.send(()).unwrap();
         });
         let store = Store::open(store_config(writer_path)).expect("reader release admits writer");
@@ -512,7 +540,13 @@ fn a_real_context_graph_open_is_refused_by_the_live_readers_holding_the_store() 
     observed
         .recv()
         .expect("real reader refusal reached the shared Store wait");
-    assert!(finished.try_recv().is_err());
+    // The writer's open is in the engine, waiting on the readers, and has not finished. An
+    // unrelated store opens now: it would never complete if the registry were held for the wait.
+    drop(Store::open(store_config(unrelated)).expect("an unrelated store opens during the wait"));
+    assert!(
+        finished.try_recv().is_err(),
+        "the writer is still waiting on the readers while the unrelated store opened"
+    );
     first.release();
     second.release();
     finished.recv().expect("writer opens after reader release");

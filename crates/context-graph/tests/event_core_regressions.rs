@@ -434,17 +434,17 @@ fn mixed_text_and_number_anchor_values_round_trip_as_two_distinct_rows() {
         )
         .expect("look up anchors persisted for this event");
     assert_eq!(
-        anchors.rows.len(),
+        anchors.rows().len(),
         2,
         "the lookup returns both typed anchors"
     );
     let original_value = anchors
-        .columns
+        .columns()
         .iter()
         .position(|column| column == "original_value")
         .expect("selected original value column");
     let values = anchors
-        .rows
+        .rows()
         .iter()
         .map(|row| row[original_value].clone())
         .collect::<Vec<_>>();
@@ -544,9 +544,9 @@ fn millisecond_source_time_round_trips_retries_and_supports_an_exact_one_millise
             ]),
         )
         .expect("read events through ordinary occurred_at SQL comparison");
-    assert_eq!(rows.columns, vec!["id", "occurred_at"]);
+    assert_eq!(rows.columns(), vec!["id", "occurred_at"]);
     assert_eq!(
-        rows.rows,
+        rows.rows(),
         vec![vec![
             Value::Uuid(event_id.as_uuid()),
             Value::Timestamp(occurred_at.timestamp_millis()),

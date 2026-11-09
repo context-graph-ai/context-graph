@@ -734,7 +734,8 @@ async fn authenticated_hub() -> AuthenticatedHub {
             tenant.clone(),
             hub_node,
             identity,
-        ),
+        )
+        .expect("sync fixture call is accepted by the engine"),
     );
     for (table, policy) in [("events", EVENT_POLICY), ("event_anchors", ANCHOR_POLICY)] {
         db.execute(
@@ -783,7 +784,8 @@ async fn bind_tenant_store(
         hub.broker.client_as(&node_id),
         hub.tenant.clone(),
         identity,
-    );
+    )
+    .expect("sync fixture call is accepted by the engine");
     let binding = client
         .bind_application_table_policy(policy_expectation())
         .await
@@ -894,30 +896,30 @@ async fn authenticated_custody_counts_equivalent_full_units_and_refuses_changed_
         .push()
         .await
         .expect("second edge receives authenticated equivalent outcome");
-    let first_event_rows = first
+    let first_event_rows_answer = first
         .sync_database()
         .execute("SELECT * FROM events", &HashMap::new())
-        .expect("read first shared row")
-        .rows;
-    let second_event_rows = second
+        .expect("read first shared row");
+    let first_event_rows = first_event_rows_answer.rows();
+    let second_event_rows_answer = second
         .sync_database()
         .execute("SELECT * FROM events", &HashMap::new())
-        .expect("read second shared row")
-        .rows;
+        .expect("read second shared row");
+    let second_event_rows = second_event_rows_answer.rows();
     assert_eq!(
         first_event_rows, second_event_rows,
         "identical accepted events retain byte-for-byte equal shared rows"
     );
-    let first_anchor_rows = first
+    let first_anchor_rows_answer = first
         .sync_database()
         .execute("SELECT * FROM event_anchors", &HashMap::new())
-        .expect("read first complete anchor rows")
-        .rows;
-    let second_anchor_rows = second
+        .expect("read first complete anchor rows");
+    let first_anchor_rows = first_anchor_rows_answer.rows();
+    let second_anchor_rows_answer = second
         .sync_database()
         .execute("SELECT * FROM event_anchors", &HashMap::new())
-        .expect("read second complete anchor rows")
-        .rows;
+        .expect("read second complete anchor rows");
+    let second_anchor_rows = second_anchor_rows_answer.rows();
     assert_eq!(
         first_anchor_rows.len(),
         1,
@@ -945,17 +947,17 @@ async fn authenticated_custody_counts_equivalent_full_units_and_refuses_changed_
             DbValue::Text("src/lib.rs".into()),
         ];
         assert_eq!(
-            anchor.columns,
+            anchor.columns(),
             vec!["event_id", "key", "value"],
             "the engine maps the named anchor projection in SELECT order"
         );
         assert_eq!(
-            anchor.rows,
+            anchor.rows(),
             vec![expected.clone()],
             "the normalized anchor retains its event, key, and canonical value"
         );
         assert_ne!(
-            anchor.rows,
+            anchor.rows(),
             vec![vec![
                 expected[0].clone(),
                 DbValue::Text("profile".into()),
@@ -964,7 +966,7 @@ async fn authenticated_custody_counts_equivalent_full_units_and_refuses_changed_
             "a different anchor key cannot satisfy exact recall"
         );
         assert_ne!(
-            anchor.rows,
+            anchor.rows(),
             vec![vec![
                 expected[0].clone(),
                 expected[1].clone(),

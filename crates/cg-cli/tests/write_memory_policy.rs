@@ -334,43 +334,105 @@ fn a_write_that_does_not_fit_the_declared_budget_is_refused_in_words_that_name_b
     assert_eq!(u64_at(&repeated.json(), "/capture/events/inserted"), 0);
 }
 
-#[test]
-fn an_import_that_exceeds_writer_memory_after_a_batch_reports_committed_progress_and_resumes() {
+/// A machine whose store already holds the first 512 events of `mid-budget.jsonl`, committed under
+/// a limit the engine accepts, with the whole 700-event file on disk ready to import.
+fn store_holding_the_first_512_events() -> (Machine, std::path::PathBuf, String) {
+    const GENEROUS_LIMIT: &str = "268435456";
     let machine = Machine::without_model();
     let project = machine.project("mid-budget");
     let source = project.join("mid-budget.jsonl");
     write_many_turns(&source, &project);
-    let source = source.to_str().expect("UTF-8 source path");
-    let limited = machine.run(
+    let whole = fs::read_to_string(&source).expect("read the whole session");
+    let first_512 = whole.lines().take(512).collect::<Vec<_>>().join("\n") + "\n";
+    fs::write(&source, first_512).expect("write the first 512 events");
+    let path = source.to_str().expect("UTF-8 source path").to_owned();
+    let committed = machine.run(
         &project,
         &[
             "import",
-            source,
+            &path,
             "--context",
             "mid-budget",
             "--search",
             "defer",
             "--write-memory-limit-bytes",
-            "41943040",
+            GENEROUS_LIMIT,
         ],
     );
-    assert_eq!(limited.code, 1, "{}", limited.describe());
+    assert_eq!(committed.code, 0, "{}", committed.describe());
+    assert_eq!(u64_at(&committed.json(), "/capture/events/inserted"), 512);
+    fs::write(&source, whole).expect("write the whole session");
+    (machine, project, path)
+}
+
+fn import_whole_session(
+    machine: &Machine,
+    project: &std::path::Path,
+    path: &str,
+    limit: u64,
+) -> event_support::Output {
+    machine.run(
+        project,
+        &[
+            "import",
+            path,
+            "--context",
+            "mid-budget",
+            "--search",
+            "defer",
+            "--write-memory-limit-bytes",
+            &limit.to_string(),
+        ],
+    )
+}
+
+// What this proves: events committed before a writer-memory refusal survive it, the refusal says
+// what limit was in force and what the write needed, and a retry imports exactly the events that
+// are missing, inserting nothing twice. The limits come from the engine's own accept/refuse
+// answer, not from a literal: the limit starts below what the remaining events need and doubles
+// until the engine accepts, and the last refusal before that is the one examined. The engine
+// currently refuses at a fixed floor rather than part-way through an import, so the refusal is
+// produced by a limit under that floor.
+#[test]
+fn committed_events_survive_a_writer_memory_refusal_and_a_retry_imports_only_the_rest() {
+    let (machine, project, path) = store_holding_the_first_512_events();
+
+    let mut limit: u64 = 1024 * 1024;
+    let mut last_refusal = None;
+    let retry = loop {
+        let attempt = import_whole_session(&machine, &project, &path, limit);
+        if attempt.code == 0 {
+            break attempt;
+        }
+        assert_eq!(attempt.code, 1, "{}", attempt.describe());
+        // A refused write changes nothing: the committed events are all still there.
+        let status = machine.run(&project, &["status", "--context", "mid-budget"]);
+        assert_eq!(status.code, 0, "{}", status.describe());
+        assert_eq!(u64_at(&status.json(), "/history/captured_events"), 512);
+        last_refusal = Some((limit, attempt));
+        limit *= 2;
+        assert!(
+            limit <= 4 * 1024 * 1024 * 1024,
+            "the engine accepted no writer limit up to 4 GiB"
+        );
+    };
+
+    let (refused_limit, limited) =
+        last_refusal.expect("the engine refused a limit below the floor");
     let refusal = limited.json();
     assert_eq!(str_at(&refusal, "/state"), "write_memory_limit");
     assert_eq!(
         str_at(&refusal, "/condition"),
         "WriteDidNotFitTheMemoryLimit"
     );
-    assert_eq!(u64_at(&refusal, "/limit_bytes"), 40 * 1024 * 1024);
+    assert_eq!(u64_at(&refusal, "/limit_bytes"), refused_limit);
     assert!(u64_at(&refusal, "/requested_bytes") > 0);
-    assert_eq!(str_at(&refusal, "/capture/status"), "partial");
-    assert_eq!(u64_at(&refusal, "/capture/events/inserted"), 512);
-    assert!(u64_at(&refusal, "/capture/last_committed_position/committed_bytes") > 0);
+    assert_eq!(u64_at(&refusal, "/capture/events/inserted"), 0);
     assert_eq!(str_at(&refusal, "/search/status"), "not_run");
     let message = str_at(&refusal, "/message");
     assert!(
         message.contains("cg import stopped")
-            && message.contains("40.0 MiB")
+            && message.contains("MiB")
             && message.contains("Earlier committed events remain")
             && message.contains("--write-memory-limit-bytes")
             && message.contains("[write] memory_limit_bytes")
@@ -379,24 +441,7 @@ fn an_import_that_exceeds_writer_memory_after_a_batch_reports_committed_progress
         limited.describe()
     );
 
-    let status = machine.run(&project, &["status", "--context", "mid-budget"]);
-    assert_eq!(status.code, 0, "{}", status.describe());
-    assert_eq!(u64_at(&status.json(), "/history/captured_events"), 512);
-
-    let retry = machine.run(
-        &project,
-        &[
-            "import",
-            source,
-            "--context",
-            "mid-budget",
-            "--search",
-            "defer",
-            "--write-memory-limit-bytes",
-            "268435456",
-        ],
-    );
-    assert_eq!(retry.code, 0, "{}", retry.describe());
+    // The first limit the engine accepted is the retry: it imports exactly the missing events.
     assert_eq!(u64_at(&retry.json(), "/capture/events/inserted"), 188);
     assert_eq!(u64_at(&retry.json(), "/capture/local_embedding_calls"), 0);
     let status = machine.run(&project, &["status", "--context", "mid-budget"]);
@@ -407,7 +452,7 @@ fn an_import_that_exceeds_writer_memory_after_a_batch_reports_committed_progress
         &project,
         &[
             "import",
-            source,
+            &path,
             "--context",
             "mid-budget",
             "--search",

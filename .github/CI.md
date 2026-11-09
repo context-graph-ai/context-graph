@@ -231,6 +231,33 @@ keep normal parallelism.
 [`CONTRIBUTING.md`](../CONTRIBUTING.md) lists the plain Cargo commands and
 the prerequisites.
 
+### The whole PR workflow in runner-shaped boxes
+
+`gate.sh pr` runs the stages one after another on your whole machine. To know
+whether the hosted run will pass, run the workflow itself:
+
+```sh
+python3 scripts/ci-local.py --path-prepend <dir-with-python3.12>
+python3 scripts/ci-local.py --event workflow_dispatch --cg-sha <sha> --contextdb-sha <sha>
+```
+
+It reads `ci.yml` at run time and runs every Linux job and matrix leg as GitHub
+does, each in its own box shaped like a hosted runner: a fresh checkout, an
+empty home, 4 dedicated CPUs, 16 GB of memory and no swap, the job's
+`timeout-minutes`, and the disk the hosted runner has left after its "Free disk
+space" step. A job that a hosted runner kills for memory, time or disk is killed
+here too, and a test pool sized from the CPU count sees 4 CPUs, as it does
+there. The second form repeats a manual run with the same `cg_sha` and
+`contextdb_sha` inputs. The report (`jobs.tsv`: job, result, cause, minutes,
+peak memory, peak disk; `steps.tsv`; logs) lands under
+`target/ci-local/work/<run>/report`, and the exit status is the `PR checks`
+verdict. The Nomic model cache and the install-action tools persist under
+`target/ci-local/`, so only the first run seeds the model. The Rust build cache is not
+restored, so jobs compile cold and take longer than hosted runs served from a
+warm cache. It needs systemd user services, a C compiler, the pinned toolchain, and a
+`python3` that can create a virtual environment (Python 3.12 on the hosted
+image). `--help` lists the options.
+
 ## Reading results
 
 - **Failed `PR checks`**: its error line names the job inventory; open the

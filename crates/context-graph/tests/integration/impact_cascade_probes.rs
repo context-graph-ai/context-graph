@@ -1,3 +1,7 @@
+#![allow(
+    clippy::result_large_err,
+    reason = "The engine's public error carries its refusal diagnostics inline (160+ bytes); this module passes it through unchanged."
+)]
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Barrier};
 use std::thread;
@@ -165,12 +169,12 @@ fn observe(
 
 fn uuid_column_set(result: &QueryResult, column: &str) -> BTreeSet<Uuid> {
     let index = result
-        .columns
+        .columns()
         .iter()
         .position(|name| name == column)
         .unwrap_or_else(|| panic!("missing column {column}"));
     result
-        .rows
+        .rows()
         .iter()
         .map(|row| match row.get(index) {
             Some(Value::Uuid(id)) => *id,

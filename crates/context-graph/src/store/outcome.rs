@@ -171,13 +171,13 @@ impl Store {
             "SELECT txid FROM audit_log WHERE id = $id AND context_id = $context_id",
             &params,
         )?;
-        if result.rows.len() != 1 {
+        if result.rows().len() != 1 {
             return Err(CgError::Engine(format!(
                 "committed Outcome audit anchor {audit_id} returned {} rows",
-                result.rows.len()
+                result.rows().len()
             )));
         }
-        get_txid(&result.rows[0], &result.columns, "txid")
+        get_txid(&result.rows()[0], result.columns(), "txid")
     }
 
     /// `HAS_OUTCOME` is a virtual one-to-one relationship backed by the current
@@ -198,7 +198,7 @@ impl Store {
                 &params,
             )
             .map_err(map_engine_err)?;
-        Ok(result.rows.len() as u64)
+        Ok(result.rows().len() as u64)
     }
 
     pub fn has_outcome_relationship(
@@ -219,7 +219,7 @@ impl Store {
             "SELECT id FROM outcomes WHERE decision_id = $decision_id AND id = $outcome_id",
             &params,
         )?;
-        Ok(!result.rows.is_empty())
+        Ok(!result.rows().is_empty())
     }
 
     pub fn admin_raw_outcomes_for_decision(&self, decision_id: DecisionId) -> Result<Vec<Outcome>> {
@@ -236,9 +236,9 @@ impl Store {
                 &params,
             )
             .map_err(map_engine_err)?;
-        let mut out = Vec::with_capacity(result.rows.len());
-        for row in &result.rows {
-            out.push(decode_outcome(&result.columns, row)?);
+        let mut out = Vec::with_capacity(result.rows().len());
+        for row in result.rows() {
+            out.push(decode_outcome(result.columns(), row)?);
         }
         Ok(out)
     }

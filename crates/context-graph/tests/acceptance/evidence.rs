@@ -538,8 +538,8 @@ fn table_count(db: &Database, table: &str) -> i64 {
             &HashMap::new(),
         )
         .expect("count table");
-    assert_eq!(result.rows.len(), 1);
-    match result.rows[0][0] {
+    assert_eq!(result.rows().len(), 1);
+    match result.rows()[0][0] {
         Value::Int64(n) => n,
         ref other => panic!("expected count integer, got {other:?}"),
     }
@@ -578,8 +578,8 @@ fn count_where(
             &params,
         )
         .expect("count table");
-    assert_eq!(result.rows.len(), 1);
-    match result.rows[0][0] {
+    assert_eq!(result.rows().len(), 1);
+    match result.rows()[0][0] {
         Value::Int64(n) => n,
         ref other => panic!("expected count integer, got {other:?}"),
     }
@@ -599,9 +599,16 @@ fn raw_evidence_rows_for_observation(
         )
         .expect("raw evidence rows");
     result
-        .rows
-        .into_iter()
-        .map(|row| result.columns.iter().cloned().zip(row).collect())
+        .rows()
+        .iter()
+        .map(|row| {
+            result
+                .columns()
+                .iter()
+                .cloned()
+                .zip(row.iter().cloned())
+                .collect()
+        })
         .collect()
 }
 
@@ -879,6 +886,12 @@ fn assert_no_unsanctioned_app_side_locks_or_global_state_in_core_sources(context
         "let registry = REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));",
         "let mut guard = registry.lock().expect(\"store registry lock\");",
         "let guard = registry.lock().expect(\"store registry lock\");",
+        "let gate = Arc::new(OnceLock::new());",
+        "let mut guard = registry.lock().unwrap_or_else(PoisonError::into_inner);",
+        "gate: Arc<OnceLock<()>>,",
+        "Opening(Arc<OnceLock<()>>),",
+        "static REGISTRY: OnceLock<Mutex<HashMap<PathBuf, Slot>>> = OnceLock::new();",
+        "use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};",
         "let _outcome_guard = self.outcome_mutex.lock().expect(\"outcome mutex poisoned\");",
         "use std::sync::{Arc, Mutex};",
         // `ConsumerReader` keeps its one read session behind a per-reader mutex so the session
@@ -6325,8 +6338,8 @@ fn record_observation_state_delta_some_null_sets_json_null_distinct_from_none_wh
             &db_params(vec![("id", Value::Uuid(observation_id.as_uuid()))]),
         )
         .expect("raw state_delta");
-    assert_eq!(row.rows.len(), 1);
-    let Value::Json(raw) = &row.rows[0][0] else {
+    assert_eq!(row.rows().len(), 1);
+    let Value::Json(raw) = &row.rows()[0][0] else {
         panic!("state_delta must be JSON");
     };
     assert_eq!(raw["format"], serde_json::json!("cg_state_delta_v1"));

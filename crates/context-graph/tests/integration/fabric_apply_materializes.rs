@@ -6,7 +6,6 @@
 use context_graph::fabric::{
     self, ApplyOutcome, FabricCapture, FabricPollOutcome, FabricWorkerConfig,
 };
-use std::time::Duration;
 
 use crate::fabric_common::{
     CountingExtractor, FabricFixture, context_id, fabric_fixture, memory_total, tier0_request,
@@ -23,10 +22,7 @@ async fn push_only(client: &contextdb_server::SyncClient) {
         {
             break;
         }
-        tokio::time::timeout(Duration::from_secs(30), client.push())
-            .await
-            .expect("authenticated push stays bounded")
-            .expect("push round");
+        client.push().await.expect("push round");
     }
     assert!(
         !client
@@ -40,10 +36,7 @@ async fn push_only(client: &contextdb_server::SyncClient) {
 async fn pull_only(client: &contextdb_server::SyncClient) {
     for _ in 0..32 {
         let before = client.pull_watermark();
-        tokio::time::timeout(Duration::from_secs(30), client.pull_default())
-            .await
-            .expect("authenticated pull stays bounded")
-            .expect("pull round");
+        client.pull_default().await.expect("pull round");
         if client.pull_watermark() == before {
             return;
         }

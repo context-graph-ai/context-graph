@@ -217,7 +217,7 @@ fn count(reader: &ConsumerReader, sql: &str, context_id: ContextId) -> u64 {
             &HashMap::from([("context_id".to_string(), Value::Uuid(context_id.as_uuid()))]),
         )
         .expect("count rows");
-    match answer.rows.first().and_then(|row| row.first()) {
+    match answer.rows().first().and_then(|row| row.first()) {
         Some(Value::Int64(value)) => u64::try_from(*value).expect("non-negative count"),
         other => panic!("count query returned {other:?}"),
     }
@@ -903,7 +903,8 @@ fn a_refused_forget_leaves_the_search_head_passages_and_find_answer_unchanged() 
                 &HashMap::new(),
             )
             .expect("read heads")
-            .rows
+            .rows()
+            .to_vec()
     };
     let heads_before = heads(&before_reader);
     let passages_before = count(

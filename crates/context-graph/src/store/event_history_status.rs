@@ -243,7 +243,7 @@ impl EventHistoryStatusSource for ConsumerReader {
             "SELECT expected_policy FROM event_placement WHERE id = $id",
             &HashMap::from([("id".to_string(), Value::Int64(1))]),
         )?;
-        match answer.rows.first().and_then(|row| row.first()) {
+        match answer.rows().first().and_then(|row| row.first()) {
             Some(Value::Text(policy)) if policy == "local_only" => {
                 Ok(EventPlacementState::LocalOnly)
             }
@@ -295,7 +295,7 @@ impl ConsumerReader {
                 ),
             ]),
         )?;
-        match answer.rows.first().and_then(|row| row.first()) {
+        match answer.rows().first().and_then(|row| row.first()) {
             Some(Value::Uuid(id)) => Ok(Some(ContextId::from(*id))),
             None => Ok(None),
             other => Err(CgError::Engine(format!(
@@ -364,13 +364,13 @@ pub(crate) fn context_names(
             "SELECT id, name FROM contexts WHERE id = $id",
             &HashMap::from([("id".to_string(), Value::Uuid(context_id.as_uuid()))]),
         )?;
-        let Some(row) = answer.rows.first() else {
+        let Some(row) = answer.rows().first() else {
             return Err(CgError::NotFound {
                 id: Some(context_id.to_string()),
                 missing: Some("context"),
             });
         };
-        names.insert(*context_id, text(row, &answer.columns, "name")?);
+        names.insert(*context_id, text(row, answer.columns(), "name")?);
     }
     Ok(names)
 }
@@ -386,7 +386,7 @@ fn count(
 ) -> Result<u64> {
     let answer = source.query_rows(sql, params)?;
     let row = answer
-        .rows
+        .rows()
         .first()
         .ok_or_else(|| CgError::Engine("a status count returned no aggregate row".into()))?;
     match row.first() {
@@ -447,14 +447,14 @@ fn context_status(
         &params,
     )?;
     let mut active_interpretations = heads
-        .rows
+        .rows()
         .iter()
         .map(|row| {
             Ok(EventHistoryInterpretationHead {
-                connector_id: text(row, &heads.columns, "connector_id")?,
+                connector_id: text(row, heads.columns(), "connector_id")?,
                 generation_id: InterpretationGenerationId::from(uuid(
                     row,
-                    &heads.columns,
+                    heads.columns(),
                     "generation_id",
                 )?),
             })
@@ -513,9 +513,9 @@ fn source_streams(
         &params,
     )?;
     let mut streams = BTreeMap::new();
-    for row in &distinct.rows {
-        let connector_id = text(row, &distinct.columns, "connector_id")?;
-        let source_instance_ref = text(row, &distinct.columns, "source_instance_ref")?;
+    for row in distinct.rows() {
+        let connector_id = text(row, distinct.columns(), "connector_id")?;
+        let source_instance_ref = text(row, distinct.columns(), "source_instance_ref")?;
         let key = (connector_id.clone(), source_instance_ref.clone());
         if streams.contains_key(&key) {
             // One source instance carries one session and one declaration; a second combination
@@ -539,8 +539,8 @@ fn source_streams(
             "SELECT seq FROM events WHERE context_id = $context_id AND connector_id = $connector_id AND source_instance_ref = $source_instance_ref ORDER BY seq DESC LIMIT 1",
             &stream_params,
         )?;
-        let latest_event_seq = match latest.rows.first() {
-            Some(row) => Some(unsigned(row, &latest.columns, "seq")?),
+        let latest_event_seq = match latest.rows().first() {
+            Some(row) => Some(unsigned(row, latest.columns(), "seq")?),
             None => None,
         };
         streams.insert(
@@ -548,11 +548,11 @@ fn source_streams(
             EventSourceStreamStatus {
                 connector_id,
                 source_instance_ref,
-                session_ref: text(row, &distinct.columns, "session_ref")?,
-                adapter_version: text(row, &distinct.columns, "adapter_version")?,
+                session_ref: text(row, distinct.columns(), "session_ref")?,
+                adapter_version: text(row, distinct.columns(), "adapter_version")?,
                 anchor_declaration_version: text(
                     row,
-                    &distinct.columns,
+                    distinct.columns(),
                     "anchor_declaration_version",
                 )?,
                 event_count,
@@ -580,10 +580,10 @@ fn search_status(
         "SELECT generation_id, activated_at FROM event_search_heads WHERE context_id = $context_id",
         &params,
     )?;
-    let active_generation_id = match head.rows.first() {
+    let active_generation_id = match head.rows().first() {
         Some(row) => Some(EventSearchGenerationId::from(uuid(
             row,
-            &head.columns,
+            head.columns(),
             "generation_id",
         )?)),
         None => None,
@@ -605,12 +605,12 @@ fn search_status(
                 ("context_id".to_string(), Value::Uuid(context_id.as_uuid())),
             ]),
         )?;
-        let row = generation.rows.first().ok_or_else(|| {
+        let row = generation.rows().first().ok_or_else(|| {
             CgError::Engine(format!(
                 "the active event-search head names missing generation {generation_id}"
             ))
         })?;
-        let generation_state = text(row, &generation.columns, "state")?;
+        let generation_state = text(row, generation.columns(), "state")?;
         if generation_state != "ready" && generation_state != "building" {
             return Err(CgError::Engine(format!(
                 "the active event-search head names generation {generation_id}, which is neither ready nor building"
@@ -628,11 +628,11 @@ fn search_status(
         outside_scope_events = coverage.outside_scope_events;
         outside_scope_indexed_events = coverage.outside_scope_indexed_events;
         no_searchable_text_events = coverage.no_searchable_text_events;
-        embedding_space_id = Some(text(row, &generation.columns, "embedding_space_id")?);
-        renderer_id = Some(text(row, &generation.columns, "renderer_id")?);
-        renderer_version = Some(text(row, &generation.columns, "renderer_version")?);
+        embedding_space_id = Some(text(row, generation.columns(), "embedding_space_id")?);
+        renderer_id = Some(text(row, generation.columns(), "renderer_id")?);
+        renderer_version = Some(text(row, generation.columns(), "renderer_version")?);
         profile = Some(
-            match row.get(column(&generation.columns, "renderer_profile")?) {
+            match row.get(column(generation.columns(), "renderer_profile")?) {
                 Some(Value::Json(value)) => {
                     serde_json::from_value(value.clone()).map_err(|error| {
                         CgError::Engine(format!("column renderer_profile: {error}"))
@@ -649,9 +649,9 @@ fn search_status(
     let live_projection_lease =
         super::event_search_projection::live_projection_lease(source, context_id, now_ms)?;
     let activated_at = head
-        .rows
+        .rows()
         .first()
-        .map(|row| txid(row, &head.columns, "activated_at"))
+        .map(|row| txid(row, head.columns(), "activated_at"))
         .transpose()?;
     // SELECT * reads generation metadata while allowing the attempt column to be absent.
     let generations = source.query_rows(
@@ -660,14 +660,14 @@ fn search_status(
     )?;
     let mut building = None;
     let mut latest_attempt: Option<(u64, EventSearchGenerationId, Option<String>)> = None;
-    for row in &generations.rows {
-        let id = EventSearchGenerationId::from(uuid(row, &generations.columns, "id")?);
-        let state = text(row, &generations.columns, "state")?;
+    for row in generations.rows() {
+        let id = EventSearchGenerationId::from(uuid(row, generations.columns(), "id")?);
+        let state = text(row, generations.columns(), "state")?;
         if state == "retired" {
             continue;
         }
-        let attempt = last_attempt_or_creation(row, &generations.columns)?;
-        let failure = optional_text(row, &generations.columns, "sanitized_failure")?
+        let attempt = last_attempt_or_creation(row, generations.columns())?;
+        let failure = optional_text(row, generations.columns(), "sanitized_failure")?
             .or_else(|| (state == "failed").then(|| "projection failed".into()));
         let active = Some(id) == active_generation_id;
         // Activation supersedes other older attempts. An active generation may record its own
@@ -692,7 +692,7 @@ fn search_status(
                 .as_ref()
                 .is_none_or(|(seen, seen_id, _)| (attempt, id) > (*seen, *seen_id))
         {
-            let profile = match row.get(column(&generations.columns, "renderer_profile")?) {
+            let profile = match row.get(column(generations.columns(), "renderer_profile")?) {
                 Some(Value::Json(value)) => {
                     serde_json::from_value(value.clone()).map_err(|error| {
                         CgError::Engine(format!("column renderer_profile: {error}"))
@@ -776,12 +776,12 @@ fn last_attempt_or_creation(row: &[Value], columns: &[String]) -> Result<u64> {
 
 fn latest_failure(answer: &contextdb_engine::QueryResult) -> Result<Option<String>> {
     let mut latest: Option<(u64, Option<String>)> = None;
-    for row in &answer.rows {
-        let started = txid(row, &answer.columns, "started_at")?;
+    for row in answer.rows() {
+        let started = txid(row, answer.columns(), "started_at")?;
         if latest.as_ref().is_none_or(|(seen, _)| started > *seen) {
             latest = Some((
                 started,
-                optional_text(row, &answer.columns, "sanitized_failure")?,
+                optional_text(row, answer.columns(), "sanitized_failure")?,
             ));
         }
     }
@@ -913,14 +913,14 @@ pub(crate) fn check_event_source_prefix(
         "SELECT source_instance_ref, adapter_version, anchor_declaration_version FROM event_source_locators WHERE context_id = $context_id AND connector_id = $connector_id AND source_locator_ref = $source_locator_ref",
         &params,
     )?;
-    let Some(row) = locator.rows.first() else {
+    let Some(row) = locator.rows().first() else {
         return Ok(EventSourcePrefixCheck::New {
             source_bytes: source_len,
         });
     };
-    let source_instance_ref = text(row, &locator.columns, "source_instance_ref")?;
-    let adapter_version = text(row, &locator.columns, "adapter_version")?;
-    let anchor_version = text(row, &locator.columns, "anchor_declaration_version")?;
+    let source_instance_ref = text(row, locator.columns(), "source_instance_ref")?;
+    let adapter_version = text(row, locator.columns(), "adapter_version")?;
+    let anchor_version = text(row, locator.columns(), "anchor_declaration_version")?;
     params.insert(
         "source_instance_ref".to_string(),
         Value::Text(source_instance_ref),
@@ -929,14 +929,14 @@ pub(crate) fn check_event_source_prefix(
         "SELECT committed_byte_offset, prefix_sha256 FROM event_source_checkpoints WHERE context_id = $context_id AND connector_id = $connector_id AND source_instance_ref = $source_instance_ref",
         &params,
     )?;
-    let Some(row) = checkpoint.rows.first() else {
+    let Some(row) = checkpoint.rows().first() else {
         return Ok(EventSourcePrefixCheck::Diverged {
             committed_bytes: 0,
             reason: "a recorded source locator has no committed checkpoint".into(),
         });
     };
-    let committed_bytes = unsigned(row, &checkpoint.columns, "committed_byte_offset")?;
-    let committed_sha256 = text(row, &checkpoint.columns, "prefix_sha256")?;
+    let committed_bytes = unsigned(row, checkpoint.columns(), "committed_byte_offset")?;
+    let committed_sha256 = text(row, checkpoint.columns(), "prefix_sha256")?;
     if adapter_version != declaration.adapter_version
         || anchor_version != declaration.anchor_declaration_version
     {

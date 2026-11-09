@@ -1,3 +1,7 @@
+#![allow(
+    clippy::result_large_err,
+    reason = "The engine's public error carries its refusal diagnostics inline (160+ bytes); this module passes it through unchanged."
+)]
 use std::collections::{BTreeSet, HashMap};
 
 use contextdb_core::{Error as EngineError, TxId, Value};
@@ -85,8 +89,8 @@ fn cites_chain(
                     ("edge_type".to_string(), Value::Text("CITES".to_string())),
                 ]),
             )?;
-            for row in &result.rows {
-                let target_id = row_uuid(row, &result.columns, "target_id")?;
+            for row in result.rows() {
+                let target_id = row_uuid(row, result.columns(), "target_id")?;
                 candidates.push(CitedCandidate {
                     id: target_id,
                     created_at: decision_created_at(db, tx, context_id, target_id)?,
@@ -126,11 +130,11 @@ fn decision_created_at(
             ("context_id".to_string(), Value::Uuid(context_id)),
         ]),
     )?;
-    match result.rows.first() {
-        Some(row) => row_txid(row, &result.columns, "created_at"),
-        None => Err(EngineError::Other(format!(
-            "cited decision {decision_id} missing in context {context_id}"
-        ))),
+    match result.rows().first() {
+        Some(row) => row_txid(row, result.columns(), "created_at"),
+        None => Err(EngineError::Other(
+            format!("cited decision {decision_id} missing in context {context_id}").into(),
+        )),
     }
 }
 
@@ -147,8 +151,9 @@ fn insert_precedent_match(
         .copied()
         .map(IntentionId::from)
         .collect::<Vec<_>>();
-    let served_json = serde_json::to_value(served_ids)
-        .map_err(|err| EngineError::Other(format!("precedent intentions serialize: {err}")))?;
+    let served_json = serde_json::to_value(served_ids).map_err(|err| {
+        EngineError::Other(format!("precedent intentions serialize: {err}").into())
+    })?;
     let params = HashMap::from([
         ("id".to_string(), Value::Uuid(Uuid::now_v7())),
         ("context_id".to_string(), Value::Uuid(context_id)),
@@ -189,9 +194,9 @@ fn outcome_success(
         ]),
     )?;
     result
-        .rows
+        .rows()
         .first()
-        .map(|row| row_bool(row, &result.columns, "success"))
+        .map(|row| row_bool(row, result.columns(), "success"))
         .transpose()
 }
 
@@ -211,18 +216,18 @@ fn served_intentions(
         ]),
     )?;
     result
-        .rows
+        .rows()
         .iter()
-        .map(|row| row_uuid(row, &result.columns, "target_id"))
+        .map(|row| row_uuid(row, result.columns(), "target_id"))
         .collect()
 }
 
 fn required_uuid(values: &HashMap<String, Value>, column: &str) -> contextdb_core::Result<Uuid> {
     match values.get(column) {
         Some(Value::Uuid(value)) => Ok(*value),
-        other => Err(EngineError::Other(format!(
-            "precedent match expected {column} uuid, got {other:?}"
-        ))),
+        other => Err(EngineError::Other(
+            format!("precedent match expected {column} uuid, got {other:?}").into(),
+        )),
     }
 }
 
@@ -230,32 +235,32 @@ fn column_index(columns: &[String], column: &str) -> contextdb_core::Result<usiz
     columns
         .iter()
         .position(|name| name == column)
-        .ok_or_else(|| EngineError::Other(format!("missing column {column}")))
+        .ok_or_else(|| EngineError::Other(format!("missing column {column}").into()))
 }
 
 fn row_uuid(row: &[Value], columns: &[String], column: &str) -> contextdb_core::Result<Uuid> {
     match row.get(column_index(columns, column)?) {
         Some(Value::Uuid(value)) => Ok(*value),
-        other => Err(EngineError::Other(format!(
-            "expected {column} uuid, got {other:?}"
-        ))),
+        other => Err(EngineError::Other(
+            format!("expected {column} uuid, got {other:?}").into(),
+        )),
     }
 }
 
 fn row_bool(row: &[Value], columns: &[String], column: &str) -> contextdb_core::Result<bool> {
     match row.get(column_index(columns, column)?) {
         Some(Value::Bool(value)) => Ok(*value),
-        other => Err(EngineError::Other(format!(
-            "expected {column} bool, got {other:?}"
-        ))),
+        other => Err(EngineError::Other(
+            format!("expected {column} bool, got {other:?}").into(),
+        )),
     }
 }
 
 fn row_txid(row: &[Value], columns: &[String], column: &str) -> contextdb_core::Result<TxId> {
     match row.get(column_index(columns, column)?) {
         Some(Value::TxId(value)) => Ok(*value),
-        other => Err(EngineError::Other(format!(
-            "expected {column} txid, got {other:?}"
-        ))),
+        other => Err(EngineError::Other(
+            format!("expected {column} txid, got {other:?}").into(),
+        )),
     }
 }

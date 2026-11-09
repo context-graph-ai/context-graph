@@ -193,18 +193,18 @@ impl GraphRows for ConsumerGraphView<'_> {
         // close.
         let paged = (|| -> Result<(Vec<String>, Vec<Vec<Value>>)> {
             let first = cursor.first_page()?;
-            let mut columns = first.columns.clone();
-            let mut rows = first.rows.clone();
-            let mut has_more = first.has_more;
+            let mut columns = first.columns().to_vec();
+            let mut rows = first.rows().to_vec();
+            let mut has_more = first.has_more();
             while has_more {
                 let page = cursor.fetch(None)?;
                 // A page that carries no rows names no columns either; the decoder needs the
                 // projection, so the first page that states one is the one believed.
                 if columns.is_empty() {
-                    columns = page.columns;
+                    columns = page.columns().to_vec();
                 }
-                rows.extend(page.rows);
-                has_more = page.has_more;
+                rows.extend(page.rows().iter().cloned());
+                has_more = page.has_more();
             }
             Ok((columns, rows))
         })();
@@ -213,10 +213,12 @@ impl GraphRows for ConsumerGraphView<'_> {
         // displace the refusal that stopped the read.
         let (columns, rows) = paged?;
         closed?;
-        Ok(QueryResult {
+        Ok(QueryResult::new(
             columns,
             rows,
-            ..QueryResult::empty()
-        })
+            0,
+            contextdb_engine::QueryTrace::scan(),
+            None,
+        ))
     }
 }

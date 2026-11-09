@@ -626,7 +626,8 @@ async fn authenticated_hub() -> AuthenticatedHub {
             tenant.clone(),
             node_id,
             identity,
-        ),
+        )
+        .expect("sync fixture call is accepted by the engine"),
     );
     for (table, policy) in [("events", EVENT_POLICY), ("event_anchors", ANCHOR_POLICY)] {
         database
@@ -674,7 +675,8 @@ async fn authenticated_binding(
         hub.broker.client_as(&node_id),
         hub.tenant.clone(),
         identity,
-    );
+    )
+    .expect("sync fixture call is accepted by the engine");
     let binding = client
         .bind_application_table_policy(policy_expectation())
         .await

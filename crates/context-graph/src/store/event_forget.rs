@@ -16,8 +16,8 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
+use crate::consumer_read::ConsumerPage;
 use contextdb_core::Value;
-use contextdb_core::read_contract::CursorPage;
 use serde::{Deserialize, Serialize};
 
 use crate::consumer_read::ConsumerCursor;
@@ -124,7 +124,7 @@ impl ConsumerReader {
 struct ForgetSessionStream {
     table: &'static str,
     cursor: ConsumerCursor,
-    page: Option<CursorPage>,
+    page: Option<ConsumerPage>,
     offset: usize,
 }
 
@@ -144,7 +144,7 @@ impl ForgetSessionStream {
         }
         loop {
             let page = self.page.as_ref().expect("initialized above");
-            if let Some(row) = page.rows.get(self.offset) {
+            if let Some(row) = page.rows().get(self.offset) {
                 self.offset += 1;
                 return match (row.first(), row.get(1)) {
                     (Some(Value::Text(connector)), Some(Value::Text(session))) => {
@@ -156,7 +156,7 @@ impl ForgetSessionStream {
                     ))),
                 };
             }
-            if !page.has_more {
+            if !page.has_more() {
                 return Ok(None);
             }
             self.page = Some(self.cursor.fetch(std::num::NonZeroUsize::new(128))?);
@@ -318,20 +318,20 @@ impl Store {
         // fails the row stays absent and readers recount, so its failure does not fail the forget.
         let _ = rewrite_event_context_counts(self, context_id);
         let table_index = answer
-            .columns
+            .columns()
             .iter()
             .position(|column| column == "table")
             .ok_or_else(|| CgError::Engine("the erasure report has no table column".into()))?;
         let rows_index = answer
-            .columns
+            .columns()
             .iter()
             .position(|column| column == "rows_affected")
             .ok_or_else(|| {
                 CgError::Engine("the erasure report has no rows_affected column".into())
             })?;
-        let mut tables = Vec::with_capacity(answer.rows.len());
+        let mut tables = Vec::with_capacity(answer.rows().len());
         let mut by_table = BTreeMap::new();
-        for row in &answer.rows {
+        for row in answer.rows() {
             let table = match row.get(table_index) {
                 Some(Value::Text(table)) => table.clone(),
                 other => {
@@ -379,8 +379,8 @@ fn active_interpretations(
         "SELECT generation_id FROM event_interpretation_heads WHERE context_id = $context_id",
         &params,
     )?;
-    let mut retired = Vec::with_capacity(heads.rows.len());
-    for row in &heads.rows {
+    let mut retired = Vec::with_capacity(heads.rows().len());
+    for row in heads.rows() {
         let Some(Value::Uuid(generation_id)) = row.first() else {
             return Err(CgError::Engine(
                 "forget read an interpretation head without a generation".into(),
@@ -395,8 +395,8 @@ fn active_interpretations(
             ]),
         )?;
         let text = |name: &str| -> Result<String> {
-            let index = column(&generation.columns, name)?;
-            match generation.rows.first().and_then(|row| row.get(index)) {
+            let index = column(generation.columns(), name)?;
+            match generation.rows().first().and_then(|row| row.get(index)) {
                 Some(Value::Text(value)) => Ok(value.clone()),
                 other => Err(CgError::Engine(format!(
                     "forget read an active interpretation generation without {name}: {other:?}"
@@ -456,7 +456,7 @@ fn require_context(store: &Store, context_id: ContextId) -> Result<()> {
             &HashMap::from([("id".to_string(), Value::Uuid(context_id.as_uuid()))]),
         )
         .map_err(map_engine_err)?;
-    if answer.rows.is_empty() {
+    if answer.rows().is_empty() {
         return Err(CgError::NotFound {
             id: Some(context_id.to_string()),
             missing: Some("context"),
@@ -496,11 +496,11 @@ fn session_plan(
         "SELECT id, source_instance_ref FROM events WHERE context_id = $context_id AND connector_id = $connector_id AND session_ref = $session_ref",
         &params,
     )?;
-    let id_index = column(&events.columns, "id")?;
-    let source_index = column(&events.columns, "source_instance_ref")?;
+    let id_index = column(events.columns(), "id")?;
+    let source_index = column(events.columns(), "source_instance_ref")?;
     let mut event_ids = BTreeSet::new();
     let mut sources = BTreeSet::new();
-    for row in &events.rows {
+    for row in events.rows() {
         match (row.get(id_index), row.get(source_index)) {
             (Some(Value::Uuid(id)), Some(Value::Text(source))) => {
                 event_ids.insert(*id);
@@ -521,7 +521,7 @@ fn session_plan(
             ),
             &params,
         )?;
-        for row in &answer.rows {
+        for row in answer.rows() {
             if let Some(Value::Text(source)) = row.first() {
                 sources.insert(source.clone());
             }
@@ -536,10 +536,10 @@ fn session_plan(
         "SELECT gap_id, event_id FROM adapter_coverage_gap_events WHERE context_id = $context_id",
         &params,
     )?;
-    let gap_index = column(&gap_links.columns, "gap_id")?;
-    let event_index = column(&gap_links.columns, "event_id")?;
+    let gap_index = column(gap_links.columns(), "gap_id")?;
+    let event_index = column(gap_links.columns(), "event_id")?;
     let mut gap_members = BTreeMap::<uuid::Uuid, bool>::new();
-    for row in &gap_links.rows {
+    for row in gap_links.rows() {
         let (Some(Value::Uuid(gap)), Some(Value::Uuid(event))) =
             (row.get(gap_index), row.get(event_index))
         else {
@@ -625,9 +625,9 @@ fn context_plan(store: &Store, context_id: ContextId) -> Result<Option<(PurgePla
             ),
             &params,
         )?;
-        let connector_index = column(&answer.columns, "connector_id")?;
-        let session_index = column(&answer.columns, "session_ref")?;
-        for row in &answer.rows {
+        let connector_index = column(answer.columns(), "connector_id")?;
+        let session_index = column(answer.columns(), "session_ref")?;
+        for row in answer.rows() {
             any_source_state = true;
             if let (Some(Value::Text(connector)), Some(Value::Text(session))) =
                 (row.get(connector_index), row.get(session_index))

@@ -1,4 +1,8 @@
 //! Bounded construction of the derived event-history search projection.
+#![allow(
+    clippy::result_large_err,
+    reason = "The engine's public error carries its refusal diagnostics inline (160+ bytes); this module passes it through unchanged."
+)]
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::num::NonZeroUsize;
@@ -48,11 +52,9 @@ fn open_for_run(
 ) -> Result<Store> {
     #[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
     STORE_OPENS.with(|opens| opens.set(opens.get() + 1));
-    super::open_retry::retry(
-        &config.db_path,
-        super::open_retry::Contention::Writer,
-        || Store::open_with_embedder_registrations(config.clone(), vec![embedder.clone()]),
-    )
+    super::open_retry::retry(&config.db_path, || {
+        Store::open_with_embedder_registrations(config.clone(), vec![embedder.clone()])
+    })
 }
 
 /// Admission shared by every projection door that has selected an event-search registration.
@@ -258,7 +260,7 @@ fn renew_claim(store: &Store, held: &HeldClaim, expires_at: i64, bounds: Bounds)
             ]),
         )
         .map_err(map_engine_err)?;
-    if updated.rows_affected != 1 {
+    if updated.rows_affected() != 1 {
         return Err(stale_claim(
             "event-search claim was taken over while embedding",
         ));
@@ -901,7 +903,7 @@ fn record_run_failure(
             ]),
         )
         .map_err(map_engine_err)?;
-    match updated.rows_affected {
+    match updated.rows_affected() {
         1 => Ok(EventSearchFailureDisposition::Recorded),
         0 => Ok(EventSearchFailureDisposition::Stale),
         count => Err(CgError::Engine(format!(
@@ -947,12 +949,12 @@ fn write_generation_attempt(
         let generation = store.internal_db().execute_in_tx(tx,
             "SELECT last_attempt_at, last_attempt_token FROM event_search_generations WHERE context_id = $context_id AND id = $id", &params).map_err(map_engine_err)?;
         let row = generation
-            .rows
+            .rows()
             .first()
             .ok_or_else(|| stale_claim("event-search generation disappeared before attempt"))?;
         let conditions = exact_conditions(
             row,
-            &generation.columns,
+            generation.columns(),
             &["last_attempt_at", "last_attempt_token"],
         )?;
         if !store
@@ -972,15 +974,15 @@ fn write_generation_attempt(
         }
         let lease = store.internal_db().execute_in_tx(tx,
             "SELECT owner_token, lease_epoch, expires_at FROM event_search_leases WHERE context_id = $context_id AND generation_id = $id", &params).map_err(map_engine_err)?;
-        if let Some(row) = lease.rows.first() {
-            if get_timestamp(row, &lease.columns, "expires_at")? > now_millis()? {
+        if let Some(row) = lease.rows().first() {
+            if get_timestamp(row, lease.columns(), "expires_at")? > now_millis()? {
                 return Err(stale_claim(
                     "another event-search worker owns the unexpired claim",
                 ));
             }
             let conditions = exact_conditions(
                 row,
-                &lease.columns,
+                lease.columns(),
                 &["owner_token", "lease_epoch", "expires_at"],
             )?;
             if !store
@@ -1006,7 +1008,7 @@ fn write_generation_attempt(
         );
         let updated = store.internal_db().execute_in_tx(tx,
             "UPDATE event_search_generations SET last_attempt_at = $attempt, last_attempt_token = $attempt_token, sanitized_failure = $failure WHERE context_id = $context_id AND id = $id", &params).map_err(map_engine_err)?;
-        if updated.rows_affected != 1 {
+        if updated.rows_affected() != 1 {
             return Err(stale_claim(
                 "event-search generation disappeared while its attempt was recorded",
             ));
@@ -1056,10 +1058,10 @@ fn read_committed_attempt(
             ]),
         )
         .map_err(map_engine_err)?;
-    let row = result.rows.first().ok_or_else(|| {
+    let row = result.rows().first().ok_or_else(|| {
         stale_claim("event-search attempt was superseded before committed timestamp readback")
     })?;
-    if result.rows.len() != 1 {
+    if result.rows().len() != 1 {
         return Err(stale_claim(
             "event-search attempt ownership token was not unique",
         ));
@@ -1068,10 +1070,10 @@ fn read_committed_attempt(
         ProjectionAttempt {
             context_id,
             generation_id,
-            tx: get_txid(row, &result.columns, "last_attempt_at")?,
+            tx: get_txid(row, result.columns(), "last_attempt_at")?,
             token,
         },
-        get_txid(row, &result.columns, "started_at")?,
+        get_txid(row, result.columns(), "started_at")?,
     ))
 }
 
@@ -1101,15 +1103,15 @@ fn read_committed_completion(store: &Store, generation: &Generation) -> Result<T
             ]),
         )
         .map_err(map_engine_err)?;
-    let row = result.rows.first().ok_or_else(|| {
+    let row = result.rows().first().ok_or_else(|| {
         stale_claim("event-search attempt was superseded before completion timestamp readback")
     })?;
-    if result.rows.len() != 1 {
+    if result.rows().len() != 1 {
         return Err(stale_claim(
             "event-search completion ownership token was not unique",
         ));
     }
-    get_optional_txid(row, &result.columns, "completed_at")?.ok_or_else(|| {
+    get_optional_txid(row, result.columns(), "completed_at")?.ok_or_else(|| {
         stale_claim("event-search ready generation has no committed completion transaction")
     })
 }
@@ -1719,14 +1721,14 @@ pub(crate) fn persist_selected_work_with_retained_requests(
                 "SELECT renderer_id, renderer_version, renderer_profile, embedding_space_id, encoding_profile FROM event_search_generations WHERE context_id = $context_id AND id = $id",
                 &HashMap::from([("context_id".into(), Value::Uuid(context_id.as_uuid())), ("id".into(), Value::Uuid(generation_id))]),
             )?;
-            let Some(generation_row) = generation.rows.first() else {
+            let Some(generation_row) = generation.rows().first() else {
                 return Err(stale_claim("queued retention generation disappeared"));
             };
-            if get_text(generation_row, &generation.columns, "renderer_id")? == EVENT_SEARCH_RENDERER_ID
-                && get_text(generation_row, &generation.columns, "renderer_version")? == EVENT_SEARCH_RENDERER_VERSION
-                && get_json(generation_row, &generation.columns, "renderer_profile")? == desired_profile
-                && get_text(generation_row, &generation.columns, "embedding_space_id")? == desired_spec.embedding_space_id
-                && get_text(generation_row, &generation.columns, "encoding_profile")? == desired_spec.encoding_profile_id
+            if get_text(generation_row, generation.columns(), "renderer_id")? == EVENT_SEARCH_RENDERER_ID
+                && get_text(generation_row, generation.columns(), "renderer_version")? == EVENT_SEARCH_RENDERER_VERSION
+                && get_json(generation_row, generation.columns(), "renderer_profile")? == desired_profile
+                && get_text(generation_row, generation.columns(), "embedding_space_id")? == desired_spec.embedding_space_id
+                && get_text(generation_row, generation.columns(), "encoding_profile")? == desired_spec.encoding_profile_id
             {
                 return Ok(());
             }
@@ -1740,7 +1742,7 @@ pub(crate) fn persist_selected_work_with_retained_requests(
                         ("owner_token".into(), Value::Text(owner_token.clone())),
                     ]),
                 )?;
-                if !header.rows.is_empty() {
+                if !header.rows().is_empty() {
                     running_requests.insert(*request_id);
                 }
             }
@@ -1799,7 +1801,7 @@ fn load_work_frontiers(
     };
     let header = source.query_rows(&format!("SELECT request_id FROM {headers} WHERE context_id = $context_id AND request_id = $request_id"),
         &HashMap::from([("context_id".into(), Value::Uuid(context_id.as_uuid())), ("request_id".into(), Value::Uuid(request_id))]))?;
-    if header.rows.is_empty() {
+    if header.rows().is_empty() {
         return Err(CgError::Engine(
             if refusal {
                 "retired search refusal has no durable selected-work identity"
@@ -1837,7 +1839,7 @@ pub(crate) fn preserve_refusal_work(
     ]);
     if !store.query_rows(
         "SELECT request_id FROM event_search_refusal_headers WHERE context_id = $context_id AND request_id = $request_id", &params,
-    )?.rows.is_empty() {
+    )?.rows().is_empty() {
         return Ok(());
     }
     let selected = load_selected_work(store, context_id, request_id)?;
@@ -1950,19 +1952,19 @@ fn reconcile_work_frontiers(store: &Store, retained: &[uuid::Uuid], refusal: boo
             &format!("SELECT context_id, request_id FROM {headers}{predicate} LIMIT 64"),
             &params,
         )?;
-        if rows.rows.is_empty() {
+        if rows.rows().is_empty() {
             return Ok(());
         }
         let mut retired = BTreeMap::<crate::ContextId, Vec<uuid::Uuid>>::new();
-        for row in &rows.rows {
+        for row in rows.rows() {
             retired
                 .entry(crate::ContextId::from(get_uuid(
                     row,
-                    &rows.columns,
+                    rows.columns(),
                     "context_id",
                 )?))
                 .or_default()
-                .push(get_uuid(row, &rows.columns, "request_id")?);
+                .push(get_uuid(row, rows.columns(), "request_id")?);
         }
         for (context_id, requests) in retired {
             release_work_frontiers(store, context_id, &requests, refusal)?;
@@ -1983,9 +1985,9 @@ fn selected_frontier(
             ("connector".into(), Value::Text(pending.connector_id.clone())), ("session".into(), Value::Text(pending.session_ref.clone())), ("source".into(), Value::Text(pending.source_instance_ref.clone())),
         ]),
     )?;
-    row.rows
+    row.rows()
         .first()
-        .map(|value| get_u64(value, &row.columns, "frontier"))
+        .map(|value| get_u64(value, row.columns(), "frontier"))
         .transpose()
 }
 
@@ -2122,10 +2124,10 @@ pub(crate) fn selected_work_complete(
             ]),
         )?;
         if !rows
-            .rows
+            .rows()
             .first()
             .map(|row| {
-                get_u64(row, &rows.columns, "committed_sequence")
+                get_u64(row, rows.columns(), "committed_sequence")
                     .map(|committed| committed >= stream.frontier)
             })
             .transpose()?
@@ -2266,9 +2268,9 @@ pub(crate) fn persisted_work_policies(
         ),
         &params,
     )?;
-    for row in &answer.rows {
-        let context_id = crate::ContextId::from(get_uuid(row, &answer.columns, "context_id")?);
-        policies.insert(context_id, work_policy_from_row(row, &answer.columns)?);
+    for row in answer.rows() {
+        let context_id = crate::ContextId::from(get_uuid(row, answer.columns(), "context_id")?);
+        policies.insert(context_id, work_policy_from_row(row, answer.columns())?);
     }
     for context_id in context_ids {
         policies
@@ -2439,10 +2441,10 @@ pub(crate) fn policy_coverage_for(
         &params,
     )?;
     let mut covered = HashMap::new();
-    for row in &generations.rows {
+    for row in generations.rows() {
         covered.insert(
-            crate::ContextId::from(get_uuid(row, &generations.columns, "context_id")?),
-            get_u64(row, &generations.columns, "searchable_event_count")?,
+            crate::ContextId::from(get_uuid(row, generations.columns(), "context_id")?),
+            get_u64(row, generations.columns(), "searchable_event_count")?,
         );
     }
 
@@ -2575,7 +2577,7 @@ fn selected_session_work_for_run(
                 ]),
             )?;
             *selected.events.entry(key.clone()).or_default() +=
-                get_u64(&rows.rows[0], &rows.columns, "event_count")?;
+                get_u64(&rows.rows()[0], rows.columns(), "event_count")?;
             frontiers.insert((key, stream.source_instance_ref.clone()), stream.frontier);
         }
         selected.frontiers = Some(frontiers);
@@ -2608,8 +2610,8 @@ fn selected_session_work_from_selection(
             &HashMap::from([("context_id".into(), Value::Uuid(context_id.as_uuid()))]),
         )
         .map_err(map_engine_err)?;
-    if let Some(row) = head.rows.first() {
-        let active = EventSearchGenerationId::from(get_uuid(row, &head.columns, "generation_id")?);
+    if let Some(row) = head.rows().first() {
+        let active = EventSearchGenerationId::from(get_uuid(row, head.columns(), "generation_id")?);
         if active != generation_id && selected.frontiers.is_none() {
             store.stream_rows(
                 "SELECT connector_id, session_ref FROM event_search_session_progress WHERE context_id = $context_id AND generation_id = $generation_id AND is_published = $published AND searchable_event_count > $zero ORDER BY connector_id ASC, session_ref ASC",
@@ -2703,10 +2705,10 @@ fn persist_required_sessions(
                 ("id".into(), Value::Uuid(generation_id.as_uuid())),
             ]),
         ).map_err(map_engine_err)?;
-        let row = generation.rows.first().ok_or_else(|| {
+        let row = generation.rows().first().ok_or_else(|| {
             stale_claim("event-search generation disappeared while its required scope was recorded")
         })?;
-        let mut required_events = get_u64(row, &generation.columns, "required_event_count")?;
+        let mut required_events = get_u64(row, generation.columns(), "required_event_count")?;
         for key in required {
             let params = HashMap::from([
                 ("context_id".into(), Value::Uuid(context_id.as_uuid())),
@@ -2719,12 +2721,12 @@ fn persist_required_sessions(
                 "SELECT event_count, is_required FROM event_search_session_progress WHERE context_id = $context_id AND generation_id = $generation_id AND connector_id = $connector_id AND session_ref = $session",
                 &params,
             ).map_err(map_engine_err)?;
-            let progress_row = progress.rows.first().ok_or_else(|| {
+            let progress_row = progress.rows().first().ok_or_else(|| {
                 stale_claim("required event-search session is absent from the captured generation")
             })?;
-            if !get_bool(progress_row, &progress.columns, "is_required")? {
+            if !get_bool(progress_row, progress.columns(), "is_required")? {
                 required_events = required_events
-                    .checked_add(get_u64(progress_row, &progress.columns, "event_count")?)
+                    .checked_add(get_u64(progress_row, progress.columns(), "event_count")?)
                     .ok_or_else(|| CgError::Engine("required event count exhausted u64".into()))?;
                 store.internal_db().execute_in_tx(
                     tx,
@@ -2784,8 +2786,8 @@ fn generation_is_head(
         "SELECT generation_id FROM event_search_heads WHERE context_id = $context_id",
         &HashMap::from([("context_id".into(), Value::Uuid(context_id.as_uuid()))]),
     )?;
-    Ok(head.rows.first().is_some_and(|row| {
-        get_uuid(row, &head.columns, "generation_id").ok() == Some(generation_id.as_uuid())
+    Ok(head.rows().first().is_some_and(|row| {
+        get_uuid(row, head.columns(), "generation_id").ok() == Some(generation_id.as_uuid())
     }))
 }
 
@@ -2892,7 +2894,7 @@ pub(crate) fn persist_work_policy(
                 &params,
             )
             .map_err(map_engine_err)?;
-        let sql = if existing.rows.is_empty() {
+        let sql = if existing.rows().is_empty() {
             "INSERT INTO event_search_work_policies (context_id, search_order, search_sessions) VALUES ($context_id, $search_order, $search_sessions)"
         } else {
             "UPDATE event_search_work_policies SET search_order = $search_order, search_sessions = $search_sessions WHERE context_id = $context_id"
@@ -2919,8 +2921,8 @@ pub(crate) fn live_projection_lease(
         "SELECT expires_at FROM event_search_leases WHERE context_id = $context_id",
         &HashMap::from([("context_id".into(), Value::Uuid(context_id.as_uuid()))]),
     )?;
-    for row in &leases.rows {
-        if get_timestamp(row, &leases.columns, "expires_at")? > now_ms {
+    for row in leases.rows() {
+        if get_timestamp(row, leases.columns(), "expires_at")? > now_ms {
             return Ok(true);
         }
     }
@@ -2940,10 +2942,10 @@ pub(crate) fn committed_generation_coverage(
         ]),
     )?;
     let row = answer
-        .rows
+        .rows()
         .first()
         .ok_or_else(|| CgError::Engine("event-search coverage count returned no row".into()))?;
-    get_u64(row, &answer.columns, "n")
+    get_u64(row, answer.columns(), "n")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3056,14 +3058,14 @@ fn ensure_event_context_revision(store: &Store, context_id: crate::ContextId) ->
                 return Err(map_engine_err(error));
             }
         };
-        if let Some(row) = existing.rows.first() {
-            if existing.rows.len() != 1 {
+        if let Some(row) = existing.rows().first() {
+            if existing.rows().len() != 1 {
                 let _ = store.internal_db().rollback(tx);
                 return Err(CgError::Engine(
                     "the event Context revision primary key returned more than one row".into(),
                 ));
             }
-            if let Err(error) = get_txid(row, &existing.columns, "revision_tx") {
+            if let Err(error) = get_txid(row, existing.columns(), "revision_tx") {
                 let _ = store.internal_db().rollback(tx);
                 return Err(error);
             }
@@ -3225,12 +3227,12 @@ fn finalize_capture_attempt(
             )
             .map_err(map_engine_err)?;
         let row = generation
-            .rows
+            .rows()
             .first()
             .ok_or_else(|| stale_claim("event-search capture attempt disappeared"))?;
-        if generation.rows.len() != 1
-            || get_u64(row, &generation.columns, "capture_ordinal")? != snapshot.event_count
-            || get_text(row, &generation.columns, "state")? != "capturing"
+        if generation.rows().len() != 1
+            || get_u64(row, generation.columns(), "capture_ordinal")? != snapshot.event_count
+            || get_text(row, generation.columns(), "state")? != "capturing"
         {
             return Err(stale_claim(
                 "event-search capture membership did not seal exactly",
@@ -3348,46 +3350,46 @@ fn current_ready_head(
         "SELECT generation_id FROM event_search_heads WHERE context_id = $context_id",
         &HashMap::from([("context_id".into(), Value::Uuid(context_id.as_uuid()))]),
     )?;
-    let Some(head_row) = head.rows.first() else {
+    let Some(head_row) = head.rows().first() else {
         return Ok(None);
     };
-    if head.rows.len() != 1 {
+    if head.rows().len() != 1 {
         return Err(stale_claim("event-search current head is not unique"));
     }
-    let id = EventSearchGenerationId::from(get_uuid(head_row, &head.columns, "generation_id")?);
+    let id = EventSearchGenerationId::from(get_uuid(head_row, head.columns(), "generation_id")?);
     let result = store.query_rows(
         "SELECT context_id, interpretation_snapshot, interpretation_snapshot_sha256, event_count, ordered_source_set_sha256, source_content_sha256, capture_ordinal, renderer_id, renderer_version, renderer_profile, embedding_space_id, encoding_profile, state, started_at FROM event_search_generations WHERE id = $id",
         &HashMap::from([("id".into(), Value::Uuid(id.as_uuid()))]),
     )?;
-    let Some(row) = result.rows.first() else {
+    let Some(row) = result.rows().first() else {
         return Err(stale_claim(
             "event-search current head generation disappeared",
         ));
     };
-    if result.rows.len() != 1 {
+    if result.rows().len() != 1 {
         return Err(stale_claim(
             "event-search current head generation is not unique",
         ));
     }
-    let persisted_snapshot = get_json(row, &result.columns, "interpretation_snapshot")?;
-    let event_count = get_u64(row, &result.columns, "event_count")?;
-    let ordered_source_set_sha256 = get_text(row, &result.columns, "ordered_source_set_sha256")?;
-    let source_content_sha256 = get_text(row, &result.columns, "source_content_sha256")?;
-    if get_uuid(row, &result.columns, "context_id")? != context_id.as_uuid()
-        || get_text(row, &result.columns, "state")? != "ready"
-        || get_text(row, &result.columns, "interpretation_snapshot_sha256")? != snapshot_sha256
+    let persisted_snapshot = get_json(row, result.columns(), "interpretation_snapshot")?;
+    let event_count = get_u64(row, result.columns(), "event_count")?;
+    let ordered_source_set_sha256 = get_text(row, result.columns(), "ordered_source_set_sha256")?;
+    let source_content_sha256 = get_text(row, result.columns(), "source_content_sha256")?;
+    if get_uuid(row, result.columns(), "context_id")? != context_id.as_uuid()
+        || get_text(row, result.columns(), "state")? != "ready"
+        || get_text(row, result.columns(), "interpretation_snapshot_sha256")? != snapshot_sha256
         || persisted_snapshot != *snapshot
         || hash_json(&persisted_snapshot) != snapshot_sha256
-        || get_text(row, &result.columns, "renderer_id")? != EVENT_SEARCH_RENDERER_ID
-        || get_text(row, &result.columns, "renderer_version")? != EVENT_SEARCH_RENDERER_VERSION
-        || get_json(row, &result.columns, "renderer_profile")?
+        || get_text(row, result.columns(), "renderer_id")? != EVENT_SEARCH_RENDERER_ID
+        || get_text(row, result.columns(), "renderer_version")? != EVENT_SEARCH_RENDERER_VERSION
+        || get_json(row, result.columns(), "renderer_profile")?
             != serde_json::to_value(&spec.profile).map_err(json_error)?
-        || get_text(row, &result.columns, "embedding_space_id")? != spec.embedding_space_id
-        || get_text(row, &result.columns, "encoding_profile")? != spec.encoding_profile_id.clone()
+        || get_text(row, result.columns(), "embedding_space_id")? != spec.embedding_space_id
+        || get_text(row, result.columns(), "encoding_profile")? != spec.encoding_profile_id.clone()
     {
         return Ok(None);
     }
-    if get_u64(row, &result.columns, "capture_ordinal")? < event_count {
+    if get_u64(row, result.columns(), "capture_ordinal")? < event_count {
         return Err(stale_claim(
             "event-search ready head capture ordinal trails its searchable watermark",
         ));
@@ -3406,7 +3408,7 @@ fn current_ready_head(
                 ordered_source_set_sha256,
                 source_content_sha256,
             },
-            started_at: get_txid(row, &result.columns, "started_at")?,
+            started_at: get_txid(row, result.columns(), "started_at")?,
             attempt_tx: None,
             attempt_token: None,
             pending_dual_head_activation: false,
@@ -3457,25 +3459,25 @@ fn incomplete_generation(
             ("retired".into(), Value::Text("retired".into())),
         ]),
     )?;
-    let Some(row) = result.rows.first() else {
+    let Some(row) = result.rows().first() else {
         return Ok(None);
     };
-    let state = get_text(row, &result.columns, "state")?;
+    let state = get_text(row, result.columns(), "state")?;
     if state != "capturing" && state != "building" {
         return Ok(None);
     }
-    let persisted_snapshot = get_json(row, &result.columns, "interpretation_snapshot")?;
+    let persisted_snapshot = get_json(row, result.columns(), "interpretation_snapshot")?;
     if persisted_snapshot != *snapshot || hash_json(&persisted_snapshot) != snapshot_sha256 {
         return Err(stale_claim(
             "incomplete event-search generation snapshot changed under its identity",
         ));
     }
-    let event_count = get_u64(row, &result.columns, "event_count")?;
-    let ordered_source_set_sha256 = get_text(row, &result.columns, "ordered_source_set_sha256")?;
-    let source_content_sha256 = get_text(row, &result.columns, "source_content_sha256")?;
+    let event_count = get_u64(row, result.columns(), "event_count")?;
+    let ordered_source_set_sha256 = get_text(row, result.columns(), "ordered_source_set_sha256")?;
+    let source_content_sha256 = get_text(row, result.columns(), "source_content_sha256")?;
     Ok(Some((
         Generation {
-            id: EventSearchGenerationId::from(get_uuid(row, &result.columns, "id")?),
+            id: EventSearchGenerationId::from(get_uuid(row, result.columns(), "id")?),
             context_id,
             bindings: bindings_from_snapshot(&persisted_snapshot)?,
             snapshot_sha256: snapshot_sha256.into(),
@@ -3487,7 +3489,7 @@ fn incomplete_generation(
                 ordered_source_set_sha256,
                 source_content_sha256,
             },
-            started_at: get_txid(row, &result.columns, "started_at")?,
+            started_at: get_txid(row, result.columns(), "started_at")?,
             attempt_tx: None,
             attempt_token: None,
             pending_dual_head_activation: false,
@@ -3507,9 +3509,9 @@ fn event_connectors(
         &HashMap::from([("context_id".into(), Value::Uuid(context_id.as_uuid()))]),
     )?;
     answer
-        .rows
+        .rows()
         .iter()
-        .map(|row| get_text(row, &answer.columns, "connector_id"))
+        .map(|row| get_text(row, answer.columns(), "connector_id"))
         .collect()
 }
 
@@ -3546,17 +3548,17 @@ fn explicit_staged_connector(
             ("id".into(), Value::Uuid(id.as_uuid())),
         ]),
     )?;
-    let row = result.rows.first().ok_or(CgError::NotFound {
+    let row = result.rows().first().ok_or(CgError::NotFound {
         id: Some(id.to_string()),
         missing: Some("interpretation generation"),
     })?;
-    if result.rows.len() != 1 {
+    if result.rows().len() != 1 {
         return Err(CgError::Engine(
             "explicit interpretation generation lookup was not unique".into(),
         ));
     }
-    validate_ready_interpretation_row(row, &result.columns, id)?;
-    get_text(row, &result.columns, "connector_id")
+    validate_ready_interpretation_row(row, result.columns(), id)?;
+    get_text(row, result.columns(), "connector_id")
 }
 
 fn resolve_search_binding(
@@ -3571,15 +3573,15 @@ fn resolve_search_binding(
             ("connector_id".into(), Value::Text(connector.into())),
         ]),
     )?;
-    let Some(row) = head.rows.first() else {
+    let Some(row) = head.rows().first() else {
         return Ok(InterpretationProvenance::CapturedBase);
     };
-    if head.rows.len() != 1 {
+    if head.rows().len() != 1 {
         return Err(CgError::Engine(
             "active interpretation head lookup was not unique".into(),
         ));
     }
-    let id = InterpretationGenerationId::from(get_uuid(row, &head.columns, "generation_id")?);
+    let id = InterpretationGenerationId::from(get_uuid(row, head.columns(), "generation_id")?);
     validate_ready_interpretation(store, context_id, connector, id)?;
     Ok(InterpretationProvenance::Active(id))
 }
@@ -3598,16 +3600,16 @@ fn validate_ready_interpretation(
             ("id".into(), Value::Uuid(id.as_uuid())),
         ]),
     )?;
-    let row = result.rows.first().ok_or(CgError::NotFound {
+    let row = result.rows().first().ok_or(CgError::NotFound {
         id: Some(id.to_string()),
         missing: Some("ready interpretation generation"),
     })?;
-    if result.rows.len() != 1 {
+    if result.rows().len() != 1 {
         return Err(CgError::Engine(
             "selected interpretation generation lookup was not unique".into(),
         ));
     }
-    validate_ready_interpretation_row(row, &result.columns, id)
+    validate_ready_interpretation_row(row, result.columns(), id)
 }
 
 fn validate_ready_interpretation_row(
@@ -3742,21 +3744,23 @@ fn capture_source_membership(
                     hook();
                 }
             });
-            let Some(last) = page.rows.last() else { break };
+            let Some(last) = page.rows().last() else {
+                break;
+            };
             after = Some((
-                get_text(last, &page.columns, "connector_id")?,
-                get_text(last, &page.columns, "source_instance_ref")?,
-                get_u64(last, &page.columns, "seq")?,
+                get_text(last, page.columns(), "connector_id")?,
+                get_text(last, page.columns(), "source_instance_ref")?,
+                get_u64(last, page.columns(), "seq")?,
             ));
-            let page_len = page.rows.len();
+            let page_len = page.rows().len();
             capture_search_page(
                 store,
                 context_id,
                 bindings,
                 generation_id,
                 bounds,
-                &page.columns,
-                &page.rows,
+                page.columns(),
+                page.rows(),
                 &mut count,
                 &mut next_ordinal,
                 &mut ordered,
@@ -3884,24 +3888,24 @@ fn reuse_or_persist_search_membership(
             ("event_id".into(), Value::Uuid(member.event.id.as_uuid())),
         ]),
     )?;
-    if let Some(row) = result.rows.first() {
-        if result.rows.len() != 1
-            || get_uuid(row, &result.columns, "context_id")? != context_id.as_uuid()
-            || get_uuid(row, &result.columns, "generation_id")? != generation_id.as_uuid()
-            || get_uuid(row, &result.columns, "event_id")? != member.event.id.as_uuid()
-            || get_text(row, &result.columns, "connector_id")? != member.event.connector_id
-            || get_text(row, &result.columns, "source_instance_ref")?
+    if let Some(row) = result.rows().first() {
+        if result.rows().len() != 1
+            || get_uuid(row, result.columns(), "context_id")? != context_id.as_uuid()
+            || get_uuid(row, result.columns(), "generation_id")? != generation_id.as_uuid()
+            || get_uuid(row, result.columns(), "event_id")? != member.event.id.as_uuid()
+            || get_text(row, result.columns(), "connector_id")? != member.event.connector_id
+            || get_text(row, result.columns(), "source_instance_ref")?
                 != member.event.source_instance_ref
-            || get_text(row, &result.columns, "session_ref")? != member.event.session_ref
-            || get_u64(row, &result.columns, "source_sequence")? != member.event.seq
+            || get_text(row, result.columns(), "session_ref")? != member.event.session_ref
+            || get_u64(row, result.columns(), "source_sequence")? != member.event.seq
             || get_optional_interpretation_id(
                 row,
-                &result.columns,
+                result.columns(),
                 "effective_interpretation_generation_id",
             )? != member.effective_interpretation_generation_id
-            || get_text(row, &result.columns, "captured_source_sha256")?
+            || get_text(row, result.columns(), "captured_source_sha256")?
                 != member.captured_source_sha256
-            || get_text(row, &result.columns, "effective_source_sha256")?
+            || get_text(row, result.columns(), "effective_source_sha256")?
                 != member.effective_source_sha256
         {
             return Err(stale_claim(
@@ -3909,8 +3913,8 @@ fn reuse_or_persist_search_membership(
             ));
         }
         let mut retained = member.clone();
-        retained.membership_id = get_uuid(row, &result.columns, "membership_id")?;
-        retained.ordinal = get_u64(row, &result.columns, "ordinal")?;
+        retained.membership_id = get_uuid(row, result.columns(), "membership_id")?;
+        retained.ordinal = get_u64(row, result.columns(), "ordinal")?;
         return Ok(retained);
     }
     persist_search_membership(store, context_id, generation_id, member)?;
@@ -3933,17 +3937,17 @@ fn generation_capture_high_water(
         ]),
     )?;
     let row = result
-        .rows
+        .rows()
         .first()
         .ok_or_else(|| stale_claim("event-search capture generation disappeared"))?;
-    if result.rows.len() != 1
-        || get_uuid(row, &result.columns, "context_id")? != context_id.as_uuid()
+    if result.rows().len() != 1
+        || get_uuid(row, result.columns(), "context_id")? != context_id.as_uuid()
     {
         return Err(stale_claim(
             "event-search capture generation lookup was not unique",
         ));
     }
-    get_u64(row, &result.columns, "capture_ordinal")
+    get_u64(row, result.columns(), "capture_ordinal")
 }
 
 fn fold_source_membership(
@@ -4042,12 +4046,12 @@ fn captured_raw_from_row(
     let mut used = 0_usize;
     let read = (|| -> Result<()> {
         let first = cursor.first_page();
-        anchor_columns = first.columns.clone();
-        let mut has_more = first.has_more;
+        anchor_columns = first.columns().to_vec();
+        let mut has_more = first.has_more();
         append_captured_anchor_rows(
             bounds,
-            &first.columns,
-            &first.rows,
+            first.columns(),
+            first.rows(),
             &mut used,
             &mut anchor_rows,
         )?;
@@ -4055,11 +4059,11 @@ fn captured_raw_from_row(
             let page = cursor
                 .fetch(NonZeroUsize::new(bounds.events.max(1)))
                 .map_err(map_engine_err)?;
-            has_more = page.has_more;
+            has_more = page.has_more();
             append_captured_anchor_rows(
                 bounds,
-                &page.columns,
-                &page.rows,
+                page.columns(),
+                page.rows(),
                 &mut used,
                 &mut anchor_rows,
             )?;
@@ -4131,12 +4135,12 @@ fn effective_captured_event(
             &params,
         )
         .map_err(map_engine_err)?;
-    let Some(member) = membership.rows.first() else {
+    let Some(member) = membership.rows().first() else {
         let hash = effective_source_hash(&event, None, None);
         return Ok((event, None, hash));
     };
-    if membership.rows.len() != 1
-        || get_text(member, &membership.columns, "source_row_sha256")? != captured_sha256
+    if membership.rows().len() != 1
+        || get_text(member, membership.columns(), "source_row_sha256")? != captured_sha256
     {
         return Err(stale_claim(
             "selected interpretation membership does not match the captured raw event",
@@ -4149,18 +4153,18 @@ fn effective_captured_event(
         )
         .map_err(map_engine_err)?;
     let row = effective
-        .rows
+        .rows()
         .first()
         .ok_or_else(|| stale_claim("selected interpretation member has no effective value"))?;
-    if effective.rows.len() != 1
-        || get_text(row, &effective.columns, "captured_content_sha256")? != event.content_hash
+    if effective.rows().len() != 1
+        || get_text(row, effective.columns(), "captured_content_sha256")? != event.content_hash
     {
         return Err(stale_claim(
             "selected interpretation value does not match captured event content",
         ));
     }
-    let effective_row_sha256 = get_text(row, &effective.columns, "effective_sha256")?;
-    apply_effective_row(&mut event, &effective.columns, row)?;
+    let effective_row_sha256 = get_text(row, effective.columns(), "effective_sha256")?;
+    apply_effective_row(&mut event, effective.columns(), row)?;
     let hash = effective_source_hash(&event, Some(selected_id), Some(&effective_row_sha256));
     Ok((event, Some(selected_id), hash))
 }
@@ -4198,12 +4202,12 @@ fn persist_search_membership(
             )
             .map_err(map_engine_err)?;
         let row = generation
-            .rows
+            .rows()
             .first()
             .ok_or_else(|| stale_claim("event-search capture attempt disappeared"))?;
-        let state = get_text(row, &generation.columns, "state")?;
-        if generation.rows.len() != 1
-            || get_u64(row, &generation.columns, "capture_ordinal")? != member.ordinal
+        let state = get_text(row, generation.columns(), "state")?;
+        if generation.rows().len() != 1
+            || get_u64(row, generation.columns(), "capture_ordinal")? != member.ordinal
             || (state != "capturing" && state != "building" && state != "ready")
         {
             return Err(stale_claim(
@@ -4219,8 +4223,8 @@ fn persist_search_membership(
                     &HashMap::from([("context_id".into(), Value::Uuid(context_id.as_uuid()))]),
                 )
                 .map_err(map_engine_err)?;
-            if head.rows.len() != 1
-                || get_uuid(&head.rows[0], &head.columns, "generation_id")?
+            if head.rows().len() != 1
+                || get_uuid(&head.rows()[0], head.columns(), "generation_id")?
                     != generation_id.as_uuid()
             {
                 return Err(stale_claim(
@@ -4230,7 +4234,7 @@ fn persist_search_membership(
         }
         let generation_guard = exact_conditions(
             row,
-            &generation.columns,
+            generation.columns(),
             &["context_id", "capture_ordinal", "state"],
         )?;
         if !store
@@ -4349,13 +4353,13 @@ fn update_generation_session_capture_in_tx(
             &params,
         )
         .map_err(map_engine_err)?;
-    if let Some(row) = existing.rows.first() {
-        if existing.rows.len() != 1 {
+    if let Some(row) = existing.rows().first() {
+        if existing.rows().len() != 1 {
             return Err(stale_claim(
                 "event-search session progress primary key returned more than one row",
             ));
         }
-        let next = get_u64(row, &existing.columns, "event_count")?
+        let next = get_u64(row, existing.columns(), "event_count")?
             .checked_add(1)
             .ok_or_else(|| CgError::Engine("event-search session count exhausted u64".into()))?;
         let mut values = params.clone();
@@ -4368,16 +4372,16 @@ fn update_generation_session_capture_in_tx(
                 &values,
             )
             .map_err(map_engine_err)?;
-        if get_bool(row, &existing.columns, "is_required")? {
+        if get_bool(row, existing.columns(), "is_required")? {
             let generation = store.internal_db().execute_in_tx(
                 tx,
                 "SELECT required_event_count FROM event_search_generations WHERE context_id = $context_id AND id = $generation_id",
                 &params,
             ).map_err(map_engine_err)?;
-            let generation_row = generation.rows.first().ok_or_else(|| {
+            let generation_row = generation.rows().first().ok_or_else(|| {
                 stale_claim("event-search generation disappeared while required capture grew")
             })?;
-            let required = get_u64(generation_row, &generation.columns, "required_event_count")?
+            let required = get_u64(generation_row, generation.columns(), "required_event_count")?
                 .checked_add(1)
                 .ok_or_else(|| CgError::Engine("required event count exhausted u64".into()))?;
             let mut values = params.clone();
@@ -4434,7 +4438,7 @@ fn ensure_generation_cursor_in_tx(
             &params,
         )
         .map_err(map_engine_err)?;
-    if !existing.rows.is_empty() {
+    if !existing.rows().is_empty() {
         return Ok(());
     }
     let mut values = params;
@@ -4523,11 +4527,11 @@ fn claim_pending_batch(
     )?;
     let mut events = Vec::new();
     let mut used = 0_usize;
-    for row in &result.rows {
-        let member_connector = get_text(row, &result.columns, "connector_id")?;
-        let member_source = get_text(row, &result.columns, "source_instance_ref")?;
-        let member_session = get_text(row, &result.columns, "session_ref")?;
-        let member_sequence = get_u64(row, &result.columns, "source_sequence")?;
+    for row in result.rows() {
+        let member_connector = get_text(row, result.columns(), "connector_id")?;
+        let member_source = get_text(row, result.columns(), "source_instance_ref")?;
+        let member_session = get_text(row, result.columns(), "session_ref")?;
+        let member_sequence = get_u64(row, result.columns(), "source_sequence")?;
         if member_connector != connector || member_source != source {
             return Err(stale_claim(
                 "event-search source claim crossed its selected stream",
@@ -4539,7 +4543,7 @@ fn claim_pending_batch(
         {
             break;
         }
-        let event = load_claimed_member(store, generation, &result.columns, row, bounds)?;
+        let event = load_claimed_member(store, generation, result.columns(), row, bounds)?;
         let measured = event_body(&event.event)
             .map(|body| event_prefix(&event.event).len().saturating_add(body.len()))
             .unwrap_or(0);
@@ -4637,15 +4641,15 @@ fn claim_pending_batch(
             ("generation_id".into(), Value::Uuid(generation.id.as_uuid())),
         ]),
     ).map_err(map_engine_err)?;
-    let lease_epoch = if let Some(row) = existing.rows.first() {
-        let persisted_expiry = get_timestamp(row, &existing.columns, "expires_at")?;
+    let lease_epoch = if let Some(row) = existing.rows().first() {
+        let persisted_expiry = get_timestamp(row, existing.columns(), "expires_at")?;
         if persisted_expiry > now {
             let _ = store.internal_db().rollback(tx);
             return Err(stale_claim(
                 "another event-search worker owns the unexpired claim",
             ));
         }
-        let epoch = get_i64(row, &existing.columns, "lease_epoch")?
+        let epoch = get_i64(row, existing.columns(), "lease_epoch")?
             .checked_add(1)
             .ok_or_else(|| CgError::Engine("event-search lease epoch exhausted INTEGER".into()))?;
         store.internal_db().execute_in_tx(
@@ -4692,7 +4696,7 @@ fn claim_pending_batch(
             ]),
         ).map_err(map_engine_err);
         match associated {
-            Ok(updated) if updated.rows_affected == 1 => {}
+            Ok(updated) if updated.rows_affected() == 1 => {}
             Ok(_) => {
                 let _ = store.internal_db().rollback(tx);
                 return Err(stale_claim(
@@ -4777,24 +4781,24 @@ fn guard_generation_for_claim_in_tx(
         )
         .map_err(map_engine_err)?;
     let row = result
-        .rows
+        .rows()
         .first()
         .ok_or_else(|| stale_claim("event-search generation disappeared before claim"))?;
-    if result.rows.len() != 1
-        || get_uuid(row, &result.columns, "context_id")? != generation.context_id.as_uuid()
-        || get_u64(row, &result.columns, "event_count")? != generation.event_count
-        || get_text(row, &result.columns, "ordered_source_set_sha256")?
+    if result.rows().len() != 1
+        || get_uuid(row, result.columns(), "context_id")? != generation.context_id.as_uuid()
+        || get_u64(row, result.columns(), "event_count")? != generation.event_count
+        || get_text(row, result.columns(), "ordered_source_set_sha256")?
             != generation.ordered_source_set_sha256
-        || get_text(row, &result.columns, "source_content_sha256")?
+        || get_text(row, result.columns(), "source_content_sha256")?
             != generation.source_content_sha256
-        || get_u64(row, &result.columns, "capture_ordinal")? != generation.target.event_count
-        || get_text(row, &result.columns, "state")? != generation.expected_state()
+        || get_u64(row, result.columns(), "capture_ordinal")? != generation.target.event_count
+        || get_text(row, result.columns(), "state")? != generation.expected_state()
     {
         return Err(stale_claim("event-search generation changed before claim"));
     }
     let conditions = exact_conditions(
         row,
-        &result.columns,
+        result.columns(),
         &[
             "context_id",
             "event_count",
@@ -4829,8 +4833,9 @@ fn guard_generation_for_claim_in_tx(
                 )]),
             )
             .map_err(map_engine_err)?;
-        if head.rows.len() != 1
-            || get_uuid(&head.rows[0], &head.columns, "generation_id")? != generation.id.as_uuid()
+        if head.rows().len() != 1
+            || get_uuid(&head.rows()[0], head.columns(), "generation_id")?
+                != generation.id.as_uuid()
         {
             return Err(stale_claim(
                 "event-search ready generation stopped being the current head before claim",
@@ -4868,12 +4873,12 @@ fn load_claimed_member(
         )
         .map_err(map_engine_err)?;
     #[cfg(feature = "test-support")]
-    LOADED_EVENT_ROWS.with(|rows| rows.set(rows.get() + result.rows.len()));
+    LOADED_EVENT_ROWS.with(|rows| rows.set(rows.get() + result.rows().len()));
     let event_row = result
-        .rows
+        .rows()
         .first()
         .ok_or_else(|| stale_claim("sealed event-search source event disappeared"))?;
-    if result.rows.len() != 1 {
+    if result.rows().len() != 1 {
         return Err(stale_claim(
             "sealed event-search source event lookup was not unique",
         ));
@@ -4882,7 +4887,7 @@ fn load_claimed_member(
         &session,
         bounds,
         generation.context_id,
-        &result.columns,
+        result.columns(),
         event_row,
     )?;
     let captured_sha256 = captured_source_sha256(
@@ -4992,14 +4997,14 @@ fn first_pending_stream(
                     ),
                 ]),
             )?;
-            if let Some(candidate) = first.rows.first() {
+            if let Some(candidate) = first.rows().first() {
                 let candidate = PendingStream {
                     publication_event_count: sessions
                         .frontiers
                         .as_ref()
                         .and_then(|_| sessions.events.get(&key).copied()),
                     through_sequence,
-                    start_ordinal: get_u64(candidate, &first.columns, "ordinal")?,
+                    start_ordinal: get_u64(candidate, first.columns(), "ordinal")?,
                     connector_id: connector,
                     source_instance_ref: source,
                     session_ref: session,
@@ -5059,15 +5064,15 @@ fn reopenable_tail_start(
         ]),
     )?;
     let row = result
-        .rows
+        .rows()
         .first()
         .ok_or_else(|| stale_claim("event-search open tail member disappeared"))?;
-    if result.rows.len() != 1 {
+    if result.rows().len() != 1 {
         return Err(stale_claim(
             "event-search open tail member lookup was not unique",
         ));
     }
-    if get_text(row, &result.columns, "session_ref")? == session {
+    if get_text(row, result.columns(), "session_ref")? == session {
         Ok(Some(start))
     } else {
         Ok(None)
@@ -5114,12 +5119,12 @@ fn load_open_tail(
                 ("member".into(), Value::Uuid(*member)),
             ]),
         )?;
-        let [row] = result.rows.as_slice() else {
+        let [row] = result.rows() else {
             return Err(stale_claim(
                 "event-search open tail member disappeared or is not unique",
             ));
         };
-        let event = load_claimed_member(store, generation, &result.columns, row, bounds)?;
+        let event = load_claimed_member(store, generation, result.columns(), row, bounds)?;
         if event.membership_id != *member
             || event.event.connector_id != connector
             || event.event.source_instance_ref != source
@@ -5230,7 +5235,7 @@ fn has_later_session_event(
             ("after".into(), integer(after, "claimed sequence")?),
         ]),
     )?;
-    Ok(!result.rows.is_empty())
+    Ok(!result.rows().is_empty())
 }
 
 fn generation_passage_count(
@@ -5245,9 +5250,9 @@ fn generation_passage_count(
         &HashMap::from([("id".into(), Value::Uuid(id.as_uuid()))]),
     )?;
     result
-        .rows
+        .rows()
         .first()
-        .map(|row| get_u64(row, &result.columns, "passage_count"))
+        .map(|row| get_u64(row, result.columns(), "passage_count"))
         .transpose()?
         .ok_or(CgError::NotFound {
             id: Some(id.to_string()),
@@ -6193,25 +6198,25 @@ fn commit_batch_in_tx(
         ]),
     ).map_err(map_engine_err)?;
     let row = lease
-        .rows
+        .rows()
         .first()
         .ok_or_else(|| stale_claim("event-search claim no longer exists"))?;
-    if lease.rows.len() != 1
-        || get_text(row, &lease.columns, "owner_token")? != claim.owner_token
-        || get_i64(row, &lease.columns, "lease_epoch")? != claim.lease_epoch
-        || get_text(row, &lease.columns, "claimed_connector_id")? != claim.connector_id
-        || get_text(row, &lease.columns, "claimed_source_instance_ref")?
+    if lease.rows().len() != 1
+        || get_text(row, lease.columns(), "owner_token")? != claim.owner_token
+        || get_i64(row, lease.columns(), "lease_epoch")? != claim.lease_epoch
+        || get_text(row, lease.columns(), "claimed_connector_id")? != claim.connector_id
+        || get_text(row, lease.columns(), "claimed_source_instance_ref")?
             != claim.source_instance_ref
-        || get_u64(row, &lease.columns, "claimed_start_sequence")? != claim.start_sequence
-        || get_u64(row, &lease.columns, "claimed_end_sequence")? != claim.end_sequence
-        || get_text(row, &lease.columns, "cursor_sha256")? != claim.cursor_sha256
-        || get_timestamp(row, &lease.columns, "expires_at")? != claim.expires_at
+        || get_u64(row, lease.columns(), "claimed_start_sequence")? != claim.start_sequence
+        || get_u64(row, lease.columns(), "claimed_end_sequence")? != claim.end_sequence
+        || get_text(row, lease.columns(), "cursor_sha256")? != claim.cursor_sha256
+        || get_timestamp(row, lease.columns(), "expires_at")? != claim.expires_at
     {
         return Err(stale_claim("event-search claim ownership or range changed"));
     }
     let guard_values = exact_conditions(
         row,
-        &lease.columns,
+        lease.columns(),
         &[
             "context_id",
             "owner_token",
@@ -6244,44 +6249,48 @@ fn commit_batch_in_tx(
         &HashMap::from([("id".into(), Value::Uuid(claim.generation.id.as_uuid()))]),
     ).map_err(map_engine_err)?;
     let generation_row = generation
-        .rows
+        .rows()
         .first()
         .ok_or_else(|| stale_claim("event-search generation disappeared"))?;
-    if get_uuid(generation_row, &generation.columns, "context_id")?
+    if get_uuid(generation_row, generation.columns(), "context_id")?
         != claim.generation.context_id.as_uuid()
         || get_text(
             generation_row,
-            &generation.columns,
+            generation.columns(),
             "interpretation_snapshot_sha256",
         )? != claim.generation.snapshot_sha256
-        || get_u64(generation_row, &generation.columns, "event_count")?
+        || get_u64(generation_row, generation.columns(), "event_count")?
             != claim.generation.event_count
         || get_text(
             generation_row,
-            &generation.columns,
+            generation.columns(),
             "ordered_source_set_sha256",
         )? != claim.generation.ordered_source_set_sha256
-        || get_text(generation_row, &generation.columns, "source_content_sha256")?
-            != claim.generation.source_content_sha256
-        || get_u64(generation_row, &generation.columns, "capture_ordinal")?
+        || get_text(
+            generation_row,
+            generation.columns(),
+            "source_content_sha256",
+        )? != claim.generation.source_content_sha256
+        || get_u64(generation_row, generation.columns(), "capture_ordinal")?
             != claim.generation.target.event_count
-        || get_text(generation_row, &generation.columns, "renderer_id")? != EVENT_SEARCH_RENDERER_ID
-        || get_text(generation_row, &generation.columns, "renderer_version")?
+        || get_text(generation_row, generation.columns(), "renderer_id")?
+            != EVENT_SEARCH_RENDERER_ID
+        || get_text(generation_row, generation.columns(), "renderer_version")?
             != EVENT_SEARCH_RENDERER_VERSION
-        || get_json(generation_row, &generation.columns, "renderer_profile")?
+        || get_json(generation_row, generation.columns(), "renderer_profile")?
             != serde_json::to_value(profile).map_err(json_error)?
-        || get_text(generation_row, &generation.columns, "embedding_space_id")?
+        || get_text(generation_row, generation.columns(), "embedding_space_id")?
             != registration.space.embedding_space_id
-        || get_text(generation_row, &generation.columns, "encoding_profile")?
+        || get_text(generation_row, generation.columns(), "encoding_profile")?
             != registration.embedder.encoding_profile_id()
-        || get_text(generation_row, &generation.columns, "state")?
+        || get_text(generation_row, generation.columns(), "state")?
             != claim.generation.expected_state()
     {
         return Err(stale_claim("event-search generation changed before commit"));
     }
     let generation_guard = exact_conditions(
         generation_row,
-        &generation.columns,
+        generation.columns(),
         &[
             "context_id",
             "interpretation_snapshot_sha256",
@@ -6330,8 +6339,8 @@ fn commit_batch_in_tx(
                 )]),
             )
             .map_err(map_engine_err)?;
-        if head.rows.len() != 1
-            || get_uuid(&head.rows[0], &head.columns, "generation_id")?
+        if head.rows().len() != 1
+            || get_uuid(&head.rows()[0], head.columns(), "generation_id")?
                 != claim.generation.id.as_uuid()
         {
             return Err(stale_claim(
@@ -6357,25 +6366,25 @@ fn commit_batch_in_tx(
             ("session".into(), Value::Text(claim.session_ref.clone())),
         ]),
     ).map_err(map_engine_err)?;
-    let progress_row = progress.rows.first().ok_or_else(|| {
+    let progress_row = progress.rows().first().ok_or_else(|| {
         stale_claim("event-search claimed session has no transactional progress row")
     })?;
-    if progress.rows.len() != 1 || !get_bool(progress_row, &progress.columns, "is_required")? {
+    if progress.rows().len() != 1 || !get_bool(progress_row, progress.columns(), "is_required")? {
         return Err(stale_claim(
             "event-search claimed session is no longer in the required scope",
         ));
     }
-    let session_event_count = get_u64(progress_row, &progress.columns, "event_count")?;
-    let prior_committed = get_u64(progress_row, &progress.columns, "committed_event_count")?;
-    let prior_eligible = get_u64(progress_row, &progress.columns, "eligible_event_count")?;
-    let prior_excluded = get_u64(progress_row, &progress.columns, "excluded_event_count")?;
-    let prior_searchable = get_u64(progress_row, &progress.columns, "searchable_event_count")?;
+    let session_event_count = get_u64(progress_row, progress.columns(), "event_count")?;
+    let prior_committed = get_u64(progress_row, progress.columns(), "committed_event_count")?;
+    let prior_eligible = get_u64(progress_row, progress.columns(), "eligible_event_count")?;
+    let prior_excluded = get_u64(progress_row, progress.columns(), "excluded_event_count")?;
+    let prior_searchable = get_u64(progress_row, progress.columns(), "searchable_event_count")?;
     let prior_no_text = get_u64(
         progress_row,
-        &progress.columns,
+        progress.columns(),
         "no_searchable_text_event_count",
     )?;
-    let session_was_published = get_bool(progress_row, &progress.columns, "is_published")?;
+    let session_was_published = get_bool(progress_row, progress.columns(), "is_published")?;
     let committed = prior_committed
         .checked_add(built.eligible_events)
         .and_then(|count| count.checked_add(built.excluded_events))
@@ -6568,27 +6577,27 @@ fn commit_batch_in_tx(
             )?;
         }
     }
-    let eligible = get_u64(generation_row, &generation.columns, "eligible_event_count")?
+    let eligible = get_u64(generation_row, generation.columns(), "eligible_event_count")?
         .checked_add(built.eligible_events)
         .ok_or_else(|| CgError::Engine("eligible event count exhausted u64".into()))?;
-    let excluded = get_u64(generation_row, &generation.columns, "excluded_event_count")?
+    let excluded = get_u64(generation_row, generation.columns(), "excluded_event_count")?
         .checked_add(built.excluded_events)
         .ok_or_else(|| CgError::Engine("excluded event count exhausted u64".into()))?;
     let searchable = get_u64(
         generation_row,
-        &generation.columns,
+        generation.columns(),
         "searchable_event_count",
     )?
     .checked_add(session_searchable.saturating_sub(prior_searchable))
     .ok_or_else(|| CgError::Engine("searchable event count exhausted u64".into()))?;
     let searchable_excluded = get_u64(
         generation_row,
-        &generation.columns,
+        generation.columns(),
         "searchable_excluded_event_count",
     )?
     .checked_add(session_no_text.saturating_sub(prior_no_text))
     .ok_or_else(|| CgError::Engine("searchable excluded count exhausted u64".into()))?;
-    let passage_count = get_u64(generation_row, &generation.columns, "passage_count")?
+    let passage_count = get_u64(generation_row, generation.columns(), "passage_count")?
         .checked_add(
             u64::try_from(built.passages.len())
                 .map_err(|_| CgError::Engine("passage count exceeds u64".into()))?,
@@ -6619,7 +6628,7 @@ fn commit_batch_in_tx(
             ("lease_epoch".into(), Value::Int64(claim.lease_epoch)),
         ]),
     ).map_err(map_engine_err)?;
-    if deleted.rows_affected != 1 {
+    if deleted.rows_affected() != 1 {
         return Err(stale_claim(
             "event-search owned claim disappeared before its committed lease deletion",
         ));
@@ -6661,32 +6670,34 @@ fn reload_claimed_events_in_tx(
             )
             .map_err(map_engine_err)?;
         let member_row = membership
-            .rows
+            .rows()
             .first()
             .ok_or_else(|| stale_claim("sealed event-search membership disappeared"))?;
-        if membership.rows.len() != 1
-            || get_uuid(member_row, &membership.columns, "membership_id")? != expected.membership_id
-            || get_uuid(member_row, &membership.columns, "context_id")?
+        if membership.rows().len() != 1
+            || get_uuid(member_row, membership.columns(), "membership_id")?
+                != expected.membership_id
+            || get_uuid(member_row, membership.columns(), "context_id")?
                 != claim.generation.context_id.as_uuid()
-            || get_uuid(member_row, &membership.columns, "generation_id")?
+            || get_uuid(member_row, membership.columns(), "generation_id")?
                 != claim.generation.id.as_uuid()
-            || get_u64(member_row, &membership.columns, "ordinal")? != expected.ordinal
-            || get_uuid(member_row, &membership.columns, "event_id")? != expected.event.id.as_uuid()
-            || get_text(member_row, &membership.columns, "connector_id")?
+            || get_u64(member_row, membership.columns(), "ordinal")? != expected.ordinal
+            || get_uuid(member_row, membership.columns(), "event_id")?
+                != expected.event.id.as_uuid()
+            || get_text(member_row, membership.columns(), "connector_id")?
                 != expected.event.connector_id
-            || get_text(member_row, &membership.columns, "source_instance_ref")?
+            || get_text(member_row, membership.columns(), "source_instance_ref")?
                 != expected.event.source_instance_ref
-            || get_text(member_row, &membership.columns, "session_ref")?
+            || get_text(member_row, membership.columns(), "session_ref")?
                 != expected.event.session_ref
-            || get_u64(member_row, &membership.columns, "source_sequence")? != expected.event.seq
+            || get_u64(member_row, membership.columns(), "source_sequence")? != expected.event.seq
             || get_optional_interpretation_id(
                 member_row,
-                &membership.columns,
+                membership.columns(),
                 "effective_interpretation_generation_id",
             )? != expected.effective_interpretation_generation_id
-            || get_text(member_row, &membership.columns, "captured_source_sha256")?
+            || get_text(member_row, membership.columns(), "captured_source_sha256")?
                 != expected.captured_source_sha256
-            || get_text(member_row, &membership.columns, "effective_source_sha256")?
+            || get_text(member_row, membership.columns(), "effective_source_sha256")?
                 != expected.effective_source_sha256
         {
             return Err(stale_claim(
@@ -6695,7 +6706,7 @@ fn reload_claimed_events_in_tx(
         }
         let member_guard = exact_conditions(
             member_row,
-            &membership.columns,
+            membership.columns(),
             &[
                 "context_id",
                 "generation_id",
@@ -6756,15 +6767,15 @@ fn reload_claimed_member_input_in_tx(
         )
         .map_err(map_engine_err)?;
     let event_row = event_result
-        .rows
+        .rows()
         .first()
         .ok_or_else(|| stale_claim("sealed event-search source event disappeared"))?;
-    if event_result.rows.len() != 1 {
+    if event_result.rows().len() != 1 {
         return Err(stale_claim(
             "sealed event-search source event lookup was not unique",
         ));
     }
-    let mut event = decode_event(&event_result.columns, event_row)?;
+    let mut event = decode_event(event_result.columns(), event_row)?;
     let anchor_limit = usize::try_from(expected.event.anchor_count)
         .unwrap_or(usize::MAX.saturating_sub(1))
         .saturating_add(1);
@@ -6785,7 +6796,7 @@ fn reload_claimed_member_input_in_tx(
         )
         .map_err(map_engine_err)?;
     let anchor_bytes = canonical_json_bytes(
-        &serde_json::to_value((&anchors.columns, &anchors.rows))
+        &serde_json::to_value((&anchors.columns(), &anchors.rows()))
             .expect("persisted anchor values always serialize"),
     )
     .len();
@@ -6795,10 +6806,10 @@ fn reload_claimed_member_input_in_tx(
         ));
     }
     let captured_sha256 = captured_source_sha256(
-        &event_result.columns,
+        event_result.columns(),
         event_row,
-        &anchors.columns,
-        &anchors.rows,
+        anchors.columns(),
+        anchors.rows(),
     );
     if captured_sha256 != expected.captured_source_sha256 {
         return Err(stale_claim(
@@ -6823,11 +6834,12 @@ fn reload_claimed_member_input_in_tx(
                 &params,
             )
             .map_err(map_engine_err)?;
-        let source_row = source_member.rows.first().ok_or_else(|| {
+        let source_row = source_member.rows().first().ok_or_else(|| {
             stale_claim("selected interpretation membership disappeared before commit")
         })?;
-        if source_member.rows.len() != 1
-            || get_text(source_row, &source_member.columns, "source_row_sha256")? != captured_sha256
+        if source_member.rows().len() != 1
+            || get_text(source_row, source_member.columns(), "source_row_sha256")?
+                != captured_sha256
         {
             return Err(stale_claim(
                 "selected interpretation membership changed before commit",
@@ -6841,12 +6853,15 @@ fn reload_claimed_member_input_in_tx(
                 &params,
             )
             .map_err(map_engine_err)?;
-        let effective_row = effective.rows.first().ok_or_else(|| {
+        let effective_row = effective.rows().first().ok_or_else(|| {
             stale_claim("selected interpretation value disappeared before commit")
         })?;
-        if effective.rows.len() != 1
-            || get_text(effective_row, &effective.columns, "captured_content_sha256")?
-                != event.content_hash
+        if effective.rows().len() != 1
+            || get_text(
+                effective_row,
+                effective.columns(),
+                "captured_content_sha256",
+            )? != event.content_hash
         {
             return Err(stale_claim(
                 "selected interpretation value changed before commit",
@@ -6854,10 +6869,10 @@ fn reload_claimed_member_input_in_tx(
         }
         effective_row_sha256 = Some(get_text(
             effective_row,
-            &effective.columns,
+            effective.columns(),
             "effective_sha256",
         )?);
-        apply_effective_row(&mut event, &effective.columns, effective_row)?;
+        apply_effective_row(&mut event, effective.columns(), effective_row)?;
     }
     let effective_sha256 = effective_source_hash(
         &event,
@@ -6946,14 +6961,14 @@ fn upsert_cursor_in_tx(
         "SELECT committed_sequence, open_tail_start_sequence, open_tail_members, open_tail_passage_id FROM event_search_cursors WHERE context_id = $context_id AND generation_id = $generation_id AND connector_id = $connector_id AND source_instance_ref = $source AND session_ref = $session",
         &params,
     ).map_err(map_engine_err)?;
-    let Some(row) = existing.rows.first() else {
+    let Some(row) = existing.rows().first() else {
         return Err(stale_claim("event-search cursor disappeared before commit"));
     };
-    if get_u64(row, &existing.columns, "committed_sequence")? != claim.prior_committed_sequence
-        || get_optional_u64(row, &existing.columns, "open_tail_start_sequence")?
+    if get_u64(row, existing.columns(), "committed_sequence")? != claim.prior_committed_sequence
+        || get_optional_u64(row, existing.columns(), "open_tail_start_sequence")?
             != claim.prior_open_tail_start_sequence
-        || decode_tail_members(row, &existing.columns)? != claim.prior_open_tail_members
-        || get_optional_uuid(row, &existing.columns, "open_tail_passage_id")?
+        || decode_tail_members(row, existing.columns())? != claim.prior_open_tail_members
+        || get_optional_uuid(row, existing.columns(), "open_tail_passage_id")?
             != claim.prior_open_tail_passage_id
     {
         return Err(stale_claim(
@@ -7050,32 +7065,32 @@ fn finish_stable(
         "SELECT context_id, interpretation_snapshot_sha256, event_count, ordered_source_set_sha256, source_content_sha256, capture_ordinal, renderer_id, renderer_version, renderer_profile, embedding_space_id, encoding_profile, state, required_event_count, searchable_event_count, searchable_excluded_event_count, eligible_event_count, rendered_event_count, embedded_event_count, excluded_event_count, failed_event_count, passage_count, completed_at FROM event_search_generations WHERE id = $id",
         &HashMap::from([("id".into(), Value::Uuid(generation.id.as_uuid()))]),
     ).map_err(map_engine_err)?;
-    let row = result.rows.first().ok_or(CgError::NotFound {
+    let row = result.rows().first().ok_or(CgError::NotFound {
         id: Some(generation.id.to_string()),
         missing: Some("event search generation"),
     })?;
-    let eligible = get_u64(row, &result.columns, "eligible_event_count")?;
-    let excluded = get_u64(row, &result.columns, "excluded_event_count")?;
-    let required = get_u64(row, &result.columns, "required_event_count")?;
-    let searchable = get_u64(row, &result.columns, "searchable_event_count")?;
-    let searchable_excluded = get_u64(row, &result.columns, "searchable_excluded_event_count")?;
-    let state = get_text(row, &result.columns, "state")?;
-    if get_uuid(row, &result.columns, "context_id")? != generation.context_id.as_uuid()
-        || get_text(row, &result.columns, "interpretation_snapshot_sha256")?
+    let eligible = get_u64(row, result.columns(), "eligible_event_count")?;
+    let excluded = get_u64(row, result.columns(), "excluded_event_count")?;
+    let required = get_u64(row, result.columns(), "required_event_count")?;
+    let searchable = get_u64(row, result.columns(), "searchable_event_count")?;
+    let searchable_excluded = get_u64(row, result.columns(), "searchable_excluded_event_count")?;
+    let state = get_text(row, result.columns(), "state")?;
+    if get_uuid(row, result.columns(), "context_id")? != generation.context_id.as_uuid()
+        || get_text(row, result.columns(), "interpretation_snapshot_sha256")?
             != generation.snapshot_sha256
-        || get_u64(row, &result.columns, "event_count")? != generation.event_count
-        || get_u64(row, &result.columns, "capture_ordinal")? != generation.target.event_count
-        || get_text(row, &result.columns, "ordered_source_set_sha256")?
+        || get_u64(row, result.columns(), "event_count")? != generation.event_count
+        || get_u64(row, result.columns(), "capture_ordinal")? != generation.target.event_count
+        || get_text(row, result.columns(), "ordered_source_set_sha256")?
             != generation.ordered_source_set_sha256
-        || get_text(row, &result.columns, "source_content_sha256")?
+        || get_text(row, result.columns(), "source_content_sha256")?
             != generation.source_content_sha256
-        || get_text(row, &result.columns, "renderer_id")? != EVENT_SEARCH_RENDERER_ID
-        || get_text(row, &result.columns, "renderer_version")? != EVENT_SEARCH_RENDERER_VERSION
-        || get_json(row, &result.columns, "renderer_profile")?
+        || get_text(row, result.columns(), "renderer_id")? != EVENT_SEARCH_RENDERER_ID
+        || get_text(row, result.columns(), "renderer_version")? != EVENT_SEARCH_RENDERER_VERSION
+        || get_json(row, result.columns(), "renderer_profile")?
             != serde_json::to_value(profile).map_err(json_error)?
-        || get_text(row, &result.columns, "embedding_space_id")?
+        || get_text(row, result.columns(), "embedding_space_id")?
             != registration.space.embedding_space_id
-        || get_text(row, &result.columns, "encoding_profile")?
+        || get_text(row, result.columns(), "encoding_profile")?
             != registration.embedder.encoding_profile_id()
         || state != generation.expected_state()
         || eligible.checked_add(excluded) != Some(required)
@@ -7088,7 +7103,7 @@ fn finish_stable(
     }
     let finish_guard = exact_conditions(
         row,
-        &result.columns,
+        result.columns(),
         &[
             "context_id",
             "interpretation_snapshot_sha256",
@@ -7154,11 +7169,11 @@ fn finish_stable(
         )
         .map_err(map_engine_err)?;
     let live_row = live_count
-        .rows
+        .rows()
         .first()
         .ok_or_else(|| stale_claim("event-search final source count returned no row"))?;
-    if live_count.rows.len() != 1
-        || get_u64(live_row, &live_count.columns, "event_count")? != generation.target.event_count
+    if live_count.rows().len() != 1
+        || get_u64(live_row, live_count.columns(), "event_count")? != generation.target.event_count
     {
         let _ = store.internal_db().rollback(tx);
         return Ok(None);
@@ -7176,7 +7191,7 @@ fn finish_stable(
         && generation.target.ordered_source_set_sha256 == generation.ordered_source_set_sha256
         && generation.target.source_content_sha256 == generation.source_content_sha256;
     if unchanged_ready {
-        get_optional_txid(row, &result.columns, "completed_at")?.ok_or_else(|| {
+        get_optional_txid(row, result.columns(), "completed_at")?.ok_or_else(|| {
             stale_claim("event-search ready generation has no completion transaction")
         })?;
     } else {
@@ -7210,7 +7225,7 @@ fn finish_stable(
             ("id".into(), Value::Uuid(generation.id.as_uuid())),
         ]),
     ).map_err(map_engine_err)?;
-    if finalized.rows_affected != 1 {
+    if finalized.rows_affected() != 1 {
         let _ = store.internal_db().rollback(tx);
         return Err(stale_claim(
             "event-search generation disappeared before recording its event revision",
@@ -7228,9 +7243,9 @@ fn finish_stable(
         // active head, even when the final call observes that same head already installed.
         true
     };
-    let rendered = get_u64(row, &result.columns, "rendered_event_count")?;
-    let embedded = get_u64(row, &result.columns, "embedded_event_count")?;
-    let failed = get_u64(row, &result.columns, "failed_event_count")?;
+    let rendered = get_u64(row, result.columns(), "rendered_event_count")?;
+    let embedded = get_u64(row, result.columns(), "embedded_event_count")?;
+    let failed = get_u64(row, result.columns(), "failed_event_count")?;
     #[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
     if let Some(hook) = BEFORE_COMPLETION_COMMIT.with(|slot| slot.borrow_mut().take()) {
         hook(store);
@@ -7303,17 +7318,17 @@ fn guard_event_context_revision_in_tx(
             &HashMap::from([("context_id".into(), Value::Uuid(context_id.as_uuid()))]),
         )
         .map_err(map_engine_err)?;
-    let Some(row) = result.rows.first() else {
+    let Some(row) = result.rows().first() else {
         return Err(stale_claim(
             "event Context revision disappeared before completion",
         ));
     };
-    if result.rows.len() != 1 {
+    if result.rows().len() != 1 {
         return Err(stale_claim(
             "event Context revision primary key returned more than one row",
         ));
     }
-    let revision = get_txid(row, &result.columns, "revision_tx")?;
+    let revision = get_txid(row, result.columns(), "revision_tx")?;
     let guarded = store
         .internal_db()
         .guard_row_conditions_in_tx(
@@ -7346,12 +7361,12 @@ fn activate_search_head_in_tx(
             &params,
         )
         .map_err(map_engine_err)?;
-    if existing.rows.first().is_some_and(|row| {
-        get_uuid(row, &existing.columns, "generation_id").ok() == Some(generation_id.as_uuid())
+    if existing.rows().first().is_some_and(|row| {
+        get_uuid(row, existing.columns(), "generation_id").ok() == Some(generation_id.as_uuid())
     }) {
         return Ok(false);
     }
-    let sql = if existing.rows.is_empty() {
+    let sql = if existing.rows().is_empty() {
         "INSERT INTO event_search_heads (context_id, generation_id, activated_at) VALUES ($context_id, $generation_id, $activated_at)"
     } else {
         "UPDATE event_search_heads SET generation_id = $generation_id, activated_at = $activated_at WHERE context_id = $context_id"
@@ -7380,9 +7395,9 @@ fn activate_search_head_for_published_session_in_tx(
             &HashMap::from([("context_id".into(), Value::Uuid(context_id.as_uuid()))]),
         )
         .map_err(map_engine_err)?;
-    if existing.rows.is_empty()
-        || existing.rows.first().is_some_and(|row| {
-            get_uuid(row, &existing.columns, "generation_id").ok() == Some(generation_id.as_uuid())
+    if existing.rows().is_empty()
+        || existing.rows().first().is_some_and(|row| {
+            get_uuid(row, existing.columns(), "generation_id").ok() == Some(generation_id.as_uuid())
         })
     {
         activate_search_head_in_tx(store, tx, context_id, generation_id)?;
@@ -7429,8 +7444,8 @@ pub(super) fn check_staged_search_in_tx(
             &HashMap::from([("id".into(), Value::Uuid(search_generation_id.as_uuid()))]),
         )
         .map_err(map_engine_err)?;
-    let row = match result.rows.as_slice() {
-        [row] if get_uuid(row, &result.columns, "context_id")? == context_id.as_uuid() => row,
+    let row = match result.rows() {
+        [row] if get_uuid(row, result.columns(), "context_id")? == context_id.as_uuid() => row,
         _ => {
             return Err(CgError::NotFound {
                 id: Some(search_generation_id.to_string()),
@@ -7438,7 +7453,7 @@ pub(super) fn check_staged_search_in_tx(
             });
         }
     };
-    let columns = &result.columns;
+    let columns = &result.columns();
     let ready = get_text(row, columns, "state")? == "ready"
         && get_optional_txid(row, columns, "completed_at")?.is_some()
         && get_optional_text(row, columns, "sanitized_failure")?.is_none();
@@ -7500,9 +7515,9 @@ pub(super) fn check_staged_search_in_tx(
             )
             .map_err(map_engine_err)?;
         let current = head
-            .rows
+            .rows()
             .first()
-            .map(|row| get_uuid(row, &head.columns, "generation_id"))
+            .map(|row| get_uuid(row, head.columns(), "generation_id"))
             .transpose()?;
         let unchanged = match binding.provenance {
             InterpretationProvenance::CapturedBase => current.is_none(),
@@ -7537,11 +7552,11 @@ pub(super) fn check_staged_search_in_tx(
         )
         .map_err(map_engine_err)?;
     let live_revision = revision
-        .rows
+        .rows()
         .first()
-        .map(|row| get_txid(row, &revision.columns, "revision_tx"))
+        .map(|row| get_txid(row, revision.columns(), "revision_tx"))
         .transpose()?;
-    if revision.rows.len() != 1 || live_revision != Some(finalized_revision) {
+    if revision.rows().len() != 1 || live_revision != Some(finalized_revision) {
         return Ok(StagedSearchCheck::Refused(Refusal::SourceWatermarkMismatch));
     }
     let live_count = store
@@ -7552,8 +7567,8 @@ pub(super) fn check_staged_search_in_tx(
             &HashMap::from([("context_id".into(), Value::Uuid(context_id.as_uuid()))]),
         )
         .map_err(map_engine_err)?;
-    match live_count.rows.as_slice() {
-        [count] if get_u64(count, &live_count.columns, "event_count")? == event_count => {}
+    match live_count.rows() {
+        [count] if get_u64(count, live_count.columns(), "event_count")? == event_count => {}
         _ => return Ok(StagedSearchCheck::Refused(Refusal::SourceWatermarkMismatch)),
     }
 
@@ -7572,9 +7587,9 @@ pub(super) fn check_staged_search_in_tx(
         )
         .map_err(map_engine_err)?;
     let passage_count = passages
-        .rows
+        .rows()
         .first()
-        .map(|row| get_u64(row, &passages.columns, "passage_count"))
+        .map(|row| get_u64(row, passages.columns(), "passage_count"))
         .transpose()?
         .ok_or_else(|| stale_claim("event-search passage count returned no row"))?;
 
@@ -7587,12 +7602,12 @@ pub(super) fn check_staged_search_in_tx(
         )
         .map_err(map_engine_err)?;
     let previous_head = head
-        .rows
+        .rows()
         .first()
         .map(|row| {
             Ok::<_, CgError>((
-                EventSearchGenerationId::from(get_uuid(row, &head.columns, "generation_id")?),
-                get_txid(row, &head.columns, "activated_at")?,
+                EventSearchGenerationId::from(get_uuid(row, head.columns(), "generation_id")?),
+                get_txid(row, head.columns(), "activated_at")?,
             ))
         })
         .transpose()?;
@@ -7700,7 +7715,7 @@ pub(super) fn activate_staged_search_in_tx(
                 ]),
             )
             .map_err(map_engine_err)?;
-        if promoted.rows_affected != 1 {
+        if promoted.rows_affected() != 1 {
             return Err(stale_claim(
                 "activated event-search generation disappeared before its snapshot was promoted",
             ));
@@ -7721,7 +7736,7 @@ pub(super) fn activate_staged_search_in_tx(
                 ]),
             )
             .map_err(map_engine_err)?;
-        if restamped.rows_affected != 1 {
+        if restamped.rows_affected() != 1 {
             return Err(stale_claim(
                 "event-search head disappeared before activation restamped it",
             ));
@@ -7747,8 +7762,9 @@ fn guard_final_interpretations_in_tx(
                 )]),
             )
             .map_err(map_engine_err)?;
-        if head.rows.len() != 1
-            || get_uuid(&head.rows[0], &head.columns, "generation_id")? != generation.id.as_uuid()
+        if head.rows().len() != 1
+            || get_uuid(&head.rows()[0], head.columns(), "generation_id")?
+                != generation.id.as_uuid()
         {
             return Err(stale_claim(
                 "event-search ready generation stopped being the current head before completion",
@@ -7773,10 +7789,10 @@ fn guard_final_interpretations_in_tx(
                     )
                     .map_err(map_engine_err)?;
                 match binding.provenance {
-                    InterpretationProvenance::CapturedBase if head.rows.is_empty() => {}
+                    InterpretationProvenance::CapturedBase if head.rows().is_empty() => {}
                     InterpretationProvenance::Active(id)
-                        if head.rows.len() == 1
-                            && get_uuid(&head.rows[0], &head.columns, "generation_id")?
+                        if head.rows().len() == 1
+                            && get_uuid(&head.rows()[0], head.columns(), "generation_id")?
                                 == id.as_uuid() => {}
                     _ => {
                         return Err(stale_claim(
@@ -7801,15 +7817,15 @@ fn guard_final_interpretations_in_tx(
                         ]),
                     )
                     .map_err(map_engine_err)?;
-                let row = selected.rows.first().ok_or_else(|| {
+                let row = selected.rows().first().ok_or_else(|| {
                     stale_claim("explicit interpretation input disappeared before completion")
                 })?;
-                if selected.rows.len() != 1 {
+                if selected.rows().len() != 1 {
                     return Err(stale_claim(
                         "explicit interpretation input changed before completion",
                     ));
                 }
-                validate_ready_interpretation_row(row, &selected.columns, id)?;
+                validate_ready_interpretation_row(row, selected.columns(), id)?;
             }
         }
     }
@@ -7962,17 +7978,17 @@ fn stream_rows(
     let mut cursor = session.open_cursor(sql, params).map_err(map_engine_err)?;
     let read = (|| -> Result<()> {
         let first = cursor.first_page();
-        let mut more = first.has_more;
-        for row in &first.rows {
-            consume(&first.columns, row)?;
+        let mut more = first.has_more();
+        for row in first.rows() {
+            consume(first.columns(), row)?;
         }
         while more {
             let page = cursor
                 .fetch(NonZeroUsize::new(bounds.events.max(1)))
                 .map_err(map_engine_err)?;
-            more = page.has_more;
-            for row in &page.rows {
-                consume(&page.columns, row)?;
+            more = page.has_more();
+            for row in page.rows() {
+                consume(page.columns(), row)?;
             }
         }
         Ok(())

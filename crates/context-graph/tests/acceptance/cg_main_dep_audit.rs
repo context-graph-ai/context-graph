@@ -2541,10 +2541,10 @@ fn store_open_with_default_config_against_freshly_created_path_writes_cg_schema_
     let rows = db
         .execute("SELECT version FROM cg_schema_version", &HashMap::new())
         .expect("schema version query");
-    assert_eq!(1, rows.rows.len(), "schema version row count");
+    assert_eq!(1, rows.rows().len(), "schema version row count");
     assert_eq!(
         Some(&Value::Int64(CG_SCHEMA_VERSION as i64)),
-        rows.rows.first().and_then(|row| row.first())
+        rows.rows().first().and_then(|row| row.first())
     );
 }
 

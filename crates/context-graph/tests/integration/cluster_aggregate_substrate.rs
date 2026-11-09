@@ -284,13 +284,13 @@ fn raw_signature_aggregate(
         )
         .map_err(|err| format!("{err:?}"))?;
     let row = result
-        .rows
+        .rows()
         .first()
         .ok_or_else(|| format!("signature row {signature_id} is missing"))?;
-    if result.rows.len() != 1 {
+    if result.rows().len() != 1 {
         return Err(format!(
             "expected exactly one signature row for {signature_id}, got {}",
-            result.rows.len()
+            result.rows().len()
         ));
     }
 
@@ -339,7 +339,7 @@ fn raw_signature_aggregate_count(db_path: &Path, signature_id: &str) -> Result<i
             )]),
         )
         .map_err(|err| format!("{err:?}"))?;
-    match result.rows.first().and_then(|row| row.first()) {
+    match result.rows().first().and_then(|row| row.first()) {
         Some(Value::Int64(value)) => Ok(*value),
         other => Err(format!("expected count integer, got {other:?}")),
     }
@@ -376,13 +376,13 @@ fn hidden_member_vector_payloads_reachable_from_signatures(
             .into_iter()
             .map(|column| column.name)
             .collect::<Vec<_>>();
-        let columns = if result.columns.is_empty() {
+        let columns = if result.columns().is_empty() {
             fallback_columns.as_slice()
         } else {
-            result.columns.as_slice()
+            result.columns()
         };
 
-        for row in result.rows {
+        for row in result.rows() {
             for (idx, value) in row.iter().enumerate() {
                 let column = columns.get(idx).map_or("<unknown>", String::as_str);
                 match value {

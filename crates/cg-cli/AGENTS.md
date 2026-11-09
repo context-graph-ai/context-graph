@@ -14,6 +14,7 @@ storage policy or a second cache-root rule.
 | Capture and forgetting | `src/history/import.rs`, `src/history/forget.rs` |
 | Find, show, status and Context selection | `src/history/read.rs`, `src/history/mod.rs` |
 | Detached work, saved selections and retry accounting | `src/history/worker.rs` |
+| Sync client construction (`cg sync`, `cg worker`) | `src/main.rs` (`CliSyncBoundary::new`, worker setup) |
 | Reader budgets | `src/read_config.rs` |
 | Writer admission | `src/write_config.rs` |
 

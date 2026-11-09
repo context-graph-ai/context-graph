@@ -35,7 +35,7 @@ mod subscriptions;
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 
 use contextdb_core::{
     ColumnType, EdgeDiscardMode, Error as EngineError, ScopeLabel, SyncDirection, TxId, Value,
@@ -115,7 +115,58 @@ const _: fn() = embedding::production_primitive_anchor;
 const MAX_GRAPH_DEPTH: u8 = 10;
 const SCHEMA_BOOTSTRAP_VALIDATE_ATTEMPTS: usize = 256;
 const EVENT_PLACEMENT_TO_TENANT_HUB: &str = "transition_to_tenant_hub";
-static REGISTRY: OnceLock<Mutex<HashMap<PathBuf, Weak<Database>>>> = OnceLock::new();
+static REGISTRY: OnceLock<Mutex<HashMap<PathBuf, Slot>>> = OnceLock::new();
+
+/// What the process-wide registry knows about one store path.
+enum Slot {
+    /// One opener is inside the engine open, which may be waiting on starting readers. Other
+    /// openers of this path wait on the gate; every other path proceeds untouched.
+    Opening(Arc<OnceLock<()>>),
+    /// The path's registered database, shared while any handle on it is alive.
+    Open(Weak<Database>),
+}
+
+impl Slot {
+    fn live(&self) -> Option<Arc<Database>> {
+        match self {
+            Slot::Open(handle) => handle.upgrade(),
+            Slot::Opening(_) => None,
+        }
+    }
+}
+
+/// An opener's claim on one path. Dropping it ends the opening: the slot goes back to what it was
+/// before, or to the new database once published, and the waiting openers are released.
+struct OpeningClaim {
+    path: PathBuf,
+    gate: Arc<OnceLock<()>>,
+    previous: Option<Weak<Database>>,
+    published: bool,
+}
+
+impl OpeningClaim {
+    fn publish(mut self, db: &Arc<Database>) {
+        let registry = REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut guard = registry.lock().unwrap_or_else(PoisonError::into_inner);
+        guard.insert(self.path.clone(), Slot::Open(Arc::downgrade(db)));
+        self.published = true;
+    }
+}
+
+impl Drop for OpeningClaim {
+    fn drop(&mut self) {
+        let registry = REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut guard = registry.lock().unwrap_or_else(PoisonError::into_inner);
+        if !self.published {
+            match self.previous.take() {
+                Some(previous) => guard.insert(self.path.clone(), Slot::Open(previous)),
+                None => guard.remove(&self.path),
+            };
+        }
+        drop(guard);
+        let _ = self.gate.set(());
+    }
+}
 static SCHEMA_INSTALL_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 pub(crate) trait StoreReadObserver: Send + Sync {
@@ -888,7 +939,7 @@ impl Store {
             .db
             .execute("SELECT id FROM contexts WHERE id = $id", &params)
             .map_err(map_engine_err)?;
-        if existing.rows.is_empty() {
+        if existing.rows().is_empty() {
             return Err(CgError::NotFound {
                 id: Some(ctx.as_uuid().to_string()),
                 missing: Some("context"),
@@ -1050,31 +1101,56 @@ fn open_bootstrapped_database(
     consumer_schema: &ConsumerSchema,
 ) -> Result<(Arc<Database>, Option<Arc<Database>>)> {
     let registry = REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
-    let (mut guard, db, reused) =
-        open_retry::retry(db_path, open_retry::Contention::Readers, || {
-            // Each attempt reacquires and rechecks. A reader wait must never own the registry mutex.
-            let guard = registry.lock().expect("store registry lock");
-            if extras.is_plain()
-                && !replace_shared_handle
-                && let Some(existing) = guard.get(db_path).and_then(Weak::upgrade)
-            {
-                return Ok((guard, existing, true));
-            }
-            let db = Arc::new(
-                Database::open_with_options(
-                    db_path,
-                    extras.open_options(
-                        config.read_memory_limit_bytes,
-                        config.read_active_time_ms,
-                        config.write_memory_limit_bytes,
-                    ),
-                )
-                .map_err(|error| extras.map_refusal(db_path, error))?,
-            );
-            Ok((guard, db, false))
-        })?;
-    bootstrap_schema(&db, config, reused, consumer_schema)?;
-    guard.insert(db_path.to_path_buf(), Arc::downgrade(&db));
+    // The registry is held only while it is read or written. A path being opened is marked
+    // `Opening` and the lock is released for the engine open, which waits once for starting
+    // readers; another opener of the SAME path waits on that mark, every other path proceeds.
+    let claim = loop {
+        let mut guard = registry.lock().expect("store registry lock");
+        let gate = match guard.get(db_path) {
+            Some(Slot::Opening(gate)) => Some(Arc::clone(gate)),
+            _ => None,
+        };
+        if let Some(gate) = gate {
+            drop(guard);
+            gate.wait();
+            continue;
+        }
+        let existing = if extras.is_plain() && !replace_shared_handle {
+            guard.get(db_path).and_then(Slot::live)
+        } else {
+            None
+        };
+        if let Some(existing) = existing {
+            bootstrap_schema(&existing, config, true, consumer_schema)?;
+            guard.insert(db_path.to_path_buf(), Slot::Open(Arc::downgrade(&existing)));
+            return Ok(narrowed_handle(existing, contexts, scope_labels));
+        }
+        let gate = Arc::new(OnceLock::new());
+        let previous = match guard.insert(db_path.to_path_buf(), Slot::Opening(Arc::clone(&gate))) {
+            Some(Slot::Open(previous)) => Some(previous),
+            _ => None,
+        };
+        break OpeningClaim {
+            path: db_path.to_path_buf(),
+            gate,
+            previous,
+            published: false,
+        };
+    };
+    let mut options = extras.open_options(
+        config.read_memory_limit_bytes,
+        config.read_active_time_ms,
+        config.write_memory_limit_bytes,
+    );
+    // The caller's deadline for the wait; the engine has none of its own.
+    options.reader_wait_deadline = Some(open_retry::reader_wait_deadline());
+    open_retry::announce_reader_wait();
+    let db = Arc::new(
+        Database::open_with_options(db_path, options)
+            .map_err(|error| extras.map_refusal(db_path, error))?,
+    );
+    bootstrap_schema(&db, config, false, consumer_schema)?;
+    claim.publish(&db);
     Ok(narrowed_handle(db, contexts, scope_labels))
 }
 
@@ -1220,10 +1296,24 @@ fn bootstrap_schema(
 
 fn existing_shared_database(db_path: &Path) -> Option<Arc<Database>> {
     let registry = REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut guard = registry.lock().expect("store registry lock");
-    let existing = guard.get(db_path).and_then(Weak::upgrade);
-    guard.retain(|_, handle| handle.strong_count() > 0);
-    existing
+    loop {
+        let mut guard = registry.lock().expect("store registry lock");
+        let gate = match guard.get(db_path) {
+            Some(Slot::Opening(gate)) => Some(Arc::clone(gate)),
+            _ => None,
+        };
+        if let Some(gate) = gate {
+            drop(guard);
+            gate.wait();
+            continue;
+        }
+        let existing = guard.get(db_path).and_then(Slot::live);
+        guard.retain(|_, slot| match slot {
+            Slot::Open(handle) => handle.strong_count() > 0,
+            Slot::Opening(_) => true,
+        });
+        return existing;
+    }
 }
 
 #[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
@@ -1239,7 +1329,10 @@ pub fn database_is_live_for_test(db_path: &Path) -> bool {
                 .lock()
                 .expect("store registry lock")
                 .get(db_path)
-                .map(Weak::strong_count)
+                .map(|slot| match slot {
+                    Slot::Open(handle) => handle.strong_count(),
+                    Slot::Opening(_) => 0,
+                })
         })
         .is_some_and(|strong_count| strong_count > 0)
 }
@@ -1251,18 +1344,18 @@ fn schema_version_is_published(db: &Database, expected: u32) -> Result<bool> {
     let result = db
         .execute("SELECT version FROM cg_schema_version", &HashMap::new())
         .map_err(map_engine_err)?;
-    if result.rows.is_empty() {
+    if result.rows().is_empty() {
         return Ok(false);
     }
-    let found = if result.rows.len() == 1 {
-        match result.rows[0].first() {
+    let found = if result.rows().len() == 1 {
+        match result.rows()[0].first() {
             Some(Value::Int64(version)) => u32::try_from(*version).unwrap_or(0),
             _ => 0,
         }
     } else {
         0
     };
-    if result.rows.len() != 1 || found != expected {
+    if result.rows().len() != 1 || found != expected {
         return Err(CgError::LegacySchemaDetected {
             found_version: found,
             expected_version: expected,
@@ -1360,7 +1453,7 @@ fn installation_table_baseline(db: &Database) -> Result<Option<HashSet<String>>>
             &HashMap::from([("id".to_string(), Value::Int64(1))]),
         )
         .map_err(map_engine_err)?;
-    let Some(value) = result.rows.first().and_then(|row| row.first()) else {
+    let Some(value) = result.rows().first().and_then(|row| row.first()) else {
         return Ok(None);
     };
     let Value::Json(serde_json::Value::Array(names)) = value else {
@@ -1415,7 +1508,7 @@ fn begin_installation_table_baseline(db: &Database) -> Result<HashSet<String>> {
             return Err(map_engine_err(error));
         }
     };
-    if updated.rows_affected != 1 {
+    if updated.rows_affected() != 1 {
         let _ = db.rollback(tx);
         return Err(CgError::Engine(
             "the tenant bootstrap changed while recording its installation table baseline".into(),
@@ -1452,7 +1545,7 @@ fn clear_installation_table_baseline_in_tx(db: &Database, tx: TxId) -> Result<()
             ]),
         )
         .map_err(map_engine_err)?;
-    if updated.rows_affected != 1 {
+    if updated.rows_affected() != 1 {
         return Err(CgError::Engine(
             "the tenant bootstrap row disappeared while clearing its installation table baseline"
                 .into(),
@@ -1775,7 +1868,7 @@ fn persisted_event_policy_value(db: &Database) -> Result<Option<String>> {
             &HashMap::from([("id".to_string(), Value::Int64(1))]),
         )
         .map_err(map_engine_err)?;
-    let Some(row) = result.rows.first() else {
+    let Some(row) = result.rows().first() else {
         return Ok(None);
     };
     match row.first() {
@@ -1861,7 +1954,7 @@ fn event_capture_has_started(db: &Database) -> Result<bool> {
             &HashMap::from([("id".to_string(), Value::Int64(1))]),
         )
         .map_err(map_engine_err)?;
-    match captured.rows.first().and_then(|row| row.first()) {
+    match captured.rows().first().and_then(|row| row.first()) {
         Some(Value::TxId(_)) => Ok(true),
         Some(Value::Null) => Ok(false),
         other => Err(CgError::Engine(format!(
@@ -1891,7 +1984,7 @@ fn begin_event_placement_transition(db: &Database) -> Result<bool> {
             return Err(map_engine_err(error));
         }
     };
-    if updated.rows_affected != 1 {
+    if updated.rows_affected() != 1 {
         let _ = db.rollback(tx);
         return Ok(false);
     }
@@ -1923,7 +2016,7 @@ fn replace_event_policy_value(db: &Database, expected: &str, replacement: &str) 
             return Err(map_engine_err(error));
         }
     };
-    if updated.rows_affected != 1 {
+    if updated.rows_affected() != 1 {
         let _ = db.rollback(tx);
         return Err(CgError::Engine(
             "the persisted event placement changed during transition".into(),
@@ -2167,7 +2260,7 @@ fn verify_complete_schema(
             &HashMap::from([("embedding_space_id".into(), Value::Text(default_space))]),
         )
         .map_err(map_engine_err)?;
-    if seeded.rows.len() != 1 {
+    if seeded.rows().len() != 1 {
         return Err(CgError::Engine(
             "schema installation is incomplete; the default embedding space is not seeded".into(),
         ));
@@ -2211,13 +2304,13 @@ fn validate_schema_version(db: &Database, expected: u32) -> Result<()> {
     let rows = db
         .execute("SELECT version FROM cg_schema_version", &HashMap::new())
         .map_err(map_engine_err)?;
-    if rows.rows.len() != 1 {
+    if rows.rows().len() != 1 {
         return Err(CgError::LegacySchemaDetected {
             found_version: 0,
             expected_version: expected,
         });
     }
-    let found = match rows.rows[0].first() {
+    let found = match rows.rows()[0].first() {
         Some(Value::Int64(version)) => *version as u32,
         _ => 0,
     };
@@ -2248,7 +2341,7 @@ fn schema_version_table_is_empty(db: &Database) -> bool {
         return false;
     }
     db.execute("SELECT version FROM cg_schema_version", &HashMap::new())
-        .map(|rows| rows.rows.is_empty())
+        .map(|rows| rows.rows().is_empty())
         .unwrap_or(false)
 }
 
@@ -2292,7 +2385,7 @@ fn seed_embedding_space(db: &Database, space: &EmbeddingSpaceDecl) -> Result<()>
             )]),
         )
         .map_err(map_engine_err)?;
-    if existing.rows.is_empty() {
+    if existing.rows().is_empty() {
         let params = HashMap::from([
             (
                 "embedding_space_id".to_string(),
@@ -2405,7 +2498,7 @@ fn validate_existing_embedding_space(db: &Database, space: &EmbeddingSpaceDecl) 
             &params,
         )
         .map_err(map_engine_err)?;
-    let Some(row) = rows.rows.first() else {
+    let Some(row) = rows.rows().first() else {
         return Ok(());
     };
     if !matches!(row.first(), Some(Value::Int64(n)) if *n as usize == space.dimension) {
@@ -2803,7 +2896,7 @@ fn validate_binding_owner(
             &params,
         )
         .map_err(map_engine_err)?;
-    if let Some(row) = rows.rows.first()
+    if let Some(row) = rows.rows().first()
         && !matches!(row.first(), Some(Value::Text(owner)) if owner == &space.embedding_space_id)
     {
         if shared_digest_vector_binding_allowed(binding) {
@@ -2875,8 +2968,8 @@ fn publish_schema_readiness(db: &Database) -> Result<()> {
     let version = db
         .execute("SELECT id, version FROM cg_schema_version", &HashMap::new())
         .map_err(map_engine_err)?;
-    if let Some(row) = version.rows.first() {
-        if version.rows.len() == 1
+    if let Some(row) = version.rows().first() {
+        if version.rows().len() == 1
             && row.first() == Some(&Value::Int64(1))
             && row.get(1) == Some(&Value::Int64(CG_SCHEMA_VERSION as i64))
         {

@@ -112,7 +112,7 @@ impl Store {
             .map_err(|err| CgError::Engine(format!("unexpected engine error: {err}")))?;
         self.set_trace(sql);
         let mut records = result
-            .rows
+            .rows()
             .iter()
             .map(|row| decode_lineage_record(row))
             .collect::<Result<Vec<_>>>()?;

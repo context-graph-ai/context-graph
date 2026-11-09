@@ -1,3 +1,7 @@
+#![allow(
+    clippy::result_large_err,
+    reason = "The engine's public error carries its refusal diagnostics inline (160+ bytes); this module passes it through unchanged."
+)]
 #![cfg(unix)]
 //! Editing a store a consumer already has never brings one into existence.
 //!
@@ -125,7 +129,7 @@ fn setting_names(store: &Store) -> Vec<String> {
             &HashMap::new(),
         )
         .expect("read the consumer table back")
-        .rows
+        .rows()
         .iter()
         .map(|row| match &row[0] {
             Value::Text(name) => name.clone(),

@@ -368,23 +368,23 @@ fn raw_digest_vector_query(
         )
         .expect("raw digest vector query");
     let ids = result
-        .rows
+        .rows()
         .iter()
         .filter_map(|row| match row.first() {
             Some(Value::Uuid(id)) => Some(DigestId::from(*id)),
             _ => None,
         })
         .collect::<Vec<_>>();
-    // The vectors admitted to the indexed AUTO plan, as the engine's query disclosure reports
-    // them. An AUTO leaf may still use bounded exact work when the maintained graph is unavailable.
-    let indexed_vectors = result
-        .trace
+    // The vectors the engine's query disclosure reports as searched by the exact route this
+    // release serves (no vector index ships), counted over the whole allowed set.
+    let searched_vectors = result
+        .trace()
         .vector_search
         .as_ref()
-        .filter(|search| search.resolved_mode == VectorSearchMode::Indexed)
+        .filter(|search| search.resolved_mode == VectorSearchMode::Exact)
         .and_then(|search| search.aggregate_allowed_vectors)
         .unwrap_or_default();
-    (ids, format!("{:?}", result.trace), indexed_vectors)
+    (ids, format!("{:?}", result.trace()), searched_vectors)
 }
 
 fn raw_extracted_from_graph_walk(
@@ -408,7 +408,7 @@ fn raw_extracted_from_graph_walk(
         )
         .expect("raw extracted-from graph walk");
     let mut ids = result
-        .rows
+        .rows()
         .iter()
         .filter_map(|row| match row.first() {
             Some(Value::Uuid(id)) => Some(*id),
@@ -416,7 +416,7 @@ fn raw_extracted_from_graph_walk(
         })
         .collect::<Vec<_>>();
     ids.sort();
-    (ids, format!("{:?}", result.trace))
+    (ids, format!("{:?}", result.trace()))
 }
 
 fn seeded_fixture() -> DigestFixture {
@@ -662,7 +662,7 @@ fn find_via_digests_uses_contextdb_vector_index_and_graph_traversal_not_local_sc
         &[goal.as_uuid(), entity.as_uuid(), decision.as_uuid()],
     );
     insert_extracted_from_edges(&db_path, context.id, near_decoy.id, &[goal.as_uuid()]);
-    let (raw_ids, raw_trace, indexed_vectors) =
+    let (raw_ids, raw_trace, searched_vectors) =
         raw_digest_vector_query(&db_path, context.id, unit_vector(40), 2);
     let (raw_graph_source_ids, raw_graph_trace) =
         raw_extracted_from_graph_walk(&db_path, context.id, target_digest.id);
@@ -686,9 +686,9 @@ fn find_via_digests_uses_contextdb_vector_index_and_graph_traversal_not_local_sc
     // and graph links with the direct query, while checking the direct query's disclosed route.
     assert!(
         raw_ids == vec![target_digest.id, near_decoy.id]
-            && indexed_vectors >= 1010
-            && raw_trace.contains("resolved_mode: Indexed")
-            && (raw_trace.contains("HNSWSearch") || raw_trace.contains("route: Some(Exact)"))
+            && searched_vectors >= 1010
+            && raw_trace.contains("resolved_mode: Exact")
+            && raw_trace.contains("route: Some(Exact)")
             && raw_graph_trace.contains("AdjacencyProbe")
             && raw_graph_source_ids == expected_graph_source_ids
             && hits.iter().map(|hit| hit.digest_id).collect::<Vec<_>>() == raw_ids
@@ -712,7 +712,7 @@ fn find_via_digests_uses_contextdb_vector_index_and_graph_traversal_not_local_sc
                     && hit.graph_walk.relationship == "EXTRACTED_FROM"
                     && hit.graph_walk.source_ids == raw_graph_source_ids)
             && public_trace.contains("digests.vector_text"),
-        "digest retrieval must use ContextDB's disclosed indexed AUTO plan and GRAPH_TABLE EXTRACTED_FROM walk; hits={hits:?}, raw_ids={raw_ids:?}, raw_trace={raw_trace:?}, raw_graph_source_ids={raw_graph_source_ids:?}, raw_graph_trace={raw_graph_trace:?}, indexed_vectors={indexed_vectors}, public_trace={public_trace:?}"
+        "digest retrieval must use ContextDB's disclosed exact vector route and GRAPH_TABLE EXTRACTED_FROM walk; hits={hits:?}, raw_ids={raw_ids:?}, raw_trace={raw_trace:?}, raw_graph_source_ids={raw_graph_source_ids:?}, raw_graph_trace={raw_graph_trace:?}, searched_vectors={searched_vectors}, public_trace={public_trace:?}"
     );
 }
 

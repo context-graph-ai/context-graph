@@ -613,7 +613,7 @@ fn entity_from_item_or_digest(
         .ok()?;
     let target_name_norm = target_name.map(normalize_lesson_name);
     let mut candidates = Vec::new();
-    for row in &result.rows {
+    for row in result.rows() {
         let Some(contextdb_core::Value::Uuid(source_id)) = row.first() else {
             continue;
         };
@@ -1129,7 +1129,7 @@ fn insert_correction_and_labels(
             "INSERT INTO cg_teaching_events (id, skill_id, corrected_item_id, kind, content, created_at) VALUES ($id, $skill_id, $corrected_item_id, $kind, $content, $created_at)",
             &teaching_params,
         )
-        .map(|result| result.rows_affected == 1)
+        .map(|result| result.rows_affected() == 1)
         .unwrap_or(false);
     if !inserted {
         let _ = db.rollback(tx);
@@ -1256,7 +1256,7 @@ fn record_firing_label_in_tx(
         "UPDATE cg_skill_firing_trace SET correct = $correct WHERE id = $id",
         &firing_label_params(firing_id, correct),
     )
-    .map(|result| result.rows_affected == 1)
+    .map(|result| result.rows_affected() == 1)
     .unwrap_or(false)
 }
 
@@ -1923,7 +1923,7 @@ fn read_review_cursor_flag(store: &Store, id: &str, default: bool) -> crate::Res
         "SELECT position FROM cg_review_cursor WHERE id = $id",
         &HashMap::from([("id".into(), contextdb_core::Value::Text(id.into()))]),
     )?;
-    Ok(match rows.rows.first().and_then(|row| row.first()) {
+    Ok(match rows.rows().first().and_then(|row| row.first()) {
         Some(contextdb_core::Value::Int64(v)) => *v != 0,
         _ => default,
     })
