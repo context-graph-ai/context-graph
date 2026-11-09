@@ -33,13 +33,13 @@ impl Store {
     pub fn get_evidence(&self, id: EvidenceId) -> Result<EvidenceRef> {
         let params = HashMap::from([("id".to_string(), Value::Uuid(id.as_uuid()))]);
         let result = self.read_query(evidence_select_sql("WHERE id = $id"), &params)?;
-        let Some(row) = result.rows.first() else {
+        let Some(row) = result.rows().first() else {
             return Err(CgError::NotFound {
                 id: Some(id.as_uuid().to_string()),
                 missing: Some("evidence"),
             });
         };
-        self.decode_evidence_with_latest_status(&result.columns, row)
+        self.decode_evidence_with_latest_status(result.columns(), row)
     }
 
     pub fn update_evidence_retention_status(
@@ -109,34 +109,34 @@ impl Store {
             "SELECT embedding_space_id, dimension, metric, model_family, model_name, model_version, supported_evidence_kinds, default_for_evidence_kind, bindings FROM embedding_spaces",
             &HashMap::new(),
         )?;
-        let mut spaces = Vec::with_capacity(result.rows.len());
-        for row in &result.rows {
-            let embedding_space_id = get_text(row, &result.columns, "embedding_space_id")?;
+        let mut spaces = Vec::with_capacity(result.rows().len());
+        for row in result.rows() {
+            let embedding_space_id = get_text(row, result.columns(), "embedding_space_id")?;
             let mut bindings = bindings_for_space(query, &embedding_space_id)?;
             if bindings.is_empty() {
                 bindings = bindings_from_json(
                     &embedding_space_id,
-                    &get_json(row, &result.columns, "bindings")?,
+                    &get_json(row, result.columns(), "bindings")?,
                 );
             }
             spaces.push(EmbeddingSpace {
                 embedding_space_id: embedding_space_id.clone(),
-                dimension: get_int(row, &result.columns, "dimension")? as usize,
-                metric: distance_metric_from_str(&get_text(row, &result.columns, "metric")?)?,
-                model_family: get_optional_text(row, &result.columns, "model_family")?
+                dimension: get_int(row, result.columns(), "dimension")? as usize,
+                metric: distance_metric_from_str(&get_text(row, result.columns(), "metric")?)?,
+                model_family: get_optional_text(row, result.columns(), "model_family")?
                     .unwrap_or_default(),
-                model_name: get_optional_text(row, &result.columns, "model_name")?
+                model_name: get_optional_text(row, result.columns(), "model_name")?
                     .unwrap_or_default(),
-                model_version: get_optional_text(row, &result.columns, "model_version")?
+                model_version: get_optional_text(row, result.columns(), "model_version")?
                     .unwrap_or_default(),
                 supported_evidence_kinds: evidence_kind_vec_from_json(&get_json(
                     row,
-                    &result.columns,
+                    result.columns(),
                     "supported_evidence_kinds",
                 )?)?,
                 default_for_evidence_kind: get_optional_text(
                     row,
-                    &result.columns,
+                    result.columns(),
                     "default_for_evidence_kind",
                 )?
                 .map(|raw| evidence_kind_from_str(&raw))
@@ -160,7 +160,7 @@ impl Store {
                 snapshot,
             )
             .map_err(map_engine_err)?;
-        let Some(decision_row) = decision_rows.rows.first() else {
+        let Some(decision_row) = decision_rows.rows().first() else {
             return Err(CgError::NotFound {
                 id: Some(decision_id.as_uuid().to_string()),
                 missing: Some("decision"),
@@ -168,7 +168,7 @@ impl Store {
         };
         let decision_context = ContextId::from(get_uuid(
             decision_row,
-            &decision_rows.columns,
+            decision_rows.columns(),
             "context_id",
         )?);
         let basis_ids = self.basis_snapshot_ids_for_decision_at_read(decision_id, snapshot)?;
@@ -256,7 +256,7 @@ impl Store {
             ]),
         );
         let rows_affected = match update {
-            Ok(result) => result.rows_affected,
+            Ok(result) => result.rows_affected(),
             Err(err) => {
                 let _ = self.db.rollback(tx);
                 if matches!(err, EngineError::UniqueViolation { .. }) {
@@ -342,7 +342,7 @@ impl Store {
             "INSERT INTO invalidations (id, status, context_id, affected_decision_id, trigger_observation_id, reason, basis_diff, cascade_from, severity, threatened_intention_ids, intention_now_un_served, detected_at, resolved_at, resolution_action, resolution_decision_id) VALUES ($id, $status, $context_id, $affected_decision_id, $trigger_observation_id, $reason, $basis_diff, $cascade_from, $severity, $threatened_intention_ids, $intention_now_un_served, $detected_at, $resolved_at, $resolution_action, $resolution_decision_id)",
             &params,
         ) {
-            Ok(result) => result.rows_affected,
+            Ok(result) => result.rows_affected(),
             Err(err) => {
                 let _ = self.db.rollback(tx);
                 if matches!(err, EngineError::UniqueViolation { .. }) {
@@ -422,9 +422,9 @@ impl Store {
             "SELECT id, status, context_id, affected_decision_id, trigger_observation_id, reason, basis_diff, cascade_from, severity, threatened_intention_ids, intention_now_un_served, detected_at, resolved_at, resolution_action, resolution_decision_id FROM invalidations{where_clause}"
         );
         let result = self.read_query(&sql, &params)?;
-        let mut rows = Vec::with_capacity(result.rows.len());
-        for row in &result.rows {
-            rows.push(decode_invalidation(&result.columns, row)?);
+        let mut rows = Vec::with_capacity(result.rows().len());
+        for row in result.rows() {
+            rows.push(decode_invalidation(result.columns(), row)?);
         }
         rows.sort_by_key(|row| row.detected_at);
         Ok(rows)
@@ -446,9 +446,9 @@ impl Store {
                     ),
                 ]),
             )?;
-        let mut rows = Vec::with_capacity(result.rows.len());
-        for row in &result.rows {
-            rows.push(decode_invalidation(&result.columns, row)?);
+        let mut rows = Vec::with_capacity(result.rows().len());
+        for row in result.rows() {
+            rows.push(decode_invalidation(result.columns(), row)?);
         }
         rows.sort_by(|a, b| {
             a.cascade_from
@@ -465,9 +465,9 @@ impl Store {
                 &HashMap::from([("id".to_string(), Value::Uuid(id.as_uuid()))]),
             )?;
         result
-            .rows
+            .rows()
             .first()
-            .map(|row| decode_invalidation(&result.columns, row))
+            .map(|row| decode_invalidation(result.columns(), row))
             .transpose()
     }
 
@@ -528,9 +528,9 @@ impl Store {
             )
             .map_err(map_engine_err)?;
         let decoded = result
-            .rows
+            .rows()
             .first()
-            .map(|row| decode_snapshot_at_read(&result.columns, row))
+            .map(|row| decode_snapshot_at_read(result.columns(), row))
             .transpose()?;
         match decoded {
             Some(mut row) => {
@@ -555,10 +555,10 @@ impl Store {
                 snapshot,
             )
             .map_err(map_engine_err)?;
-        let Some(row) = result.rows.first() else {
+        let Some(row) = result.rows().first() else {
             return Ok(None);
         };
-        let snapshot_id = EntitySnapshotId::from(get_uuid(row, &result.columns, "snapshot_id")?);
+        let snapshot_id = EntitySnapshotId::from(get_uuid(row, result.columns(), "snapshot_id")?);
         self.snapshot_by_id_at_read(snapshot_id, snapshot)
     }
 
@@ -576,9 +576,9 @@ impl Store {
             )
             .map_err(map_engine_err)?;
         result
-            .rows
+            .rows()
             .first()
-            .map(|row| get_uuid(row, &result.columns, "context_id").map(ContextId::from))
+            .map(|row| get_uuid(row, result.columns(), "context_id").map(ContextId::from))
             .transpose()
     }
 
@@ -595,13 +595,13 @@ impl Store {
                     &HashMap::from([("id".to_string(), Value::Uuid(snapshot_id.as_uuid()))]),
                 )
                 .map_err(map_engine_err)?;
-            let Some(row) = result.rows.first() else {
+            let Some(row) = result.rows().first() else {
                 return Err(CgError::NotFound {
                     id: Some(snapshot_id.as_uuid().to_string()),
                     missing: Some("entity_snapshot"),
                 });
             };
-            let entity_id = EntityId::from(get_uuid(row, &result.columns, "entity_id")?);
+            let entity_id = EntityId::from(get_uuid(row, result.columns(), "entity_id")?);
             let entity_context = self.entity_context(entity_id)?.ok_or(CgError::NotFound {
                 id: Some(entity_id.as_uuid().to_string()),
                 missing: Some("entity"),
@@ -619,9 +619,9 @@ impl Store {
             &HashMap::from([("id".to_string(), Value::Uuid(entity_id.as_uuid()))]),
         )?;
         result
-            .rows
+            .rows()
             .first()
-            .map(|row| get_uuid(row, &result.columns, "context_id").map(ContextId::from))
+            .map(|row| get_uuid(row, result.columns(), "context_id").map(ContextId::from))
             .transpose()
     }
 
@@ -633,16 +633,16 @@ impl Store {
             "SELECT status, context_id, confidence FROM decisions WHERE id = $id",
             &HashMap::from([("id".to_string(), Value::Uuid(decision_id.as_uuid()))]),
         )?;
-        let Some(row) = result.rows.first() else {
+        let Some(row) = result.rows().first() else {
             return Err(CgError::NotFound {
                 id: Some(decision_id.as_uuid().to_string()),
                 missing: Some("decision"),
             });
         };
         Ok(DecisionStatusAndContext {
-            status: decision_status_from_str(&get_text(row, &result.columns, "status")?)?,
-            context_id: ContextId::from(get_uuid(row, &result.columns, "context_id")?),
-            confidence: get_optional_float(row, &result.columns, "confidence")?,
+            status: decision_status_from_str(&get_text(row, result.columns(), "status")?)?,
+            context_id: ContextId::from(get_uuid(row, result.columns(), "context_id")?),
+            confidence: get_optional_float(row, result.columns(), "confidence")?,
         })
     }
 
@@ -651,7 +651,7 @@ impl Store {
             "SELECT context_id FROM observations WHERE id = $id",
             &HashMap::from([("id".to_string(), Value::Uuid(observation_id.as_uuid()))]),
         )?;
-        let Some(row) = result.rows.first() else {
+        let Some(row) = result.rows().first() else {
             return Err(CgError::NotFound {
                 id: Some(observation_id.as_uuid().to_string()),
                 missing: Some("observation"),
@@ -659,7 +659,7 @@ impl Store {
         };
         Ok(ContextId::from(get_uuid(
             row,
-            &result.columns,
+            result.columns(),
             "context_id",
         )?))
     }
@@ -691,10 +691,10 @@ impl Store {
             )
             .map_err(map_engine_err)?;
         let mut rows = Vec::new();
-        for row in &result.rows {
+        for row in result.rows() {
             rows.push((
-                get_txid(row, &result.columns, "recorded_at_txid")?,
-                retention_status_from_str(&get_text(row, &result.columns, "status")?)?,
+                get_txid(row, result.columns(), "recorded_at_txid")?,
+                retention_status_from_str(&get_text(row, result.columns(), "status")?)?,
             ));
         }
         rows.sort_by_key(|row| row.0);
@@ -740,11 +740,11 @@ pub(super) fn list_evidence_for_observation(
         evidence_select_sql("WHERE observation_id = $observation_id"),
         &params,
     )?;
-    let mut rows = Vec::with_capacity(result.rows.len());
-    for row in &result.rows {
+    let mut rows = Vec::with_capacity(result.rows().len());
+    for row in result.rows() {
         rows.push(decode_evidence_with_latest_status(
             source,
-            &result.columns,
+            result.columns(),
             row,
         )?);
     }
@@ -767,12 +767,12 @@ pub(super) fn evidence_availability_log(
         "SELECT evidence_id, status, recorded_at_txid FROM evidence_availability_log WHERE evidence_id = $evidence_id",
         &params,
     )?;
-    let mut rows = Vec::with_capacity(result.rows.len());
-    for row in &result.rows {
+    let mut rows = Vec::with_capacity(result.rows().len());
+    for row in result.rows() {
         rows.push(EvidenceAvailabilityLogRow {
-            evidence_id: EvidenceId::from(get_uuid(row, &result.columns, "evidence_id")?),
-            status: retention_status_from_str(&get_text(row, &result.columns, "status")?)?,
-            recorded_at_txid: get_txid(row, &result.columns, "recorded_at_txid")?,
+            evidence_id: EvidenceId::from(get_uuid(row, result.columns(), "evidence_id")?),
+            status: retention_status_from_str(&get_text(row, result.columns(), "status")?)?,
+            recorded_at_txid: get_txid(row, result.columns(), "recorded_at_txid")?,
         });
     }
     rows.sort_by_key(|row| row.recorded_at_txid);
@@ -852,13 +852,13 @@ fn supply_order_for_evidence_id(
     result: &contextdb_engine::QueryResult,
     evidence_id: EvidenceId,
 ) -> Option<i64> {
-    let id_idx = result.columns.iter().position(|column| column == "id")?;
+    let id_idx = result.columns().iter().position(|column| column == "id")?;
     let order_idx = result
-        .columns
+        .columns()
         .iter()
         .position(|column| column == "supply_order")?;
     result
-        .rows
+        .rows()
         .iter()
         .find_map(|row| match (row.get(id_idx), row.get(order_idx)) {
             (Some(Value::Uuid(id)), Some(Value::Int64(order))) if *id == evidence_id.as_uuid() => {
@@ -1286,12 +1286,12 @@ fn bindings_for_space(
             Value::Text(embedding_space_id.to_string()),
         )]),
     )?;
-    let mut bindings = Vec::with_capacity(result.rows.len());
-    for row in &result.rows {
+    let mut bindings = Vec::with_capacity(result.rows().len());
+    for row in result.rows() {
         bindings.push(EmbeddingSpaceBinding {
-            embedding_space_id: get_text(row, &result.columns, "embedding_space_id")?,
-            table_name: get_text(row, &result.columns, "table_name")?,
-            vector_column: get_text(row, &result.columns, "vector_column")?,
+            embedding_space_id: get_text(row, result.columns(), "embedding_space_id")?,
+            table_name: get_text(row, result.columns(), "table_name")?,
+            vector_column: get_text(row, result.columns(), "vector_column")?,
         });
     }
     bindings.sort_by(|a, b| {

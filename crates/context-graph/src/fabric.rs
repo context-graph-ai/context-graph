@@ -467,7 +467,8 @@ fn digest_context(store: &Store, digest_id: DigestId) -> Result<Option<(ContextI
         "SELECT context_id FROM digests WHERE id = $id",
         &HashMap::from([("id".to_string(), DbValue::Uuid(digest_id.as_uuid()))]),
     )?;
-    let Some(DbValue::Uuid(context_uuid)) = result.rows.first().and_then(|row| row.first()) else {
+    let Some(DbValue::Uuid(context_uuid)) = result.rows().first().and_then(|row| row.first())
+    else {
         return Ok(None);
     };
     let context_id = ContextId::from(*context_uuid);
@@ -489,7 +490,7 @@ fn chunk_text_for_digest(store: &Store, digest_text: &str) -> Result<Option<Stri
             DbValue::Text(digest_text.to_string()),
         )]),
     )?;
-    Ok(result.rows.first().and_then(|row| match row.first() {
+    Ok(result.rows().first().and_then(|row| match row.first() {
         Some(DbValue::Text(content)) => Some(content.clone()),
         _ => None,
     }))
@@ -552,7 +553,7 @@ pub fn input_material_in_push_set_read_only(
 /// input copy in the push set.
 fn input_material_count(rows: &dyn crate::store::graph_rows::GraphRows) -> Result<usize> {
     let answer = rows.query_rows("SELECT COUNT(*) AS n FROM work_inputs", &HashMap::new())?;
-    match answer.rows.first().and_then(|row| row.first()) {
+    match answer.rows().first().and_then(|row| row.first()) {
         Some(DbValue::Int64(count)) => usize::try_from(*count)
             .map_err(|_| crate::CgError::Engine("push-set count is negative".into())),
         other => Err(crate::CgError::Engine(format!(

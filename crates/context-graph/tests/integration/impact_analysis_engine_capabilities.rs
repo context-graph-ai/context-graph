@@ -1,3 +1,7 @@
+#![allow(
+    clippy::result_large_err,
+    reason = "The engine's public error carries its refusal diagnostics inline (160+ bytes); this module passes it through unchanged."
+)]
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Barrier};
 use std::thread;

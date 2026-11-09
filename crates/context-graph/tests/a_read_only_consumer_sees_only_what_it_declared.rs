@@ -208,7 +208,7 @@ fn vector_index_tables_in_the_whole_store(path: &Path) -> BTreeSet<String> {
         .sync_database()
         .execute("SHOW VECTOR_INDEXES", &no_params())
         .expect("an unrestricted handle is answered about every vector index in the store");
-    let tables = text_column(&answered.rows).into_iter().collect();
+    let tables = text_column(answered.rows()).into_iter().collect();
     drop(store);
     tables
 }
@@ -423,7 +423,7 @@ fn a_declared_reader_journeys_from_open_through_sql_metadata_and_cursor_to_close
         .expect("a declared table answers the reader");
     assert_eq!(
         vec!["note-1".to_string()],
-        text_column(&answered.rows),
+        text_column(answered.rows()),
         "the reader reads back the row the consumer wrote",
     );
 
@@ -444,10 +444,10 @@ fn a_declared_reader_journeys_from_open_through_sql_metadata_and_cursor_to_close
     assert_eq!(
         vec!["note-1".to_string()],
         text_column(
-            &cursor
+            cursor
                 .first_page()
                 .expect("the cursor was just opened")
-                .rows
+                .rows()
         ),
         "the page produced at open carries the declared table's row",
     );
@@ -455,7 +455,7 @@ fn a_declared_reader_journeys_from_open_through_sql_metadata_and_cursor_to_close
         !cursor
             .first_page()
             .expect("the cursor was just opened")
-            .has_more,
+            .has_more(),
         "one row is the whole answer, so nothing remains after the first page",
     );
     cursor.close().expect("the reader closes its own cursor");
@@ -566,7 +566,7 @@ fn an_out_of_scope_row_is_invisible_to_the_reader_rather_than_refused() {
         .expect("the role the reader declared answers");
     assert_eq!(
         vec!["edge-1".to_string()],
-        text_column(&answered.rows),
+        text_column(answered.rows()),
         "the edge reader reads the edge row and nothing else",
     );
 
@@ -577,9 +577,9 @@ fn an_out_of_scope_row_is_invisible_to_the_reader_rather_than_refused() {
         )
         .expect("a label the reader did not declare is invisible to it, never an error it catches");
     assert!(
-        text_column(&named.rows).is_empty(),
+        text_column(named.rows()).is_empty(),
         "naming the hub's label must answer with no rows, got: {:?}",
-        text_column(&named.rows),
+        text_column(named.rows()),
     );
 
     let parameterized = reader
@@ -589,9 +589,9 @@ fn an_out_of_scope_row_is_invisible_to_the_reader_rather_than_refused() {
         )
         .expect("a parameter is not a way around the declaration, and not a reason to refuse");
     assert!(
-        text_column(&parameterized.rows).is_empty(),
+        text_column(parameterized.rows()).is_empty(),
         "the hub's label handed in as a parameter must answer with no rows, got: {:?}",
-        text_column(&parameterized.rows),
+        text_column(parameterized.rows()),
     );
 
     let unrestricted = reader
@@ -601,7 +601,7 @@ fn an_out_of_scope_row_is_invisible_to_the_reader_rather_than_refused() {
         );
     assert_eq!(
         vec!["edge-1".to_string()],
-        text_column(&unrestricted.rows),
+        text_column(unrestricted.rows()),
         "a query that restricts nothing must still see only the row its declaration allows",
     );
 
@@ -639,7 +639,7 @@ fn a_statement_that_would_change_the_store_is_refused_by_the_read_only_surface()
         .expect("read the declared table back");
     assert_eq!(
         vec!["note-1".to_string()],
-        text_column(&rows.rows),
+        text_column(rows.rows()),
         "a refused write must leave no row behind",
     );
     after.close().expect("close the reader");
@@ -663,7 +663,7 @@ fn two_read_only_opens_of_the_same_stopped_store_both_answer() {
             .unwrap_or_else(|error| panic!("the {which} reader must answer: {error:?}"));
         assert_eq!(
             vec!["note-1".to_string()],
-            text_column(&answered.rows),
+            text_column(answered.rows()),
             "the {which} reader reads the declared row",
         );
     }
@@ -719,7 +719,7 @@ fn every_query_shape_that_re_widens_a_narrowed_predicate_answers_only_in_scope_r
         });
         assert_eq!(
             *expected,
-            text_column(&answered.rows),
+            text_column(answered.rows()),
             "{shape} must hand back only the rows the reader's declaration admits",
         );
     }
@@ -731,10 +731,10 @@ fn every_query_shape_that_re_widens_a_narrowed_predicate_answers_only_in_scope_r
     assert_eq!(
         only_the_edge_row,
         text_column(
-            &cursor
+            cursor
                 .first_page()
                 .expect("the cursor was just opened")
-                .rows
+                .rows()
         ),
         "the page produced at open must carry only the row the declaration admits",
     );
@@ -773,12 +773,52 @@ fn a_table_keyed_show_answers_only_about_the_tables_the_consumer_declared() {
     let answered = reader
         .execute("SHOW VECTOR_INDEXES", &no_params())
         .expect("a table-keyed SHOW answers the reader about its own tables");
-    let named: BTreeSet<String> = text_column(&answered.rows).into_iter().collect();
+    let named: BTreeSet<String> = text_column(answered.rows()).into_iter().collect();
     assert_eq!(
         BTreeSet::from(["vigil_notes".to_string()]),
         named,
         "a table-keyed SHOW must come back intersected with the declaration; it named {undeclared:?} \
          besides",
+    );
+
+    reader.close().expect("close the reader");
+}
+
+// The same narrowing holds when the table-keyed `SHOW` is read through a cursor, whose pages are
+// context-graph's own: the first page and every page fetched after it name only declared tables.
+#[test]
+fn a_table_keyed_show_read_through_a_cursor_names_only_the_declared_tables() {
+    let directory = tempfile::tempdir().expect("scratch directory");
+    let root = scratch_root(&directory);
+    let store = seeded_store(&root);
+
+    let whole_store = vector_index_tables_in_the_whole_store(&store);
+    assert!(
+        whole_store
+            .iter()
+            .any(|table| table.as_str() != "vigil_notes"),
+        "the store must hold a vector index on a table this reader never declared, or the \
+         narrowing below proves nothing",
+    );
+
+    let reader = ConsumerReader::open(&store, notes_only_declaration())
+        .expect("open a reader that declared one table");
+    let mut cursor = reader
+        .open_cursor("SHOW VECTOR_INDEXES", &no_params())
+        .expect("a table-keyed SHOW opens as a cursor");
+    let first = cursor.first_page().expect("the cursor was just opened");
+    let mut named: BTreeSet<String> = text_column(first.rows()).into_iter().collect();
+    let mut more = first.has_more();
+    while more {
+        let page = cursor.fetch(None).expect("a later page of the SHOW");
+        named.extend(text_column(page.rows()));
+        more = page.has_more();
+    }
+    cursor.close().expect("the reader closes its own cursor");
+    assert_eq!(
+        BTreeSet::from(["vigil_notes".to_string()]),
+        named,
+        "every page of a table-keyed SHOW must be intersected with the declaration",
     );
 
     reader.close().expect("close the reader");
@@ -804,7 +844,7 @@ fn a_store_level_show_with_no_table_of_its_own_answers_through_the_reader() {
                 panic!("{statement} reports store-level configuration and must answer: {error:?}")
             });
         assert!(
-            !answered.rows.is_empty(),
+            !answered.rows().is_empty(),
             "{statement} must answer with the store's own configuration rather than nothing",
         );
     }
@@ -859,7 +899,7 @@ fn the_sync_conflict_policy_show_answers_only_about_declared_tables_and_the_stor
     let answered = reader
         .execute("SHOW SYNC_CONFLICT_POLICY", &no_params())
         .expect("a reader is entitled to how the store arbitrates its own table");
-    let named: BTreeSet<String> = text_column(&answered.rows).into_iter().collect();
+    let named: BTreeSet<String> = text_column(answered.rows()).into_iter().collect();
     assert_eq!(
         BTreeSet::from([
             "keep_first".to_string(),
@@ -920,7 +960,7 @@ fn a_read_narrowing_declaration_over_a_write_scoped_column_is_refused_at_open() 
         .expect("a consumer that asked for no narrowing reads its own table");
     assert_eq!(
         vec!["edge-1".to_string(), "server-1".to_string()],
-        text_column(&answered.rows),
+        text_column(answered.rows()),
         "a declaration with no labels narrows nothing, so every row its table accepts answers",
     );
 

@@ -1,3 +1,7 @@
+#![allow(
+    clippy::result_large_err,
+    reason = "The engine's public error carries its refusal diagnostics inline (160+ bytes); this module passes it through unchanged."
+)]
 use std::path::Path;
 use std::sync::Arc;
 
@@ -73,7 +77,7 @@ fn embedding_space_row_count(db_path: &Path, space_id: &str) -> i64 {
             )]),
         )
         .expect("count");
-    match result.rows[0][0] {
+    match result.rows()[0][0] {
         Value::Int64(value) => value,
         _ => 0,
     }
@@ -92,7 +96,7 @@ fn embedding_space_created_at(
         )]),
     )?;
     Ok(result
-        .rows
+        .rows()
         .first()
         .and_then(|row| row.first())
         .cloned()

@@ -1,3 +1,7 @@
+#![allow(
+    clippy::result_large_err,
+    reason = "The engine's public error carries its refusal diagnostics inline (160+ bytes); this module passes it through unchanged."
+)]
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
@@ -359,8 +363,8 @@ impl Store {
                 &params,
             )
             .map_err(map_engine_err)?;
-        let mut out = Vec::with_capacity(result.rows.len());
-        for row in &result.rows {
+        let mut out = Vec::with_capacity(result.rows().len());
+        for row in result.rows() {
             if let Some(Value::Uuid(u)) = row.first() {
                 out.push(ObservationId::from(*u));
             }
@@ -382,7 +386,7 @@ impl Store {
             &params,
         )?;
         let mut count = 0usize;
-        for row in &result.rows {
+        for row in result.rows() {
             let is_non_invalidating = match row.first() {
                 Some(Value::Json(json)) => state_delta_has_no_ops(json),
                 Some(Value::Text(text)) => serde_json::from_str::<JsonValue>(text)
@@ -460,7 +464,7 @@ impl Store {
                 &HashMap::from([("id".to_string(), Value::Uuid(context_id.as_uuid()))]),
             )
             .map_err(map_engine_err)?;
-        Ok(!result.rows.is_empty())
+        Ok(!result.rows().is_empty())
     }
 
     fn validate_record_observation_input(&self, input: &RecordObservation) -> Result<()> {
@@ -708,7 +712,7 @@ impl Store {
                 &HashMap::from([("id".to_string(), Value::Uuid(id.as_uuid()))]),
             )
             .map_err(map_engine_err)?;
-        Ok(!result.rows.is_empty())
+        Ok(!result.rows().is_empty())
     }
 
     fn evidence_context(&self, id: EvidenceId) -> Result<Option<ContextId>> {
@@ -720,9 +724,9 @@ impl Store {
             )
             .map_err(map_engine_err)?;
         result
-            .rows
+            .rows()
             .first()
-            .map(|row| get_uuid(row, &result.columns, "context_id").map(ContextId::from))
+            .map(|row| get_uuid(row, result.columns(), "context_id").map(ContextId::from))
             .transpose()
     }
 
@@ -752,7 +756,7 @@ impl Store {
                 ]),
             )
             .map_err(map_engine_err)?;
-        Ok(!result.rows.is_empty())
+        Ok(!result.rows().is_empty())
     }
 
     fn digest_row_id(&self, id: DigestId, context_id: ContextId) -> Result<Option<RowId>> {
@@ -1099,7 +1103,7 @@ impl Store {
                         StateDeltaMergeError::Error(map_engine_err(err))
                     }
                 })?
-                .rows_affected;
+                .rows_affected();
             if inserted_link != 1 {
                 return Err(StateDeltaMergeError::Retry);
             }
@@ -1307,15 +1311,15 @@ impl Store {
             )
             .map_err(map_engine_err)?;
         let mut candidates = Vec::new();
-        for row in &result.rows {
-            let entity_id = EntityId::from(get_uuid(row, &result.columns, "target_id")?);
+        for row in result.rows() {
+            let entity_id = EntityId::from(get_uuid(row, result.columns(), "target_id")?);
             if entity_id == live_entity_id {
                 continue;
             }
             candidates.push(EntityBasisDecisionCandidate {
-                decision_id: DecisionId::from(get_uuid(row, &result.columns, "source_id")?),
+                decision_id: DecisionId::from(get_uuid(row, result.columns(), "source_id")?),
                 entity_id,
-                confidence: get_optional_float(row, &result.columns, "confidence")?,
+                confidence: get_optional_float(row, result.columns(), "confidence")?,
             });
         }
         candidates.sort_by_key(|candidate| (candidate.decision_id, candidate.entity_id));
@@ -1365,10 +1369,10 @@ impl Store {
                 ]),
             )
             .map_err(map_engine_err)?;
-        let Some(row) = result.rows.first() else {
+        let Some(row) = result.rows().first() else {
             return Ok(None);
         };
-        let score = get_optional_float(row, &result.columns, "score")?.ok_or_else(|| {
+        let score = get_optional_float(row, result.columns(), "score")?.ok_or_else(|| {
             CgError::Engine("entity reference vector search missing score".to_string())
         })?;
         Ok(Some(score as f32))
@@ -1393,7 +1397,7 @@ impl Store {
                 ]),
             )
             .map_err(map_engine_err)?;
-        let Some(row) = result.rows.first() else {
+        let Some(row) = result.rows().first() else {
             return Err(CgError::NotFound {
                 id: Some(decision_id.as_uuid().to_string()),
                 missing: Some("decision_basis_snapshot"),
@@ -1401,7 +1405,7 @@ impl Store {
         };
         Ok(EntitySnapshotId::from(get_uuid(
             row,
-            &result.columns,
+            result.columns(),
             "snapshot_id",
         )?))
     }
@@ -1483,13 +1487,13 @@ impl Store {
                 ]),
             )
             .map_err(map_engine_err)?;
-        if updated.rows_affected == 0 {
+        if updated.rows_affected() == 0 {
             return Ok(());
         }
-        if updated.rows_affected != 1 {
+        if updated.rows_affected() != 1 {
             return Err(CgError::Engine(format!(
                 "entity no-match invalidated {} decisions, expected 1",
-                updated.rows_affected
+                updated.rows_affected()
             )));
         }
 
@@ -1552,10 +1556,10 @@ impl Store {
                 &HashMap::from([("entity_id".to_string(), Value::Uuid(entity_id.as_uuid()))]),
             )
             .map_err(map_engine_err)?;
-        let Some(row) = pointer.rows.first() else {
+        let Some(row) = pointer.rows().first() else {
             return Ok(None);
         };
-        let snapshot_id = EntitySnapshotId::from(get_uuid(row, &pointer.columns, "snapshot_id")?);
+        let snapshot_id = EntitySnapshotId::from(get_uuid(row, pointer.columns(), "snapshot_id")?);
         let result = self
             .db
             .execute(
@@ -1564,9 +1568,9 @@ impl Store {
             )
             .map_err(map_engine_err)?;
         result
-            .rows
+            .rows()
             .first()
-            .map(|row| decode_snapshot_for_merge(&result.columns, row))
+            .map(|row| decode_snapshot_for_merge(result.columns(), row))
             .transpose()
     }
 
@@ -1583,14 +1587,14 @@ impl Store {
                 &HashMap::from([("id".to_string(), Value::Uuid(entity_id.as_uuid()))]),
             )
             .map_err(map_engine_err)?;
-        let Some(row) = result.rows.first() else {
+        let Some(row) = result.rows().first() else {
             return Err(CgError::NotFound {
                 id: Some(entity_id.as_uuid().to_string()),
                 missing: Some("entity"),
             });
         };
-        let entity_type = entity_type_from_str(&get_text(row, &result.columns, "entity_type")?)?;
-        let name = get_text(row, &result.columns, "name")?;
+        let entity_type = entity_type_from_str(&get_text(row, result.columns(), "entity_type")?)?;
+        let name = get_text(row, result.columns(), "name")?;
         Ok((entity_type_str(entity_type).to_string(), name))
     }
 }
@@ -1723,13 +1727,13 @@ pub(crate) fn get_observation(rows: &dyn GraphRows, id: ObservationId) -> Result
         "SELECT id, observation_type, observed_properties, state_delta, properties, source, entity_id, context_id, timestamp, created_at FROM observations WHERE id = $id",
         &params,
     )?;
-    if result.rows.is_empty() {
+    if result.rows().is_empty() {
         return Err(CgError::NotFound {
             id: Some(id.as_uuid().to_string()),
             missing: Some("observation"),
         });
     }
-    let mut observation = decode_observation(&result.columns, &result.rows[0])?;
+    let mut observation = decode_observation(result.columns(), &result.rows()[0])?;
     observation.evidence = list_evidence_for_observation(rows, id)?;
     Ok(observation)
 }
@@ -1756,9 +1760,9 @@ pub(crate) fn list_observations(
     };
     let result = rows.query_rows(sql, &params)?;
     let mut observations = result
-        .rows
+        .rows()
         .iter()
-        .map(|row| decode_observation(&result.columns, row))
+        .map(|row| decode_observation(result.columns(), row))
         .collect::<Result<Vec<_>>>()?;
     for observation in &mut observations {
         observation.evidence = list_evidence_for_observation(rows, observation.id)?;

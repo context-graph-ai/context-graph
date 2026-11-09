@@ -339,13 +339,13 @@ fn params(pairs: Vec<(&str, Value)>) -> HashMap<String, Value> {
 
 fn count(db: &Database, sql: &str, params: &HashMap<String, Value>) -> i64 {
     let result = db.execute(sql, params).expect("count query");
-    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.rows().len(), 1);
     assert!(
-        matches!(result.rows[0].first(), Some(Value::Int64(_))),
+        matches!(result.rows()[0].first(), Some(Value::Int64(_))),
         "expected count integer, got {:?}",
-        result.rows[0].first()
+        result.rows()[0].first()
     );
-    match result.rows[0][0] {
+    match result.rows()[0][0] {
         Value::Int64(value) => value,
         _ => 0,
     }
@@ -354,7 +354,7 @@ fn count(db: &Database, sql: &str, params: &HashMap<String, Value>) -> i64 {
 fn single_i64(db: &Database, sql: &str, params: &HashMap<String, Value>) -> Option<i64> {
     db.execute(sql, params)
         .ok()
-        .and_then(|result| result.rows.first().and_then(|row| row.first()).cloned())
+        .and_then(|result| result.rows().first().and_then(|row| row.first()).cloned())
         .and_then(|value| match value {
             Value::Int64(value) => Some(value),
             _ => None,
@@ -364,7 +364,7 @@ fn single_i64(db: &Database, sql: &str, params: &HashMap<String, Value>) -> Opti
 fn single_txid(db: &Database, sql: &str, params: &HashMap<String, Value>) -> Option<TxId> {
     db.execute(sql, params)
         .ok()
-        .and_then(|result| result.rows.first().and_then(|row| row.first()).cloned())
+        .and_then(|result| result.rows().first().and_then(|row| row.first()).cloned())
         .and_then(|value| match value {
             Value::TxId(value) => Some(value),
             _ => None,
@@ -374,7 +374,7 @@ fn single_txid(db: &Database, sql: &str, params: &HashMap<String, Value>) -> Opt
 fn single_uuid(db: &Database, sql: &str, params: &HashMap<String, Value>) -> Option<uuid::Uuid> {
     db.execute(sql, params)
         .ok()
-        .and_then(|result| result.rows.first().and_then(|row| row.first()).cloned())
+        .and_then(|result| result.rows().first().and_then(|row| row.first()).cloned())
         .and_then(|value| match value {
             Value::Uuid(value) => Some(value),
             _ => None,
@@ -388,7 +388,7 @@ fn stored_evidence_vision_vector(db: &Database, evidence_id: EvidenceId) -> Opti
             &params(vec![("id", Value::Uuid(evidence_id.as_uuid()))]),
         )
         .expect("evidence vision vector query");
-    result.rows.first().and_then(|row| match row.first() {
+    result.rows().first().and_then(|row| match row.first() {
         Some(Value::Vector(vector)) => Some(vector.clone()),
         _ => None,
     })

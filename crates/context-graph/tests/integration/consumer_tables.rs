@@ -11,6 +11,10 @@
 //! leave reachable rather than pre-empt with a message of its own; and that a
 //! consumer opening with a role — an edge, not the hub — is held to the
 //! `SCOPE_LABEL` its own declaration wrote down.
+#![allow(
+    clippy::result_large_err,
+    reason = "The engine's public error carries its refusal diagnostics inline (160+ bytes); this module passes it through unchanged."
+)]
 
 use std::collections::{BTreeSet, HashMap};
 
@@ -72,7 +76,7 @@ fn read_settings(store: &Store) -> Vec<(String, String)> {
             &no_params(),
         )
         .expect("read the consumer table back");
-    rows.rows
+    rows.rows()
         .iter()
         .map(|row| match (&row[0], &row[1]) {
             (Value::Text(name), Value::Text(requested)) => (name.clone(), requested.clone()),
@@ -572,7 +576,7 @@ fn hub_setting_names(store: &Store) -> Vec<String> {
             &no_params(),
         )
         .expect("read the consumer table back");
-    rows.rows
+    rows.rows()
         .iter()
         .map(|row| match &row[0] {
             Value::Text(name) => name.clone(),

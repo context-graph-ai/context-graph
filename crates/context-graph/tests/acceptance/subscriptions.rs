@@ -1,3 +1,7 @@
+#![allow(
+    clippy::result_large_err,
+    reason = "The engine's public error carries its refusal diagnostics inline (160+ bytes); this module passes it through unchanged."
+)]
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Barrier, Condvar, Mutex, MutexGuard};
@@ -1280,7 +1284,9 @@ fn per_context_fifo_ordering_preserved_under_concurrent_commits_via_lsn_ordering
     assert_eq!(payload_ids, committed_ids);
     drop(store);
     let raw = RawDatabase::open(&path).expect("open raw database");
-    let changes = raw.changes_since(Lsn(0));
+    let changes = raw
+        .changes_since(Lsn(0))
+        .expect("sync fixture call is accepted by the engine");
     for payload in captured {
         let decision_lsn = changes
             .rows

@@ -15,6 +15,7 @@ Must not own CLI rendering/exits, Claude JSON navigation, node config IO or a lo
 | Shared typed graph SQL/decoding | `src/store/graph_rows.rs` |
 | Consumer read declaration and executor | `src/consumer_read.rs`, `src/consumer_read/graph.rs` |
 | Administrative owner requests | `src/owner_control.rs` |
+| Writable open: waiting for readers, the per-path registry | `src/store/mod.rs` (`open_bootstrapped_database`, `Slot`), `src/store/open_retry.rs` (`reader_wait_deadline`) |
 | In-process status totals | `src/status_reads.rs` |
 | Embedding trait and spaces | `src/embedder.rs`, `src/embedding_space.rs` |
 | Bundled Nomic and its cache root | `src/embedder/nomic.rs` under default `nomic-embedder` feature |
@@ -36,6 +37,14 @@ Ownership boundaries above are review-only architectural constraints unless a gu
   `a_live_owner_answers_a_control_frame_addressed_only_by_the_store_path` and
   `a_store_nobody_holds_answers_owner_not_running_without_running_any_handler`.
   Review-only: direct fallback requires typed owner absence; timeout never licenses fallback.
+- A writable open makes one engine open with the caller's reader-wait deadline
+  (`owner_control::READER_RELEASE_ALLOWANCE`) and has no reader retry loop; an already-spent
+  deadline gives the immediate held-by-readers refusal. The registry marks a path `Opening` and
+  releases its lock for that open, so only openers of the same path wait.
+  Guard: `tests/a_real_store_open_is_refused_by_the_readers_holding_it.rs`:
+  `a_real_context_graph_open_is_refused_by_the_live_readers_holding_the_store`; command level,
+  `../cg-cli/tests/a_busy_store_is_told_to_the_operator.rs`:
+  `a_command_refused_by_a_reader_held_store_names_the_readers_it_waits_on`.
 - Status totals use bounded reads. Review-only: the only guard,
   `tests/status_totals_are_bounded_on_a_large_store.rs`:
   `status_totals_stay_correct_and_bounded_on_a_store_no_single_read_can_cross`, is `#[ignore]`d
@@ -80,6 +89,15 @@ For deterministic reads, adapt ContextDB's existing `DeadlineClock` through the 
 Both timing-site arms in `tests/test_estate_audit.rs` include private test modules; only default-tier
 test counting excludes them. Never park a fixture in a pre-commit callback while its sibling
 needs an engine read fence; rendezvous before the real statements enter that commit phase.
+
+Engine answers (`QueryResult`, `CursorPage`) are immutable and borrowed: read them through `rows()`
+and `columns()` and clone only the values you keep; build an answer of your own with `QueryResult::new`.
+Read-only cursors return `ConsumerPage`, an owned page, because narrowing a table-keyed `SHOW` answer
+to the declared tables is context-graph's rule and the engine cannot build a page from filtered rows.
+Guard: `tests/a_read_only_consumer_sees_only_what_it_declared.rs`:
+`a_table_keyed_show_answers_only_about_the_tables_the_consumer_declared` and, for cursor pages,
+`a_table_keyed_show_read_through_a_cursor_names_only_the_declared_tables`.
+Engine errors are large (160+ bytes), so modules that pass them through allow `clippy::result_large_err`.
 
 Fast check: `cargo test -p context-graph --test event_capture --test read_memory_policy`.
 Full gate: `scripts/gate.sh`. Public contracts live in [library API](../../docs/library-api.md)

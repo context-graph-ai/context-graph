@@ -296,7 +296,8 @@ impl TicketedMemoryFixture {
             store.sync_database(),
             &dial_spec,
             TenantId::from(&self.tenant_id),
-        );
+        )
+        .expect("sync fixture call is accepted by the engine");
         TicketedMemoryNode { store, client }
     }
 
@@ -322,11 +323,10 @@ pub async fn ticketed_memory_fixture(test_name: &str) -> TicketedMemoryFixture {
     .await
     .expect("bind ticketed Iroh hub");
     let ticket = endpoint.ticket();
-    let server = Arc::new(SyncServer::new(
-        hub.sync_database(),
-        &endpoint,
-        TenantId::from(&tenant_id),
-    ));
+    let server = Arc::new(
+        SyncServer::new(hub.sync_database(), &endpoint, TenantId::from(&tenant_id))
+            .expect("sync fixture call is accepted by the engine"),
+    );
     let shutdown = Arc::new(AtomicBool::new(false));
     let server_task = tokio::spawn({
         let server = Arc::clone(&server);
@@ -403,6 +403,7 @@ pub async fn unavailable_authenticated_client(
         &edge_db_path.with_extension("fabric-identity.key"),
     );
     SyncClient::new(db, &dial_spec, TenantId::from(tenant_id))
+        .expect("sync fixture call is accepted by the engine")
 }
 
 impl TestStore {
@@ -914,7 +915,8 @@ impl PreClientSyncFixture {
             self.edge1.store.sync_database(),
             &edge1_dial_spec,
             TenantId::from(&self.tenant_id),
-        );
+        )
+        .expect("sync fixture call is accepted by the engine");
         let edge2_dial_spec = contextdb_server::peer_dial_spec(
             &self.ticket,
             &self.edge2.db_path.with_extension("fabric-identity.key"),
@@ -923,7 +925,8 @@ impl PreClientSyncFixture {
             self.edge2.store.sync_database(),
             &edge2_dial_spec,
             TenantId::from(&self.tenant_id),
-        );
+        )
+        .expect("sync fixture call is accepted by the engine");
         (edge1_client, edge2_client)
     }
 }
@@ -959,6 +962,7 @@ impl RealSyncFixture {
     ) -> SyncClient {
         let dial_spec = contextdb_server::peer_dial_spec(&self.remote_url, identity_path);
         SyncClient::new(db, &dial_spec, TenantId::from(&self.tenant_id))
+            .expect("sync fixture call is accepted by the engine")
     }
 }
 
@@ -972,11 +976,14 @@ pub async fn real_sync_fixture(test_name: &str) -> RealSyncFixture {
     .await
     .expect("bind authenticated fixture hub");
     let remote_url = endpoint.ticket();
-    let server = Arc::new(SyncServer::new(
-        hub.store.sync_database(),
-        &endpoint,
-        TenantId::from(&tenant_id),
-    ));
+    let server = Arc::new(
+        SyncServer::new(
+            hub.store.sync_database(),
+            &endpoint,
+            TenantId::from(&tenant_id),
+        )
+        .expect("sync fixture call is accepted by the engine"),
+    );
     let shutdown = Arc::new(AtomicBool::new(false));
     let server_task = {
         let server = Arc::clone(&server);
@@ -996,7 +1003,8 @@ pub async fn real_sync_fixture(test_name: &str) -> RealSyncFixture {
         edge1.store.sync_database(),
         &edge1_dial_spec,
         TenantId::from(&tenant_id),
-    );
+    )
+    .expect("sync fixture call is accepted by the engine");
     let edge2_dial_spec = contextdb_server::peer_dial_spec(
         &remote_url,
         &edge2.db_path.with_extension("fabric-identity.key"),
@@ -1005,7 +1013,8 @@ pub async fn real_sync_fixture(test_name: &str) -> RealSyncFixture {
         edge2.store.sync_database(),
         &edge2_dial_spec,
         TenantId::from(&tenant_id),
-    );
+    )
+    .expect("sync fixture call is accepted by the engine");
     RealSyncFixture {
         _hub: hub,
         edge1,
@@ -1030,11 +1039,14 @@ pub async fn self_echo_sync_fixture(test_name: &str) -> SelfEchoSyncFixture {
     .await
     .expect("bind authenticated self-echo hub");
     let ticket = endpoint.ticket();
-    let server = Arc::new(SyncServer::new(
-        hub.store.sync_database(),
-        &endpoint,
-        TenantId::from(&tenant_id),
-    ));
+    let server = Arc::new(
+        SyncServer::new(
+            hub.store.sync_database(),
+            &endpoint,
+            TenantId::from(&tenant_id),
+        )
+        .expect("sync fixture call is accepted by the engine"),
+    );
     let shutdown = Arc::new(AtomicBool::new(false));
     let server_task = {
         let server = Arc::clone(&server);
@@ -1051,7 +1063,8 @@ pub async fn self_echo_sync_fixture(test_name: &str) -> SelfEchoSyncFixture {
         node.store.sync_database(),
         &dial_spec,
         TenantId::from(&tenant_id),
-    );
+    )
+    .expect("sync fixture call is accepted by the engine");
     SelfEchoSyncFixture {
         _hub: hub,
         node,
@@ -1071,11 +1084,14 @@ pub async fn pre_client_sync_fixture(test_name: &str) -> PreClientSyncFixture {
     .await
     .expect("bind pre-client authenticated hub");
     let ticket = endpoint.ticket();
-    let server = Arc::new(SyncServer::new(
-        hub.store.sync_database(),
-        &endpoint,
-        TenantId::from(&tenant_id),
-    ));
+    let server = Arc::new(
+        SyncServer::new(
+            hub.store.sync_database(),
+            &endpoint,
+            TenantId::from(&tenant_id),
+        )
+        .expect("sync fixture call is accepted by the engine"),
+    );
     let shutdown = Arc::new(AtomicBool::new(false));
     let server_task = {
         let server = Arc::clone(&server);

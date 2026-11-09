@@ -263,13 +263,13 @@ fn a_typed_active_time_refusal_retains_committed_passages_and_resumes() {
         );
     }
     let store = open(&config);
-    let rows = store
+    let rows_answer = store
         .execute_sql_for_test(
             "SELECT id FROM event_search_passages WHERE context_id = $context_id",
             &HashMap::from([("context_id".into(), Value::Uuid(context_id.as_uuid()))]),
         )
-        .expect("read published passages")
-        .rows;
+        .expect("read published passages");
+    let rows = rows_answer.rows();
     let ids = rows
         .iter()
         .map(|row| format!("{:?}", row[0]))
@@ -641,7 +641,7 @@ fn commit_later_begun_audit_transaction(
             &HashMap::from([("id".into(), Value::Uuid(id))]),
         )
         .expect("read intervening transaction");
-    match committed.rows.as_slice() {
+    match committed.rows() {
         [row] => match row.as_slice() {
             [Value::TxId(committed)] => *committed,
             other => panic!("intervening row has no committed TXID: {other:?}"),
@@ -657,7 +657,8 @@ fn attempt_owner_row(config: &StoreConfig, context_id: ContextId) -> Vec<Value> 
             &HashMap::from([("context_id".into(), Value::Uuid(context_id.as_uuid()))]),
         )
         .expect("read the competing owner's committed identity")
-        .rows;
+        .rows()
+        .to_vec();
     assert_eq!(rows.len(), 1, "one generation owns this fixture Context");
     rows.remove(0)
 }
@@ -716,7 +717,7 @@ fn projection_attempts_and_completion_keep_their_committed_identity_when_commits
             &HashMap::from([("id".into(), Value::Uuid(receipt.generation_id.as_uuid()))]),
         )
         .expect("read committed completion");
-    assert_eq!(stored.rows, vec![vec![Value::TxId(completed)]]);
+    assert_eq!(stored.rows(), vec![vec![Value::TxId(completed)]]);
     drop(interleaved);
 
     let store = open(&config);
@@ -1051,7 +1052,7 @@ struct CommittedProjection {
 }
 
 fn committed_projection(store: &Store, context_id: ContextId) -> CommittedProjection {
-    let passages = store
+    let passages_answer = store
         .execute_sql_for_test(
             "SELECT passage_ordinal, first_event_sequence, last_event_sequence, rendered_text, content_sha256, vector_text, dimension FROM event_search_passages WHERE context_id = $context_id AND is_current = $current ORDER BY passage_ordinal ASC",
             &HashMap::from([
@@ -1059,8 +1060,8 @@ fn committed_projection(store: &Store, context_id: ContextId) -> CommittedProjec
                 ("current".into(), Value::Bool(true)),
             ]),
         )
-        .expect("inspect committed passage order, content, and vectors")
-        .rows;
+        .expect("inspect committed passage order, content, and vectors");
+    let passages = passages_answer.rows();
     let status = store
         .event_history_status(ContextSelector::one(context_id))
         .expect("inspect committed coverage")
@@ -1071,25 +1072,26 @@ fn committed_projection(store: &Store, context_id: ContextId) -> CommittedProjec
         &HashMap::from([("context_id".into(), Value::Uuid(context_id.as_uuid())), ("current".into(), Value::Bool(true))]),
     ).unwrap();
     let mut sources = Vec::new();
-    for passage in passage_ids.rows {
+    for passage in passage_ids.rows() {
         let links = store.execute_sql_for_test(
             "SELECT event_id, source_order, event_start_byte, event_end_byte, passage_start_byte, passage_end_byte FROM event_search_passage_sources WHERE passage_id = $passage_id ORDER BY source_order ASC",
             &HashMap::from([("passage_id".into(), passage[0].clone())]),
         ).unwrap();
-        for mut link in links.rows {
+        for link in links.rows() {
+            let mut link = link.clone();
             let event = store
                 .execute_sql_for_test(
                     "SELECT seq FROM events WHERE id = $event_id",
                     &HashMap::from([("event_id".into(), link[0].clone())]),
                 )
                 .unwrap();
-            link[0] = event.rows[0][0].clone();
+            link[0] = event.rows()[0][0].clone();
             link.insert(0, passage[1].clone());
             sources.push(link);
         }
     }
     CommittedProjection {
-        passages,
+        passages: passages.to_vec(),
         sources,
         coverage: (
             status.captured_events,
@@ -1131,7 +1133,7 @@ fn current_passages(store: &Store, context_id: ContextId) -> Vec<(uuid::Uuid, St
         )
         .expect("inspect current passages");
     result
-        .rows
+        .rows()
         .iter()
         .map(|row| match (&row[0], &row[1]) {
             (Value::Uuid(id), Value::Text(text)) => (*id, text.clone()),
@@ -1152,7 +1154,7 @@ fn searchable_current_passages(store: &Store, context_id: ContextId) -> Vec<(uui
         )
         .expect("inspect searchable current passages");
     result
-        .rows
+        .rows()
         .iter()
         .map(|row| match (&row[0], &row[1]) {
             (Value::Uuid(id), Value::Text(text)) => (*id, text.clone()),
@@ -1168,7 +1170,7 @@ fn all_passage_count(store: &Store, context_id: ContextId) -> usize {
             &HashMap::from([("context_id".into(), Value::Uuid(context_id.as_uuid()))]),
         )
         .expect("inspect every passage row")
-        .rows
+        .rows()
         .len()
 }
 
@@ -1360,7 +1362,7 @@ fn committed_cursor_sequences(
         )
         .expect("inspect committed event-search cursors");
     result
-        .rows
+        .rows()
         .iter()
         .map(|row| match row.as_slice() {
             [Value::Int64(sequence)] => {
@@ -1378,7 +1380,7 @@ fn generation_count(store: &Store, context_id: ContextId) -> usize {
             &HashMap::from([("context_id".into(), Value::Uuid(context_id.as_uuid()))]),
         )
         .expect("inspect search generations")
-        .rows
+        .rows()
         .len()
 }
 
@@ -2100,13 +2102,13 @@ fn invalid_profile_preserves_an_in_progress_build() {
         .expect_err("the second batch fails after the first one commits");
 
     let store = open(&config);
-    let generation_rows = store
+    let generation_rows_answer = store
         .execute_sql_for_test(
             "SELECT id, state, sanitized_failure, eligible_event_count, rendered_event_count, embedded_event_count, passage_count FROM event_search_generations WHERE context_id = $context_id ORDER BY id ASC",
             &HashMap::from([("context_id".into(), Value::Uuid(context_id.as_uuid()))]),
         )
-        .expect("snapshot building generation rows")
-        .rows;
+        .expect("snapshot building generation rows");
+    let generation_rows = generation_rows_answer.rows();
     let failure_reason = store
         .event_history_status(ContextSelector::one(context_id))
         .expect("status after deterministic failure")
@@ -2114,13 +2116,13 @@ fn invalid_profile_preserves_an_in_progress_build() {
         .remove(0)
         .search
         .last_failure;
-    let cursor_rows = store
+    let cursor_rows_answer = store
         .execute_sql_for_test(
             "SELECT generation_id, source_instance_ref, committed_sequence, open_tail_start_sequence, open_tail_passage_id, watermark_sha256 FROM event_search_cursors WHERE context_id = $context_id ORDER BY generation_id ASC, source_instance_ref ASC",
             &HashMap::from([("context_id".into(), Value::Uuid(context_id.as_uuid()))]),
         )
-        .expect("snapshot committed cursor rows")
-        .rows;
+        .expect("snapshot committed cursor rows");
+    let cursor_rows = cursor_rows_answer.rows();
     let passages = current_passages(&store, context_id);
     let passage_count = all_passage_count(&store, context_id);
     assert_eq!(generation_rows.len(), 1, "one generation remains building");
@@ -2243,7 +2245,7 @@ fn invalid_profile_preserves_an_in_progress_build() {
                 &HashMap::from([("context_id".into(), Value::Uuid(context_id.as_uuid()))]),
             )
             .expect("resnapshot building generation rows")
-            .rows,
+            .rows(),
         generation_rows,
         "the invalid public run leaves every building-generation field unchanged"
     );
@@ -2265,7 +2267,7 @@ fn invalid_profile_preserves_an_in_progress_build() {
                 &HashMap::from([("context_id".into(), Value::Uuid(context_id.as_uuid()))]),
             )
             .expect("resnapshot committed cursor rows")
-            .rows,
+            .rows(),
         cursor_rows,
         "the invalid public run leaves committed cursors unchanged"
     );
@@ -2832,7 +2834,7 @@ fn an_append_during_rebuild_finalization_is_caught_up_before_the_head_switches()
             &params,
         )
         .expect("inspect search head")
-        .rows[0][0]
+        .rows()[0][0]
         .clone();
     let head_event_count = store
         .execute_sql_for_test(
@@ -2840,7 +2842,7 @@ fn an_append_during_rebuild_finalization_is_caught_up_before_the_head_switches()
             &HashMap::from([("id".into(), head)]),
         )
         .expect("inspect head generation")
-        .rows[0][0]
+        .rows()[0][0]
         .clone();
 
     assert_eq!(
@@ -2935,7 +2937,7 @@ fn lease_rows(store: &Store, context_id: ContextId) -> usize {
             &HashMap::from([("context_id".into(), Value::Uuid(context_id.as_uuid()))]),
         )
         .expect("inspect projection leases")
-        .rows
+        .rows()
         .len()
 }
 
@@ -3078,7 +3080,7 @@ fn lease_expiries(store: &Store, context_id: ContextId) -> Vec<(String, i64)> {
             &HashMap::from([("context_id".into(), Value::Uuid(context_id.as_uuid()))]),
         )
         .expect("inspect lease rows")
-        .rows
+        .rows()
         .iter()
         .map(|row| match (&row[0], &row[1]) {
             (Value::Text(owner), Value::Timestamp(expires_at)) => (owner.clone(), *expires_at),
@@ -3846,7 +3848,7 @@ fn attempt_rows(config: &StoreConfig, context_id: ContextId) -> Vec<Vec<Value>> 
     open(config).execute_sql_for_test(
         "SELECT id, started_at, last_attempt_at, sanitized_failure FROM event_search_generations WHERE context_id = $context_id ORDER BY started_at ASC",
         &HashMap::from([("context_id".into(), Value::Uuid(context_id.as_uuid()))]),
-    ).unwrap().rows
+    ).unwrap().rows().to_vec()
 }
 
 fn consumer_search(
@@ -3962,13 +3964,13 @@ fn attempt_chronology_follows_resumption_and_activation_instead_of_generation_cr
         after[1], two_failed[1],
         "activation leaves the competing failure as historical metadata"
     );
-    let head = open(&config)
+    let head_answer = open(&config)
         .execute_sql_for_test(
             "SELECT activated_at FROM event_search_heads WHERE context_id = $context_id",
             &HashMap::from([("context_id".into(), Value::Uuid(context_id.as_uuid()))]),
         )
-        .unwrap()
-        .rows;
+        .unwrap();
+    let head = head_answer.rows();
     let (Value::TxId(activated), Value::TxId(attempt)) = (&head[0][0], &after[0][2]) else {
         panic!("activation and attempt TXIDs")
     };
@@ -4363,7 +4365,7 @@ fn open_tail_loads_only_text_members_across_a_long_metadata_suffix() {
     );
     let sources = store.execute_sql_for_test("SELECT source_order, event_start_byte, event_end_byte FROM event_search_passage_sources WHERE context_id = $context_id ORDER BY source_order ASC", &HashMap::from([("context_id".into(), Value::Uuid(context.as_uuid()))])).unwrap();
     assert_eq!(
-        sources.rows.len(),
+        sources.rows().len(),
         2,
         "metadata never becomes a passage source"
     );
@@ -4401,7 +4403,7 @@ fn missing_or_mismatched_open_tail_member_ids_are_refused_before_embedding() {
         .unwrap();
         let store = open(&cfg);
         let metadata = store.execute_sql_for_test("SELECT membership_id FROM event_search_source_events WHERE context_id = $context_id AND source_sequence = 2", &HashMap::from([("context_id".into(), Value::Uuid(context.as_uuid()))])).unwrap();
-        let Value::Uuid(metadata_id) = metadata.rows[0][0] else {
+        let Value::Uuid(metadata_id) = metadata.rows()[0][0] else {
             panic!("membership UUID");
         };
         let corrupt = match corruption {
@@ -4810,12 +4812,12 @@ fn current_source_sequences(store: &Store, passage_id: uuid::Uuid) -> Vec<i64> {
     store.execute_sql_for_test(
         "SELECT event_id FROM event_search_passage_sources WHERE passage_id = $passage_id ORDER BY source_order ASC",
         &HashMap::from([("passage_id".into(), Value::Uuid(passage_id))]),
-    ).expect("read current passage source links").rows.into_iter().map(|row| {
+    ).expect("read current passage source links").rows().iter().map(|row| {
         let event = store.execute_sql_for_test(
             "SELECT seq FROM events WHERE id = $event_id",
             &HashMap::from([("event_id".into(), row[0].clone())]),
         ).expect("read linked event sequence");
-        match event.rows[0][0] {
+        match event.rows()[0][0] {
             Value::Int64(sequence) => sequence,
             ref other => panic!("event sequence is not an integer: {other:?}"),
         }
@@ -4866,8 +4868,8 @@ fn searchable_session_order(store: &Store, context_id: ContextId) -> Vec<String>
             ]),
         )
         .expect("read searchable session order")
-        .rows
-        .into_iter()
+        .rows()
+        .iter()
         .map(|row| match &row[0] {
             Value::Text(value) => value.clone(),
             other => panic!("session_ref is not text: {other:?}"),
@@ -5366,7 +5368,7 @@ fn reopened_published_tail_updates_session_and_generation_coverage_atomically() 
         )
         .expect("read independent transactional session progress");
     assert_eq!(
-        progress.rows,
+        progress.rows(),
         vec![vec![
             Value::Int64(2),
             Value::Int64(2),

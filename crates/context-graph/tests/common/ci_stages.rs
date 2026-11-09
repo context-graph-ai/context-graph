@@ -263,7 +263,7 @@ fn model_contract_matches(
         && format!("{:x}", Sha256::digest(core.0))
             == "9feafef445a5364998c90178048e781f08b9840595a311f9f7bf620b2c0798d9"
         && format!("{:x}", Sha256::digest(core.1))
-            == "b7139130b299fd226fcccabab8c06b0e58c3881577e6aa763ce49421b692cc60"
+            == "2efd8d48d63ef13306f36b6c89af6b28cd719a848b31ad0d8e7a5587f7dc9f0e"
 }
 
 fn shard_contract_is_frozen(script: &str) -> bool {
@@ -363,11 +363,11 @@ fn shard_contract_is_frozen(script: &str) -> bool {
         && format!(
             "{:x}",
             Sha256::digest(include_bytes!("../../../../Cargo.toml"))
-        ) == "871a8c130d3dbc7e88d4da615dafdd83ec25cfac85b170cd75f673a0a4d376d7"
+        ) == "adf17ecfbb043fe6bfb29fbb97829a5a035f85536f6d71c217bbea4a80596c7a"
         && format!(
             "{:x}",
             Sha256::digest(include_bytes!("../../../../Cargo.lock"))
-        ) == "b44b27b83f71c94adff4eddf806d4d5a9ed3f0535f94c44255cdf149bac1afd2"
+        ) == "a5ca5f6ffb1fa0ccbbd83b375783c346236032ef7905fffcaa68c66c0e5e79d3"
         && format!(
             "{:x}",
             Sha256::digest(include_bytes!(

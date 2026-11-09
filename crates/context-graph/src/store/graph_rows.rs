@@ -9,6 +9,10 @@
 //!
 //! Refusals are already this crate's own by the time they come back: each executor converts the
 //! engine's error at its own edge, so a read written here never sees the substrate's vocabulary.
+#![allow(
+    clippy::result_large_err,
+    reason = "The engine's public error carries its refusal diagnostics inline (160+ bytes); this module passes it through unchanged."
+)]
 
 use std::collections::HashMap;
 
@@ -75,21 +79,24 @@ impl crate::Store {
             .map_err(super::convert::map_engine_err)?;
         let paged = (|| -> Result<QueryResult> {
             let first = cursor.first_page();
-            let mut answer = QueryResult {
-                columns: first.columns.clone(),
-                rows: first.rows.clone(),
-                ..QueryResult::empty()
-            };
-            let mut has_more = first.has_more;
+            let mut columns = first.columns().to_vec();
+            let mut rows = first.rows().to_vec();
+            let mut has_more = first.has_more();
             while has_more {
                 let page = cursor.fetch(None).map_err(super::convert::map_engine_err)?;
-                if answer.columns.is_empty() {
-                    answer.columns = page.columns;
+                if columns.is_empty() {
+                    columns = page.columns().to_vec();
                 }
-                answer.rows.extend(page.rows);
-                has_more = page.has_more;
+                rows.extend(page.rows().iter().cloned());
+                has_more = page.has_more();
             }
-            Ok(answer)
+            Ok(QueryResult::new(
+                columns,
+                rows,
+                0,
+                contextdb_engine::QueryTrace::scan(),
+                None,
+            ))
         })();
         let closed = cursor.close().map_err(super::convert::map_engine_err);
         let answer = paged?;
@@ -141,10 +148,15 @@ impl crate::Store {
     pub(crate) fn read_table(&self, table: &str) -> Result<Vec<ReadRow>> {
         let answer = self.read_query(&format!("SELECT * FROM {table}"), &HashMap::new())?;
         Ok(answer
-            .rows
-            .into_iter()
+            .rows()
+            .iter()
             .map(|row| ReadRow {
-                values: answer.columns.iter().cloned().zip(row).collect(),
+                values: answer
+                    .columns()
+                    .iter()
+                    .cloned()
+                    .zip(row.iter().cloned())
+                    .collect(),
             })
             .collect())
     }

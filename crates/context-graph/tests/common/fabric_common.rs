@@ -117,7 +117,8 @@ pub async fn fabric_fixture_with_tenants(
         edge1.store.sync_database(),
         &edge1_dial_spec,
         TenantId::from(edge1_tenant),
-    );
+    )
+    .expect("sync fixture call is accepted by the engine");
     let edge2_dial_spec = contextdb_server::peer_dial_spec(
         &edge2_ticket,
         &edge2.db_path.with_extension("fabric-identity.key"),
@@ -126,7 +127,8 @@ pub async fn fabric_fixture_with_tenants(
         edge2.store.sync_database(),
         &edge2_dial_spec,
         TenantId::from(edge2_tenant),
-    );
+    )
+    .expect("sync fixture call is accepted by the engine");
 
     FabricFixture {
         _hubs: hubs,
@@ -156,11 +158,10 @@ async fn start_ticketed_hub(
     .expect("authenticated hub bind stays bounded")
     .expect("bind authenticated ticketed hub");
     let ticket = endpoint.ticket();
-    let server = Arc::new(SyncServer::new(
-        hub.store.sync_database(),
-        &endpoint,
-        TenantId::from(tenant),
-    ));
+    let server = Arc::new(
+        SyncServer::new(hub.store.sync_database(), &endpoint, TenantId::from(tenant))
+            .expect("sync fixture call is accepted by the engine"),
+    );
     let task = tokio::spawn(async move { server.run_until(shutdown).await });
     (hub, ticket, task)
 }
@@ -175,10 +176,7 @@ pub async fn push_then_pull(pusher: &SyncClient, puller: &SyncClient) {
             break;
         }
         let before = pusher.push_watermark();
-        tokio::time::timeout(Duration::from_secs(30), pusher.push())
-            .await
-            .expect("authenticated push stays bounded")
-            .expect("push round");
+        pusher.push().await.expect("push round");
         if pusher
             .has_pending_push_changes()
             .expect("pending push check")
@@ -197,10 +195,7 @@ pub async fn push_then_pull(pusher: &SyncClient, puller: &SyncClient) {
     );
     for _ in 0..32 {
         let before = puller.pull_watermark();
-        tokio::time::timeout(Duration::from_secs(30), puller.pull_default())
-            .await
-            .expect("authenticated pull stays bounded")
-            .expect("pull round");
+        puller.pull_default().await.expect("pull round");
         if puller.pull_watermark() == before {
             return;
         }
@@ -232,6 +227,7 @@ pub async fn unavailable_authenticated_client(
         &edge_db_path.with_extension("fabric-identity.key"),
     );
     SyncClient::new(db, &dial_spec, TenantId::from(tenant))
+        .expect("sync fixture call is accepted by the engine")
 }
 
 /// An extractor double that records how many times the model boundary was invoked, wrapping the

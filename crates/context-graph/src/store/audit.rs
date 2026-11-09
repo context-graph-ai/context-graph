@@ -193,9 +193,9 @@ pub(crate) fn audit_query(rows: &dyn GraphRows, filter: AuditFilter) -> Result<V
         sql.push_str(&clauses.join(" AND "));
     }
     let result = rows.query_rows(&sql, &params)?;
-    let mut all: Vec<AuditEntry> = Vec::with_capacity(result.rows.len());
-    for row in &result.rows {
-        all.push(decode_audit_entry(&result.columns, row)?);
+    let mut all: Vec<AuditEntry> = Vec::with_capacity(result.rows().len());
+    for row in result.rows() {
+        all.push(decode_audit_entry(result.columns(), row)?);
     }
 
     let mut out: Vec<AuditEntry> = Vec::with_capacity(all.len());

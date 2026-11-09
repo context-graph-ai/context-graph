@@ -285,7 +285,7 @@ impl Store {
                     &HashMap::from([("id".to_string(), Value::Uuid(intention_id.as_uuid()))]),
                 )
                 .map_err(map_engine_err)?;
-            let Some(row) = result.rows.first() else {
+            let Some(row) = result.rows().first() else {
                 return Err(CgError::IntentionNotFound { id: *intention_id });
             };
             let found_context = match row.first() {
@@ -399,7 +399,7 @@ impl Store {
             .map_err(map_engine_err)?;
         let mut latest_by_evidence_space =
             HashMap::<(uuid::Uuid, String), DecisionReasoningProducerSnapshot>::new();
-        for row in &result.rows {
+        for row in result.rows() {
             let snapshot = decode_decision_reasoning_producer_snapshot(row)?;
             let key = (snapshot.evidence_id, snapshot.embedding_space_id.clone());
             latest_by_evidence_space
@@ -436,7 +436,12 @@ impl Store {
             .db
             .execute_at_snapshot(sql, &params, snapshot)
             .map_err(map_engine_err)?;
-        ordered_snapshot_ids(&result.columns, &result.rows, "basis_order", "snapshot_id")
+        ordered_snapshot_ids(
+            result.columns(),
+            result.rows(),
+            "basis_order",
+            "snapshot_id",
+        )
     }
 
     pub(super) fn insert_decision_basis_snapshots_in_tx(
@@ -534,7 +539,7 @@ impl Store {
             .into_iter()
             .collect();
         let result = self.read_query("SELECT context_id FROM decisions WHERE id = $id", &params)?;
-        match result.rows.first().and_then(|r| r.first()) {
+        match result.rows().first().and_then(|r| r.first()) {
             Some(Value::Uuid(u)) => Ok(Some(ContextId::from(*u))),
             Some(_) => Err(CgError::Engine("decisions.context_id non-uuid".to_string())),
             None => Ok(None),
@@ -567,8 +572,8 @@ impl Store {
             "SELECT source_id FROM edges WHERE target_id = $target_id AND edge_type = $edge_type",
             &params,
         )?;
-        let mut out = Vec::with_capacity(result.rows.len());
-        for row in &result.rows {
+        let mut out = Vec::with_capacity(result.rows().len());
+        for row in result.rows() {
             if let Some(Value::Uuid(u)) = row.first() {
                 out.push(DecisionId::from(*u));
             }
@@ -588,8 +593,8 @@ impl Store {
             "SELECT entity_id FROM decision_basis_snapshots WHERE decision_id = $decision_id",
             &params,
         )?;
-        let mut out = Vec::with_capacity(result.rows.len());
-        for row in &result.rows {
+        let mut out = Vec::with_capacity(result.rows().len());
+        for row in result.rows() {
             if let Some(Value::Uuid(u)) = row.first() {
                 let entity = EntityId::from(*u);
                 if !out.contains(&entity) {
@@ -616,8 +621,8 @@ impl Store {
             .db
             .execute_at_snapshot(sql, &params, snapshot)
             .map_err(map_engine_err)?;
-        let mut ids = Vec::with_capacity(result.rows.len());
-        for row in &result.rows {
+        let mut ids = Vec::with_capacity(result.rows().len());
+        for row in result.rows() {
             if let Some(Value::Uuid(id)) = row.first() {
                 ids.push(DecisionId::from(*id));
             }
@@ -646,10 +651,10 @@ impl Store {
             .db
             .execute_at_snapshot(anchor_sql, &params, snapshot)
             .map_err(map_engine_err)?;
-        if anchor.rows.is_empty() {
+        if anchor.rows().is_empty() {
             return Err(CgError::IntentionNotFound { id: intention_id });
         }
-        let anchor_context_id = match anchor.rows[0].as_slice() {
+        let anchor_context_id = match anchor.rows()[0].as_slice() {
             [_, Value::Uuid(context_id), ..] => ContextId::from(*context_id),
             other => {
                 return Err(CgError::Engine(format!(
@@ -686,7 +691,7 @@ impl Store {
             .db
             .execute_at_snapshot(&sql, &params, snapshot)
             .map_err(map_engine_err)?;
-        self.decode_discovery_decisions_at_read(&result.columns, &result.rows, snapshot)
+        self.decode_discovery_decisions_at_read(result.columns(), result.rows(), snapshot)
     }
 
     /// Additive SERVES routing (the reconciliation writer seam): attach an
@@ -710,7 +715,7 @@ impl Store {
                 return Err(map_engine_err(error));
             }
         };
-        let Some(row) = result.rows.first() else {
+        let Some(row) = result.rows().first() else {
             let _ = self.db.rollback(tx);
             return Err(CgError::DecisionNotFound { id: decision_id });
         };
@@ -734,7 +739,7 @@ impl Store {
                 return Err(map_engine_err(error));
             }
         };
-        let Some(intention_row) = intention.rows.first() else {
+        let Some(intention_row) = intention.rows().first() else {
             let _ = self.db.rollback(tx);
             return Err(CgError::IntentionNotFound { id: intention_id });
         };
@@ -758,7 +763,7 @@ impl Store {
                 return Err(map_engine_err(error));
             }
         };
-        if !existing.rows.is_empty() {
+        if !existing.rows().is_empty() {
             let _ = self.db.rollback(tx);
             return Ok(());
         }
@@ -824,7 +829,7 @@ impl Store {
             .db
             .execute_at_snapshot(sql, &params, snapshot)
             .map_err(map_engine_err)?;
-        self.decode_discovery_decisions_at_read(&result.columns, &result.rows, snapshot)
+        self.decode_discovery_decisions_at_read(result.columns(), result.rows(), snapshot)
     }
 
     pub fn by_entity_decisions(
@@ -845,13 +850,13 @@ impl Store {
             .db
             .execute_at_snapshot(anchor_sql, &params, snapshot)
             .map_err(map_engine_err)?;
-        if anchor.rows.is_empty() {
+        if anchor.rows().is_empty() {
             return Err(CgError::NotFound {
                 id: Option::from(entity_id.as_uuid().to_string()),
                 missing: Option::from("entity"),
             });
         }
-        let anchor_context_id = match anchor.rows[0].as_slice() {
+        let anchor_context_id = match anchor.rows()[0].as_slice() {
             [_, Value::Uuid(context_id), ..] => ContextId::from(*context_id),
             other => {
                 return Err(CgError::Engine(format!(
@@ -895,7 +900,7 @@ impl Store {
             .db
             .execute_at_snapshot(&sql, &params, snapshot)
             .map_err(map_engine_err)?;
-        self.decode_discovery_decisions_at_read(&result.columns, &result.rows, snapshot)
+        self.decode_discovery_decisions_at_read(result.columns(), result.rows(), snapshot)
     }
 
     pub fn by_entity_intentions(
@@ -915,7 +920,7 @@ impl Store {
             .db
             .execute_at_snapshot(anchor_sql, &params, snapshot)
             .map_err(map_engine_err)?;
-        if anchor.rows.is_empty() {
+        if anchor.rows().is_empty() {
             return Err(CgError::NotFound {
                 id: Option::from(entity_id.as_uuid().to_string()),
                 missing: Option::from("entity"),
@@ -961,9 +966,9 @@ impl Store {
             .execute_at_snapshot(&sql, &params, snapshot)
             .map_err(map_engine_err)?;
         result
-            .rows
+            .rows()
             .iter()
-            .map(|row| decode_intention(&result.columns, row))
+            .map(|row| decode_intention(result.columns(), row))
             .collect()
     }
 
@@ -1429,7 +1434,7 @@ impl Store {
                     "SELECT target_id FROM edges WHERE source_id = $source_id AND edge_type = $edge_type",
                     &params,
                 )?;
-            match result.rows.first().and_then(|r| r.first()) {
+            match result.rows().first().and_then(|r| r.first()) {
                 Some(Value::Uuid(u)) => cursor = DecisionId::from(*u),
                 _ => break,
             }
@@ -1575,7 +1580,7 @@ impl Store {
                 "SELECT id FROM edges WHERE source_id = $source_id AND target_id = $target_id AND edge_type = $edge_type",
                 &params,
             )?;
-        Ok(!result.rows.is_empty())
+        Ok(!result.rows().is_empty())
     }
 
     pub fn decision_targets_intention(
@@ -1598,7 +1603,7 @@ impl Store {
                 "SELECT id FROM edges WHERE source_id = $source_id AND target_id = $target_id AND edge_type = $edge_type",
                 &params,
             )?;
-        Ok(!result.rows.is_empty())
+        Ok(!result.rows().is_empty())
     }
 
     pub fn decision_targets_entity(
@@ -1621,7 +1626,7 @@ impl Store {
                 "SELECT id FROM edges WHERE source_id = $source_id AND target_id = $target_id AND edge_type = $edge_type",
                 &params,
             )?;
-        Ok(!result.rows.is_empty())
+        Ok(!result.rows().is_empty())
     }
 
     pub fn incoming_supersedes(&self, decision_id: DecisionId) -> Result<Vec<DecisionId>> {
@@ -1638,8 +1643,8 @@ impl Store {
             "SELECT source_id FROM edges WHERE target_id = $target_id AND edge_type = $edge_type",
             &params,
         )?;
-        let mut out = Vec::with_capacity(result.rows.len());
-        for row in &result.rows {
+        let mut out = Vec::with_capacity(result.rows().len());
+        for row in result.rows() {
             if let Some(Value::Uuid(u)) = row.first() {
                 out.push(DecisionId::from(*u));
             }
@@ -1659,13 +1664,13 @@ impl Store {
                 snapshot,
             )
             .map_err(map_engine_err)?;
-        let Some(row) = decision_rows.rows.first() else {
+        let Some(row) = decision_rows.rows().first() else {
             return Err(CgError::NotFound {
                 id: Some(id.as_uuid().to_string()),
                 missing: Some("decision"),
             });
         };
-        let mut decision = decode_decision_raw(&decision_rows.columns, row)?;
+        let mut decision = decode_decision_raw(decision_rows.columns(), row)?;
         decision.based_on_snapshots = self.basis_snapshot_ids_for_decision_at_read(id, snapshot)?;
         decision.intention_ids =
             self.intentions_for_decision_at_read(id, decision.context_id, snapshot)?;
@@ -1761,8 +1766,8 @@ impl Store {
             .db
             .execute_at_snapshot(sql, &params, snapshot)
             .map_err(map_engine_err)?;
-        let mut ids = Vec::with_capacity(result.rows.len());
-        for row in &result.rows {
+        let mut ids = Vec::with_capacity(result.rows().len());
+        for row in result.rows() {
             if let Some(Value::Uuid(id)) = row.first() {
                 ids.push(IntentionId::from(*id));
             }
@@ -1782,9 +1787,9 @@ impl Store {
             .execute_at_snapshot(sql, &params, snapshot)
             .map_err(map_engine_err)?;
         result
-            .rows
+            .rows()
             .first()
-            .map(|row| decode_outcome(&result.columns, row))
+            .map(|row| decode_outcome(result.columns(), row))
             .transpose()
     }
 
@@ -1834,13 +1839,13 @@ impl Store {
             )
             .map_err(map_engine_err)?;
         let supply_order_idx = result
-            .columns
+            .columns()
             .iter()
             .position(|column| column == "supply_order")
             .unwrap_or(usize::MAX);
-        let mut rows = Vec::with_capacity(result.rows.len());
-        for row in &result.rows {
-            let mut evidence = decode_evidence(&result.columns, row)?;
+        let mut rows = Vec::with_capacity(result.rows().len());
+        for row in result.rows() {
+            let mut evidence = decode_evidence(result.columns(), row)?;
             if let Some(status) = self.evidence_status_at_snapshot(evidence.id, snapshot)? {
                 evidence.retention_status = status;
             }
@@ -1875,14 +1880,14 @@ impl Store {
                 snapshot,
             )
             .map_err(map_engine_err)?;
-        let citation_row = citation.rows.first().ok_or_else(|| {
+        let citation_row = citation.rows().first().ok_or_else(|| {
             CgError::Engine(format!(
                 "data-integrity: decision {} has no immutable intention citation for {}",
                 decision.id, intention_id
             ))
         })?;
         let snapshot_id =
-            IntentionSnapshotId::from(get_uuid(citation_row, &citation.columns, "snapshot_id")?);
+            IntentionSnapshotId::from(get_uuid(citation_row, citation.columns(), "snapshot_id")?);
         let result = self
             .db
             .execute_at_snapshot(
@@ -1896,9 +1901,9 @@ impl Store {
             )
             .map_err(map_engine_err)?;
         result
-            .rows
+            .rows()
             .first()
-            .map(|row| decode_intention_snapshot_at_read(&result.columns, row))
+            .map(|row| decode_intention_snapshot_at_read(result.columns(), row))
             .transpose()?
             .ok_or_else(|| {
                 CgError::Engine(format!(
@@ -1924,9 +1929,9 @@ impl Store {
                 snapshot,
             )
             .map_err(map_engine_err)?;
-        let mut rows = Vec::with_capacity(result.rows.len());
-        for row in &result.rows {
-            rows.push(decode_invalidation_at_read(&result.columns, row)?);
+        let mut rows = Vec::with_capacity(result.rows().len());
+        for row in result.rows() {
+            rows.push(decode_invalidation_at_read(result.columns(), row)?);
         }
         rows.sort_by_key(|row| row.detected_at);
         Ok(rows)
@@ -2191,10 +2196,10 @@ pub(crate) fn get_decision(rows: &dyn GraphRows, id: DecisionId) -> Result<Optio
         "SELECT id, decision_type, description, reasoning, confidence, status, agent_id, context_id, properties, tags, created_at FROM decisions WHERE id = $id",
         &params,
     )?;
-    if result.rows.is_empty() {
+    if result.rows().is_empty() {
         return Ok(None);
     }
-    let mut decision = decode_decision_raw(&result.columns, &result.rows[0])?;
+    let mut decision = decode_decision_raw(result.columns(), &result.rows()[0])?;
     decision.intention_ids = intentions_for_decision(rows, id)?;
     decision.based_on_snapshots = basis_snapshots_for_decision(rows, id)?;
     decision.outcome = outcome_for_decision(rows, id)?;
@@ -2216,8 +2221,8 @@ fn intentions_for_decision(rows: &dyn GraphRows, id: DecisionId) -> Result<Vec<I
         "SELECT target_id FROM edges WHERE source_id = $source_id AND edge_type = $edge_type ORDER BY id ASC",
         &params,
     )?;
-    let mut out = Vec::with_capacity(result.rows.len());
-    for row in &result.rows {
+    let mut out = Vec::with_capacity(result.rows().len());
+    for row in result.rows() {
         if let Some(Value::Uuid(u)) = row.first() {
             out.push(IntentionId::from(*u));
         }
@@ -2236,7 +2241,12 @@ fn basis_snapshots_for_decision(
         "SELECT snapshot_id, basis_order FROM decision_basis_snapshots WHERE decision_id = $decision_id",
         &HashMap::from([("decision_id".to_string(), Value::Uuid(id.as_uuid()))]),
     )?;
-    ordered_snapshot_ids(&result.columns, &result.rows, "basis_order", "snapshot_id")
+    ordered_snapshot_ids(
+        result.columns(),
+        result.rows(),
+        "basis_order",
+        "snapshot_id",
+    )
 }
 
 /// One decision's outcome, or the answered absence when nobody has recorded one.
@@ -2253,10 +2263,10 @@ pub(super) fn outcome_for_decision(
         "SELECT id, decision_id, success, notes, recorded_at FROM outcomes WHERE decision_id = $decision_id",
         &params,
     )?;
-    if result.rows.is_empty() {
+    if result.rows().is_empty() {
         return Ok(None);
     }
-    Some(decode_outcome(&result.columns, &result.rows[0])).transpose()
+    Some(decode_outcome(result.columns(), &result.rows()[0])).transpose()
 }
 
 /// The decisions one decision CITES as precedent, inside its own context.

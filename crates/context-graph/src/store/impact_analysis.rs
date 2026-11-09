@@ -1,3 +1,7 @@
+#![allow(
+    clippy::result_large_err,
+    reason = "The engine's public error carries its refusal diagnostics inline (160+ bytes); this module passes it through unchanged."
+)]
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 use contextdb_core::{Error as EngineError, TxId, Value};
@@ -43,9 +47,10 @@ fn run_impact_analysis(db: &Database, ctx: &TriggerContext) -> contextdb_core::R
     let state_delta = match ctx.row_values.get("state_delta") {
         Some(Value::Json(value)) => state_delta_from_json(value.clone()).map_err(cg_to_engine)?,
         other => {
-            return Err(EngineError::Other(format!(
-                "impact analysis expected observations.state_delta json, got {other:?}"
-            )));
+            return Err(EngineError::Other(
+                format!("impact analysis expected observations.state_delta json, got {other:?}")
+                    .into(),
+            ));
         }
     };
     if state_delta.is_empty() {
@@ -292,10 +297,10 @@ fn active_decision_details_by_id(
         &params,
     )?;
     let mut out = HashMap::with_capacity(decision_ids.len());
-    for row in &result.rows {
+    for row in result.rows() {
         out.insert(
-            row_uuid(row, &result.columns, "id")?,
-            row_optional_float(row, &result.columns, "confidence")?,
+            row_uuid(row, result.columns(), "id")?,
+            row_optional_float(row, result.columns(), "confidence")?,
         );
     }
     Ok(out)
@@ -317,9 +322,9 @@ fn active_based_on_decisions(
         ]),
     )?;
     let mut basis_fields_by_decision = BTreeMap::new();
-    for row in &result.rows {
-        let decision_id = row_uuid(row, &result.columns, "source_id")?;
-        let properties = row_json(row, &result.columns, "properties")?;
+    for row in result.rows() {
+        let decision_id = row_uuid(row, result.columns(), "source_id")?;
+        let properties = row_json(row, result.columns(), "properties")?;
         basis_fields_by_decision.insert(decision_id, basis_fields_from_edge(&properties));
     }
     let decision_ids = basis_fields_by_decision.keys().copied().collect::<Vec<_>>();
@@ -377,13 +382,13 @@ fn basis_snapshots_for_decision_entity_many(
         &params,
     )?;
     let mut basis_rows = result
-        .rows
+        .rows()
         .iter()
         .map(|row| {
             Ok((
-                row_uuid(row, &result.columns, "decision_id")?,
-                row_uuid(row, &result.columns, "snapshot_id")?,
-                row_i64(row, &result.columns, "basis_order")?,
+                row_uuid(row, result.columns(), "decision_id")?,
+                row_uuid(row, result.columns(), "snapshot_id")?,
+                row_i64(row, result.columns(), "basis_order")?,
             ))
         })
         .collect::<contextdb_core::Result<Vec<_>>>()?;
@@ -424,10 +429,10 @@ fn entity_snapshots_by_id(
         ),
         &params,
     )?;
-    let mut out = HashMap::with_capacity(result.rows.len());
-    for row in &result.rows {
-        let id = row_uuid(row, &result.columns, "id")?;
-        let data = row_json(row, &result.columns, "data")?;
+    let mut out = HashMap::with_capacity(result.rows().len());
+    for row in result.rows() {
+        let id = row_uuid(row, result.columns(), "id")?;
+        let data = row_json(row, result.columns(), "data")?;
         let properties = match data.get("properties") {
             Some(JsonValue::Object(map)) => map
                 .iter()
@@ -439,7 +444,7 @@ fn entity_snapshots_by_id(
             id,
             BasisSnapshot {
                 id,
-                entity_id: row_uuid(row, &result.columns, "entity_id")?,
+                entity_id: row_uuid(row, result.columns(), "entity_id")?,
                 properties,
             },
         );
@@ -526,9 +531,9 @@ fn serves_intentions_many(
         &params,
     )?;
     let mut target_ids = result
-        .rows
+        .rows()
         .iter()
-        .map(|row| row_uuid(row, &result.columns, "target_id"))
+        .map(|row| row_uuid(row, result.columns(), "target_id"))
         .collect::<contextdb_core::Result<Vec<_>>>()?;
     target_ids.sort();
     target_ids.dedup();
@@ -539,9 +544,9 @@ fn serves_intentions_many(
     for decision_id in decision_ids {
         out.insert(decision_id, Vec::new());
     }
-    for row in &result.rows {
-        let source_id = row_uuid(row, &result.columns, "source_id")?;
-        let target_id = row_uuid(row, &result.columns, "target_id")?;
+    for row in result.rows() {
+        let source_id = row_uuid(row, result.columns(), "source_id")?;
+        let target_id = row_uuid(row, result.columns(), "target_id")?;
         if context_intentions.contains(&target_id) {
             out.entry(source_id).or_default().push(target_id);
         }
@@ -598,12 +603,12 @@ fn active_servers_for_intentions_many(
         &params,
     )?;
     let edge_rows = result
-        .rows
+        .rows()
         .iter()
         .map(|row| {
             Ok((
-                row_uuid(row, &result.columns, "target_id")?,
-                row_uuid(row, &result.columns, "source_id")?,
+                row_uuid(row, result.columns(), "target_id")?,
+                row_uuid(row, result.columns(), "source_id")?,
             ))
         })
         .collect::<contextdb_core::Result<Vec<_>>>()?;
@@ -708,10 +713,13 @@ fn append_cascade_rows(
         return Ok(());
     }
     if db.trigger_cascade_depth_cap() <= CASCADE_DEPTH_CAP {
-        return Err(EngineError::Other(format!(
-            "engine trigger depth cap {} is not above cg cascade cap {CASCADE_DEPTH_CAP}",
-            db.trigger_cascade_depth_cap()
-        )));
+        return Err(EngineError::Other(
+            format!(
+                "engine trigger depth cap {} is not above cg cascade cap {CASCADE_DEPTH_CAP}",
+                db.trigger_cascade_depth_cap()
+            )
+            .into(),
+        ));
     }
     let direct_ids = direct_rows
         .iter()
@@ -834,9 +842,9 @@ fn cites_edges_by_target(
     for target_id in target_ids {
         out.insert(target_id, Vec::new());
     }
-    for row in &result.rows {
-        let target_id = row_uuid(row, &result.columns, "target_id")?;
-        let source_id = row_uuid(row, &result.columns, "source_id")?;
+    for row in result.rows() {
+        let target_id = row_uuid(row, result.columns(), "target_id")?;
+        let source_id = row_uuid(row, result.columns(), "source_id")?;
         out.entry(target_id).or_default().push(source_id);
     }
     for citers in out.values_mut() {
@@ -871,12 +879,15 @@ fn transition_decisions_to_invalidated(
         ),
         &params,
     )?;
-    if result.rows_affected != decision_ids.len() as u64 {
-        return Err(EngineError::Other(format!(
-            "impact analysis invalidated {} active decisions, expected {}",
-            result.rows_affected,
-            decision_ids.len()
-        )));
+    if result.rows_affected() != decision_ids.len() as u64 {
+        return Err(EngineError::Other(
+            format!(
+                "impact analysis invalidated {} active decisions, expected {}",
+                result.rows_affected(),
+                decision_ids.len()
+            )
+            .into(),
+        ));
     }
     Ok(())
 }
@@ -907,15 +918,16 @@ fn insert_invalidation_rows(
     let mut values_sql = Vec::with_capacity(rows.len());
     for (index, row) in rows.iter().enumerate() {
         let basis_diff = serde_json::to_value(&row.basis_diff)
-            .map_err(|err| EngineError::Other(format!("basis diff serialize: {err}")))?;
+            .map_err(|err| EngineError::Other(format!("basis diff serialize: {err}").into()))?;
         let threatened_ids = row
             .threatened_intention_ids
             .iter()
             .copied()
             .map(IntentionId::from)
             .collect::<Vec<_>>();
-        let threatened = serde_json::to_value(threatened_ids)
-            .map_err(|err| EngineError::Other(format!("threatened intentions serialize: {err}")))?;
+        let threatened = serde_json::to_value(threatened_ids).map_err(|err| {
+            EngineError::Other(format!("threatened intentions serialize: {err}").into())
+        })?;
         let id_key = format!("id_{index}");
         let affected_key = format!("affected_decision_id_{index}");
         let basis_diff_key = format!("basis_diff_{index}");
@@ -954,12 +966,15 @@ fn insert_invalidation_rows(
         ),
         &params,
     )?;
-    if result.rows_affected != rows.len() as u64 {
-        return Err(EngineError::Other(format!(
-            "impact analysis inserted {} invalidation rows, expected {}",
-            result.rows_affected,
-            rows.len()
-        )));
+    if result.rows_affected() != rows.len() as u64 {
+        return Err(EngineError::Other(
+            format!(
+                "impact analysis inserted {} invalidation rows, expected {}",
+                result.rows_affected(),
+                rows.len()
+            )
+            .into(),
+        ));
     }
     Ok(())
 }
@@ -991,9 +1006,9 @@ fn invalidation_severity_str(severity: InvalidationSeverity) -> &'static str {
 fn required_uuid(values: &HashMap<String, Value>, name: &str) -> contextdb_core::Result<Uuid> {
     match values.get(name) {
         Some(Value::Uuid(value)) => Ok(*value),
-        other => Err(EngineError::Other(format!(
-            "impact analysis expected {name} uuid, got {other:?}"
-        ))),
+        other => Err(EngineError::Other(
+            format!("impact analysis expected {name} uuid, got {other:?}").into(),
+        )),
     }
 }
 
@@ -1001,15 +1016,15 @@ fn col(columns: &[String], name: &str) -> contextdb_core::Result<usize> {
     columns
         .iter()
         .position(|column| column == name)
-        .ok_or_else(|| EngineError::Other(format!("impact analysis missing column {name}")))
+        .ok_or_else(|| EngineError::Other(format!("impact analysis missing column {name}").into()))
 }
 
 fn row_uuid(row: &[Value], columns: &[String], name: &str) -> contextdb_core::Result<Uuid> {
     match row.get(col(columns, name)?) {
         Some(Value::Uuid(value)) => Ok(*value),
-        other => Err(EngineError::Other(format!(
-            "impact analysis expected {name} uuid, got {other:?}"
-        ))),
+        other => Err(EngineError::Other(
+            format!("impact analysis expected {name} uuid, got {other:?}").into(),
+        )),
     }
 }
 
@@ -1017,23 +1032,21 @@ fn row_json(row: &[Value], columns: &[String], name: &str) -> contextdb_core::Re
     match row.get(col(columns, name)?) {
         Some(Value::Json(value)) => Ok(value.clone()),
         Some(Value::Text(value)) => serde_json::from_str(value).map_err(|err| {
-            EngineError::Other(format!(
-                "impact analysis invalid json text in {name}: {err}"
-            ))
+            EngineError::Other(format!("impact analysis invalid json text in {name}: {err}").into())
         }),
         Some(Value::Null) | None => Ok(JsonValue::Null),
-        other => Err(EngineError::Other(format!(
-            "impact analysis expected {name} json, got {other:?}"
-        ))),
+        other => Err(EngineError::Other(
+            format!("impact analysis expected {name} json, got {other:?}").into(),
+        )),
     }
 }
 
 fn row_i64(row: &[Value], columns: &[String], name: &str) -> contextdb_core::Result<i64> {
     match row.get(col(columns, name)?) {
         Some(Value::Int64(value)) => Ok(*value),
-        other => Err(EngineError::Other(format!(
-            "impact analysis expected {name} integer, got {other:?}"
-        ))),
+        other => Err(EngineError::Other(
+            format!("impact analysis expected {name} integer, got {other:?}").into(),
+        )),
     }
 }
 
@@ -1051,9 +1064,9 @@ fn ids_in_context(
     let table = match table {
         "intentions" => "intentions",
         other => {
-            return Err(EngineError::Other(format!(
-                "impact analysis cannot context-filter table {other}"
-            )));
+            return Err(EngineError::Other(
+                format!("impact analysis cannot context-filter table {other}").into(),
+            ));
         }
     };
     let mut params = HashMap::from([("context_id".to_string(), Value::Uuid(context_id))]);
@@ -1064,9 +1077,9 @@ fn ids_in_context(
         &params,
     )?;
     result
-        .rows
+        .rows()
         .iter()
-        .map(|row| row_uuid(row, &result.columns, "id"))
+        .map(|row| row_uuid(row, result.columns(), "id"))
         .collect()
 }
 
@@ -1078,12 +1091,12 @@ fn row_optional_float(
     match row.get(col(columns, name)?) {
         Some(Value::Float64(value)) => Ok(Some(*value)),
         Some(Value::Null) | None => Ok(None),
-        other => Err(EngineError::Other(format!(
-            "impact analysis expected {name} float|null, got {other:?}"
-        ))),
+        other => Err(EngineError::Other(
+            format!("impact analysis expected {name} float|null, got {other:?}").into(),
+        )),
     }
 }
 
 fn cg_to_engine(error: crate::error::CgError) -> EngineError {
-    EngineError::Other(format!("impact analysis: {error}"))
+    EngineError::Other(format!("impact analysis: {error}").into())
 }

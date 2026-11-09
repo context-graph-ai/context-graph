@@ -595,7 +595,14 @@ fn column_mismatch(declared: &DeclaredColumn, stored: &StoredColumn, mismatches:
         max_partitions,
         search_mode,
         auto_index_at,
-        hnsw,
+        // The engine's own vector-tuning clauses. A consumer declaration does not carry them:
+        // this release ships exact vector search only, so the verifier compares the search mode
+        // and the vector shape (type, quantization, partitioning) and nothing index-specific.
+        auto_expansion_ceiling: _,
+        flat_below: _,
+        search: _,
+        ivf: _,
+        engine_policy: _,
         consolidation,
         rank_policy,
         context_id,
@@ -714,14 +721,6 @@ fn column_mismatch(declared: &DeclaredColumn, stored: &StoredColumn, mismatches:
             format!("{auto_index_at:?}"),
             format!("{stored_auto_index_at:?}"),
         );
-    }
-    let declared_hnsw =
-        hnsw.m.is_some() || hnsw.ef_construction.is_some() || hnsw.ef_search.is_some();
-    let stored_hnsw = stored.hnsw_m.is_some()
-        || stored.hnsw_ef_construction.is_some()
-        || stored.hnsw_ef_search.is_some();
-    if declared_hnsw != stored_hnsw {
-        differs("HNSW", declared_hnsw.to_string(), stored_hnsw.to_string());
     }
     let declared_consolidation = consolidation.disabled
         || consolidation.change_percent.is_some()

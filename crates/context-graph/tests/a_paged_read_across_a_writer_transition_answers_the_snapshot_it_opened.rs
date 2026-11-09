@@ -334,14 +334,14 @@ fn a_cursor_opened_before_the_handover_finishes_the_read_it_opened() {
         .expect("open a cursor on the paged read");
     let first = cursor.first_page().expect("the first page").clone();
     assert!(
-        first.has_more,
+        first.has_more(),
         "this proof needs a read that cannot be answered in one page; the first page carried {} \
          rows and reported no more",
-        first.rows.len()
+        first.rows().len()
     );
     let mut seen = Vec::new();
-    for row in &first.rows {
-        seen.push(seq_of(row, &first.columns));
+    for row in first.rows() {
+        seen.push(seq_of(row, first.columns()));
     }
 
     // The writer that was holding the store goes, and a different process opens and commits rows
@@ -357,15 +357,15 @@ fn a_cursor_opened_before_the_handover_finishes_the_read_it_opened() {
 
     // The rest of the read the cursor opened.
     let mut fetches = Vec::new();
-    let mut has_more = first.has_more;
+    let mut has_more = first.has_more();
     while has_more {
         match cursor.fetch(None) {
             Ok(page) => {
-                has_more = page.has_more;
-                for row in &page.rows {
-                    seen.push(seq_of(row, &page.columns));
+                has_more = page.has_more();
+                for row in page.rows() {
+                    seen.push(seq_of(row, page.columns()));
                 }
-                fetches.push(Ok(page.rows.len()));
+                fetches.push(Ok(page.rows().len()));
             }
             Err(error) => {
                 fetches.push(Err(format!("{error:?}")));
@@ -439,9 +439,9 @@ fn a_statement_crossing_the_handover_answers_the_route_that_took_over() {
             &params(fixture.context_id),
         )
         .expect("a statement crossing a writer handover is answered, never left hanging");
-    let row = answered.rows.first().expect("one aggregate row");
+    let row = answered.rows().first().expect("one aggregate row");
     let index = answered
-        .columns
+        .columns()
         .iter()
         .position(|column| column == "n")
         .expect("the count names n");

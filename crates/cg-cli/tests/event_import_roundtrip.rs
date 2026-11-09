@@ -946,9 +946,9 @@ fn importing_history_writes_events_and_passages_and_no_graph_rows() {
                 &HashMap::new(),
             )
             .expect("bounded table total");
-        assert_eq!(result.rows.len(), 1, "one aggregate row for {table}");
-        assert_eq!(result.rows[0].len(), 1, "one aggregate value for {table}");
-        match result.rows[0][0] {
+        assert_eq!(result.rows().len(), 1, "one aggregate row for {table}");
+        assert_eq!(result.rows()[0].len(), 1, "one aggregate value for {table}");
+        match result.rows()[0][0] {
             contextdb_core::Value::Int64(value) => value,
             ref value => panic!("integer total for {table}, got {value:?}"),
         }

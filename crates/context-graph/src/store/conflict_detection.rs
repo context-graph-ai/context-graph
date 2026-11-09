@@ -1,3 +1,7 @@
+#![allow(
+    clippy::result_large_err,
+    reason = "The engine's public error carries its refusal diagnostics inline (160+ bytes); this module passes it through unchanged."
+)]
 use std::collections::{BTreeSet, HashMap};
 
 use contextdb_core::{Error as EngineError, TxId, Value};
@@ -83,9 +87,9 @@ fn run_conflict_detection(db: &Database, ctx: &TriggerContext) -> contextdb_core
         "decisions" => required_uuid(&ctx.row_values, "id")?,
         "outcomes" => required_uuid(&ctx.row_values, "decision_id")?,
         other => {
-            return Err(EngineError::Other(format!(
-                "conflict detection fired for unsupported table {other}"
-            )));
+            return Err(EngineError::Other(
+                format!("conflict detection fired for unsupported table {other}").into(),
+            ));
         }
     };
     detect_conflicts_for_decision(db, ctx.tx, decision_id)
@@ -142,8 +146,9 @@ fn insert_conflict_row(
         .copied()
         .map(IntentionId::from)
         .collect::<Vec<_>>();
-    let threatened_json = serde_json::to_value(threatened_ids)
-        .map_err(|err| EngineError::Other(format!("conflict intentions serialize: {err}")))?;
+    let threatened_json = serde_json::to_value(threatened_ids).map_err(|err| {
+        EngineError::Other(format!("conflict intentions serialize: {err}").into())
+    })?;
     let params = HashMap::from([
         (
             "id".to_string(),
@@ -197,15 +202,15 @@ fn decision_projection(
         "SELECT id, context_id, decision_type, status, created_at FROM decisions WHERE id = $id",
         &HashMap::from([("id".to_string(), Value::Uuid(decision_id))]),
     )?;
-    let Some(row) = result.rows.first() else {
+    let Some(row) = result.rows().first() else {
         return Ok(None);
     };
     Ok(Some(DecisionProjection {
-        id: row_uuid(row, &result.columns, "id")?,
-        context_id: row_uuid(row, &result.columns, "context_id")?,
-        decision_type: row_text(row, &result.columns, "decision_type")?,
-        status: row_text(row, &result.columns, "status")?,
-        created_at: row_txid(row, &result.columns, "created_at")?,
+        id: row_uuid(row, result.columns(), "id")?,
+        context_id: row_uuid(row, result.columns(), "context_id")?,
+        decision_type: row_text(row, result.columns(), "decision_type")?,
+        status: row_text(row, result.columns(), "status")?,
+        created_at: row_txid(row, result.columns(), "created_at")?,
     }))
 }
 
@@ -224,9 +229,9 @@ fn outcome_success(
         ]),
     )?;
     result
-        .rows
+        .rows()
         .first()
-        .map(|row| row_bool(row, &result.columns, "success"))
+        .map(|row| row_bool(row, result.columns(), "success"))
         .transpose()
 }
 
@@ -246,9 +251,9 @@ fn based_on_entities(
         ]),
     )?;
     result
-        .rows
+        .rows()
         .iter()
-        .map(|row| row_uuid(row, &result.columns, "target_id"))
+        .map(|row| row_uuid(row, result.columns(), "target_id"))
         .collect()
 }
 
@@ -273,12 +278,12 @@ fn active_candidates_on_entity(
         ]),
     )?;
     result
-        .rows
+        .rows()
         .iter()
         .map(|row| {
             Ok(Candidate {
-                id: row_uuid(row, &result.columns, "id")?,
-                created_at: row_txid(row, &result.columns, "created_at")?,
+                id: row_uuid(row, result.columns(), "id")?,
+                created_at: row_txid(row, result.columns(), "created_at")?,
             })
         })
         .collect()
@@ -316,18 +321,18 @@ fn served_intentions(
         ]),
     )?;
     result
-        .rows
+        .rows()
         .iter()
-        .map(|row| row_uuid(row, &result.columns, "target_id"))
+        .map(|row| row_uuid(row, result.columns(), "target_id"))
         .collect()
 }
 
 fn required_uuid(values: &HashMap<String, Value>, column: &str) -> contextdb_core::Result<Uuid> {
     match values.get(column) {
         Some(Value::Uuid(value)) => Ok(*value),
-        other => Err(EngineError::Other(format!(
-            "conflict detection expected {column} uuid, got {other:?}"
-        ))),
+        other => Err(EngineError::Other(
+            format!("conflict detection expected {column} uuid, got {other:?}").into(),
+        )),
     }
 }
 
@@ -335,42 +340,42 @@ fn column_index(columns: &[String], column: &str) -> contextdb_core::Result<usiz
     columns
         .iter()
         .position(|name| name == column)
-        .ok_or_else(|| EngineError::Other(format!("missing column {column}")))
+        .ok_or_else(|| EngineError::Other(format!("missing column {column}").into()))
 }
 
 fn row_uuid(row: &[Value], columns: &[String], column: &str) -> contextdb_core::Result<Uuid> {
     match row.get(column_index(columns, column)?) {
         Some(Value::Uuid(value)) => Ok(*value),
-        other => Err(EngineError::Other(format!(
-            "expected {column} uuid, got {other:?}"
-        ))),
+        other => Err(EngineError::Other(
+            format!("expected {column} uuid, got {other:?}").into(),
+        )),
     }
 }
 
 fn row_text(row: &[Value], columns: &[String], column: &str) -> contextdb_core::Result<String> {
     match row.get(column_index(columns, column)?) {
         Some(Value::Text(value)) => Ok(value.clone()),
-        other => Err(EngineError::Other(format!(
-            "expected {column} text, got {other:?}"
-        ))),
+        other => Err(EngineError::Other(
+            format!("expected {column} text, got {other:?}").into(),
+        )),
     }
 }
 
 fn row_bool(row: &[Value], columns: &[String], column: &str) -> contextdb_core::Result<bool> {
     match row.get(column_index(columns, column)?) {
         Some(Value::Bool(value)) => Ok(*value),
-        other => Err(EngineError::Other(format!(
-            "expected {column} bool, got {other:?}"
-        ))),
+        other => Err(EngineError::Other(
+            format!("expected {column} bool, got {other:?}").into(),
+        )),
     }
 }
 
 fn row_txid(row: &[Value], columns: &[String], column: &str) -> contextdb_core::Result<TxId> {
     match row.get(column_index(columns, column)?) {
         Some(Value::TxId(value)) => Ok(*value),
-        other => Err(EngineError::Other(format!(
-            "expected {column} txid, got {other:?}"
-        ))),
+        other => Err(EngineError::Other(
+            format!("expected {column} txid, got {other:?}").into(),
+        )),
     }
 }
 

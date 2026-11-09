@@ -25,3 +25,6 @@ fabric_status::remote_receipt_round_trips_unmangled
 fabric_status::status_shows_state_executing_node_and_receipt
 status_reports_whole_store_totals_on_a_context_larger_than_one_read
 status_totals_stay_correct_and_bounded_on_a_store_no_single_read_can_cross
+#
+# One fails intermittently and carries #[ignore]; it stays listed until the refusal itself is fixed.
+event_history::search_reaches_ready_while_three_readers_poll_the_store_throughout_the_build

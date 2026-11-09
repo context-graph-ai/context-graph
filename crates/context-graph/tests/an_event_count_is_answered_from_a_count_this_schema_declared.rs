@@ -83,7 +83,11 @@ fn disclosure(
     params: &HashMap<String, Value>,
 ) -> Option<MaintainedCountDisclosure> {
     let result = reader.execute(sql, params).expect("the count answers");
-    result.trace.maintained_count.map(|boxed| *boxed)
+    result
+        .trace()
+        .maintained_count
+        .as_ref()
+        .map(|boxed| (**boxed).clone())
 }
 
 fn context_params(fixture: &Fixture) -> HashMap<String, Value> {

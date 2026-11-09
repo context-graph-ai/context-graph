@@ -1,3 +1,7 @@
+#![allow(
+    clippy::result_large_err,
+    reason = "The engine's public error carries its refusal diagnostics inline (160+ bytes); this module passes it through unchanged."
+)]
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -356,17 +360,17 @@ fn engine_contexts(contexts: &[uuid::Uuid]) -> BTreeSet<contextdb_core::ContextI
 
 fn engine_uuid_set(result: &contextdb_engine::QueryResult, column: &str) -> BTreeSet<uuid::Uuid> {
     let idx = result
-        .columns
+        .columns()
         .iter()
         .position(|candidate| candidate == column || candidate.rsplit('.').next() == Some(column));
     assert!(
         idx.is_some(),
         "column {column} not found in {:?}",
-        result.columns
+        result.columns()
     );
     let idx = idx.unwrap();
     result
-        .rows
+        .rows()
         .iter()
         .map(|row| match &row[idx] {
             Value::Uuid(id) => *id,
@@ -1101,7 +1105,9 @@ fn call_names_in_function(source: &str) -> Vec<String> {
 }
 
 fn assert_only_allowed_calls(method: &str, source: &str, allowed_calls: &[&str]) {
-    let allowed = allowed_calls.iter().copied().collect::<BTreeSet<&str>>();
+    let mut allowed = allowed_calls.iter().copied().collect::<BTreeSet<&str>>();
+    // The engine's answer accessors read a result already produced; they compute nothing.
+    allowed.extend(["rows", "columns"]);
     for call in call_names_in_function(source) {
         assert!(
             allowed.contains(call.as_str()),
@@ -1114,6 +1120,7 @@ fn assert_no_candidate_work_before_result(method: &str, source: &str) {
     let allowed = [
         "as_uuid",
         "as_slice",
+        "columns",
         "decision_statuses_for_discovery",
         "Engine",
         "Err",
@@ -1127,6 +1134,7 @@ fn assert_no_candidate_work_before_result(method: &str, source: &str) {
         "map_err",
         "new",
         "Ok",
+        "rows",
         "snapshot",
         "sql_string_list",
         "to_string",
@@ -1279,9 +1287,9 @@ fn assert_discovery_result_return_shape(method: &str, source: &str) {
     let end = after_sql.find("let result =").unwrap();
     let result_source = compact_source(&after_sql[end..]);
     let expected = if method.contains("by_entity_intentions") {
-        "let result = self .db .execute_at_snapshot(&sql, &params, snapshot) .map_err(map_engine_err)?; result .rows .iter() .map(|row| decode_intention(&result.columns, row)) .collect()"
+        "let result = self .db .execute_at_snapshot(&sql, &params, snapshot) .map_err(map_engine_err)?; result .rows() .iter() .map(|row| decode_intention(result.columns(), row)) .collect()"
     } else {
-        "let result = self .db .execute_at_snapshot(&sql, &params, snapshot) .map_err(map_engine_err)?; self.decode_discovery_decisions_at_read(&result.columns, &result.rows, snapshot)"
+        "let result = self .db .execute_at_snapshot(&sql, &params, snapshot) .map_err(map_engine_err)?; self.decode_discovery_decisions_at_read(result.columns(), result.rows(), snapshot)"
     };
     let expected = format!("{expected} }}");
     assert_eq!(
@@ -1516,6 +1524,7 @@ fn assert_discovery_method_uses_engine_snapshot(method: &str, min_graph_tables: 
         &[
             "as_uuid",
             "as_slice",
+            "columns",
             "decode_discovery_decisions_at_read",
             "decode_intention",
             "decision_statuses_for_discovery",
@@ -1534,6 +1543,7 @@ fn assert_discovery_method_uses_engine_snapshot(method: &str, min_graph_tables: 
             "map_err",
             "new",
             "Ok",
+            "rows",
             "Some",
             "snapshot",
             "sql_string_list",

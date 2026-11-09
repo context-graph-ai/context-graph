@@ -1244,7 +1244,7 @@ mod request_write_ceilings {
                 )
                 .expect("completion count");
             assert_eq!(
-                rows.rows[0][0],
+                rows.rows()[0][0],
                 contextdb_core::Value::Int64(expected),
                 "unexpected retained rows in {table}"
             );
@@ -1268,7 +1268,7 @@ mod request_write_ceilings {
                 )
                 .expect("selection count");
             assert_eq!(
-                rows.rows[0][0],
+                rows.rows()[0][0],
                 contextdb_core::Value::Int64(expected),
                 "unexpected retained rows in {table}"
             );
@@ -2907,7 +2907,7 @@ mod request_write_ceilings {
             // Generation preparation may create a zero-progress cursor for unselected history.
             // It must never commit or publish an embedding from that session.
             assert!(
-                rows.rows
+                rows.rows()
                     .iter()
                     .filter(|row| { row[0] == contextdb_core::Value::Text("session-B".into()) })
                     .all(|row| row[1] == contextdb_core::Value::Int64(0))
@@ -2916,9 +2916,9 @@ mod request_write_ceilings {
                 "SELECT COUNT(*) AS total FROM event_search_passages WHERE session_ref = 'session-B'",
                 &std::collections::HashMap::new(),
             ).unwrap();
-            assert_eq!(older_passages.rows[0][0], contextdb_core::Value::Int64(0));
+            assert_eq!(older_passages.rows()[0][0], contextdb_core::Value::Int64(0));
             let selected = rows
-                .rows
+                .rows()
                 .iter()
                 .find(|row| row[0] == contextdb_core::Value::Text("selected-newest-session".into()))
                 .unwrap();
@@ -3007,7 +3007,7 @@ mod request_write_ceilings {
                 )
                 .expect("count");
             assert_eq!(
-                rows.rows[0][0],
+                rows.rows()[0][0],
                 contextdb_core::Value::Int64(0),
                 "payload leaked in {table}"
             );
@@ -5037,6 +5037,9 @@ mod request_write_ceilings {
                     ],
                 )
             } else {
+                // The previous step's worker releases its lock after its command returns; wait for
+                // that release rather than racing it.
+                machine.wait_for_search_worker_exit();
                 let held = acquire_worker_lock(&machine.data_root.join("event-search-worker.lock"))
                     .unwrap();
                 let accepted = import_selected(
@@ -5599,7 +5602,7 @@ mod request_write_ceilings {
                 .unwrap();
                 let passages = reader.execute("SELECT COUNT(*) AS total FROM event_search_passages WHERE is_current = true AND is_searchable = true", &std::collections::HashMap::new()).unwrap();
                 assert_eq!(
-                    passages.rows[0][0],
+                    passages.rows()[0][0],
                     contextdb_core::Value::Int64(expected_events as i64 / 2),
                     "each completed session publishes exactly one current passage"
                 );
@@ -6536,7 +6539,7 @@ mod request_write_ceilings {
                 )
                 .expect("read selection count");
             assert_eq!(
-                rows.rows[0][0],
+                rows.rows()[0][0],
                 contextdb_core::Value::Int64(1),
                 "unaccepted rows in {table}"
             );
@@ -6653,10 +6656,10 @@ mod request_write_ceilings {
                 &std::collections::HashMap::new(),
             )
             .expect("projection counters");
-        assert_eq!(rows.rows.len(), 1);
-        assert_eq!(rows.rows[0][0], contextdb_core::Value::Int64(2));
+        assert_eq!(rows.rows().len(), 1);
+        assert_eq!(rows.rows()[0][0], contextdb_core::Value::Int64(2));
         assert_eq!(
-            rows.rows[0][1],
+            rows.rows()[0][1],
             contextdb_core::Value::Null,
             "unselected suffix cannot refuse the selected request"
         );
@@ -6676,8 +6679,8 @@ mod request_write_ceilings {
         let prefix = passages
             .first_page()
             .expect("published prefix page")
-            .rows
-            .clone();
+            .rows()
+            .to_vec();
         passages.close().expect("close prefix cursor");
         assert_eq!(prefix.len(), 1, "one published prefix passage");
         assert_eq!(prefix[0][0], contextdb_core::Value::Int64(2));
@@ -6845,8 +6848,8 @@ mod request_write_ceilings {
             let passages = cursor
                 .first_page()
                 .expect("widened passage page")
-                .rows
-                .clone();
+                .rows()
+                .to_vec();
             cursor.close().expect("close widened passage cursor");
             assert_eq!(
                 passages.len(),
@@ -7359,7 +7362,7 @@ mod request_write_ceilings {
                     )]),
                 )
                 .expect("expire the orphan claim deterministically");
-            assert_eq!(changed.rows_affected, 1);
+            assert_eq!(changed.rows_affected(), 1);
         }
         event_support::write_test_file(lease_wait.join("release"), b"resume expired claim")
             .expect("release replacement");

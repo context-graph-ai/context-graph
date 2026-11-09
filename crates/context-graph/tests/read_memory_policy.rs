@@ -75,20 +75,20 @@ fn every_id(reader: &ConsumerReader) -> Vec<String> {
             .first_page()
             .expect("the opened cursor has its first page");
         (
-            page.rows
+            page.rows()
                 .iter()
                 .map(|row| match &row[0] {
                     Value::Text(id) => id.clone(),
                     other => panic!("id column is text, got {other:?}"),
                 })
                 .collect::<Vec<_>>(),
-            page.has_more,
+            page.has_more(),
         )
     };
     while has_more {
         let page = cursor.fetch(None).expect("fetch the next bounded page");
-        has_more = page.has_more;
-        ids.extend(page.rows.iter().map(|row| match &row[0] {
+        has_more = page.has_more();
+        ids.extend(page.rows().iter().map(|row| match &row[0] {
             Value::Text(id) => id.clone(),
             other => panic!("id column is text, got {other:?}"),
         }));

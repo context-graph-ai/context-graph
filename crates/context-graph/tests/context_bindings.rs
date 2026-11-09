@@ -60,7 +60,8 @@ fn binding_rows(store: &Store) -> Vec<Vec<Value>> {
             &HashMap::new(),
         )
         .expect("read local binding rows")
-        .rows
+        .rows()
+        .to_vec()
 }
 
 fn durable_rows(store: &Store, table: &str) -> Vec<VersionedRow> {
@@ -121,7 +122,8 @@ async fn authenticated_hub() -> AuthenticatedHub {
             tenant.clone(),
             hub_node,
             identity,
-        ),
+        )
+        .expect("sync fixture call is accepted by the engine"),
     );
     for (table, policy) in [("events", EVENT_POLICY), ("event_anchors", ANCHOR_POLICY)] {
         database
@@ -175,7 +177,8 @@ async fn bind_tenant_store(
         hub.broker.client_as(&node_id),
         hub.tenant.clone(),
         identity,
-    );
+    )
+    .expect("sync fixture call is accepted by the engine");
     let binding = client
         .bind_application_table_policy(policy_expectation())
         .await
@@ -520,7 +523,7 @@ fn placement_change_is_allowed_before_capture_or_after_failure_but_not_after_era
                 .sync_database()
                 .execute(&format!("SELECT * FROM {table}"), &HashMap::new())
                 .expect("inspect rolled-back append rows")
-                .rows
+                .rows()
                 .is_empty(),
             "the divergent second draft rolls back every staged {table} row"
         );
@@ -560,21 +563,21 @@ fn placement_change_is_allowed_before_capture_or_after_failure_but_not_after_era
         ))
         .expect("capture one anchored event");
     let event_id = captured_event.events[0].event.id.as_uuid();
-    let event_rows_before_erasure = captured
+    let event_rows_before_erasure_answer = captured
         .sync_database()
         .execute("SELECT * FROM events", &HashMap::new())
-        .expect("read captured rows")
-        .rows;
-    let anchor_rows_before_erasure = captured
+        .expect("read captured rows");
+    let event_rows_before_erasure = event_rows_before_erasure_answer.rows();
+    let anchor_rows_before_erasure_answer = captured
         .sync_database()
         .execute("SELECT * FROM event_anchors", &HashMap::new())
-        .expect("read captured anchor rows")
-        .rows;
-    let local_commit_rows_before_erasure = captured
+        .expect("read captured anchor rows");
+    let anchor_rows_before_erasure = anchor_rows_before_erasure_answer.rows();
+    let local_commit_rows_before_erasure_answer = captured
         .sync_database()
         .execute("SELECT * FROM event_local_commits", &HashMap::new())
-        .expect("read captured local commit rows")
-        .rows;
+        .expect("read captured local commit rows");
+    let local_commit_rows_before_erasure = local_commit_rows_before_erasure_answer.rows();
     assert_eq!(event_rows_before_erasure.len(), 1);
     assert_eq!(anchor_rows_before_erasure.len(), 1);
     assert_eq!(local_commit_rows_before_erasure.len(), 1);
@@ -598,11 +601,11 @@ fn placement_change_is_allowed_before_capture_or_after_failure_but_not_after_era
         .table_meta("event_placement")
         .expect("placement table")
         .clone();
-    let placement_rows_before = captured
+    let placement_rows_before_answer = captured
         .sync_database()
         .execute("SELECT * FROM event_placement", &HashMap::new())
-        .expect("read persisted local placement")
-        .rows;
+        .expect("read persisted local placement");
+    let placement_rows_before = placement_rows_before_answer.rows();
 
     let event_params = HashMap::from([("event_id".to_string(), Value::Uuid(event_id))]);
     captured
@@ -618,7 +621,7 @@ fn placement_change_is_allowed_before_capture_or_after_failure_but_not_after_era
                 .sync_database()
                 .execute(&format!("SELECT * FROM {table}"), &HashMap::new())
                 .expect("inspect erased event rows")
-                .rows
+                .rows()
                 .is_empty(),
             "the successful local erasure removes every captured {table} row"
         );
@@ -666,7 +669,7 @@ fn placement_change_is_allowed_before_capture_or_after_failure_but_not_after_era
         raw_after_refusal
             .execute("SELECT * FROM event_placement", &HashMap::new())
             .expect("read placement after refusal")
-            .rows,
+            .rows(),
         placement_rows_before,
         "the refused placement change leaves the exact persisted policy row unchanged"
     );
@@ -686,7 +689,7 @@ fn placement_change_is_allowed_before_capture_or_after_failure_but_not_after_era
                 .sync_database()
                 .execute(&format!("SELECT * FROM {table}"), &HashMap::new())
                 .expect("read rows after reopen")
-                .rows
+                .rows()
                 .is_empty(),
             "the legitimate erasure of {table} remains effective after reopen"
         );

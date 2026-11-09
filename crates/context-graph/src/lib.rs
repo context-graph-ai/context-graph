@@ -47,7 +47,7 @@ pub mod write_budget;
 
 pub use capture_sync_status::*;
 pub use consumer_read::graph::ConsumerGraphView;
-pub use consumer_read::{ConsumerDeclaration, ConsumerReader};
+pub use consumer_read::{ConsumerCursor, ConsumerDeclaration, ConsumerPage, ConsumerReader};
 pub use contextdb_core::{ScopeLabel, TxId};
 pub use embedder::{
     Embedder, EmbedderConfig, EmbedderRegistration, EmbeddingInput, EmbeddingOutput,
@@ -95,7 +95,8 @@ pub mod test_support {
     };
     #[cfg(feature = "test-support")]
     pub use crate::store::open_retry::{
-        observe_store_open_retries_for_test, set_store_open_retry_allowance_for_test,
+        observe_store_open_reader_wait_for_test, observe_store_open_retries_for_test,
+        set_store_open_retry_allowance_for_test,
     };
 
     /// Pauses inside the next event-search head-switch transaction on the calling thread.

@@ -236,10 +236,10 @@ impl<'s> ScopedStore<'s> {
                 EngineError::ContextScopeViolation { .. } => CgError::InvalidationNotFound { id },
                 other => map_engine_err(other),
             })?;
-        let Some(row) = result.rows.first() else {
+        let Some(row) = result.rows().first() else {
             return Err(CgError::InvalidationNotFound { id });
         };
-        decode_invalidation(&result.columns, row)
+        decode_invalidation(result.columns(), row)
     }
 
     fn current_transition_error(&self, id: InvalidationId, to: InvalidationStatus) -> CgError {
@@ -474,7 +474,7 @@ impl<'s> ScopedStore<'s> {
                 }
                 other => map_engine_err(other),
             })?
-            .rows_affected;
+            .rows_affected();
         if rows_affected == 1 {
             return Ok(());
         }
@@ -543,7 +543,7 @@ impl<'s> ScopedStore<'s> {
                 },
                 other => map_engine_err(other),
             })?;
-        let Some(row) = result.rows.first() else {
+        let Some(row) = result.rows().first() else {
             return Err(CgError::DecisionNotFound {
                 id: invalidation.affected_decision_id,
             });

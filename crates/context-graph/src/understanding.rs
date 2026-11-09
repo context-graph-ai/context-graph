@@ -246,7 +246,7 @@ fn highest_claim_attempt(store: &Store, job_id: &str) -> Result<i64> {
         &HashMap::from([("job_id".to_string(), DbValue::Text(job_id.to_string()))]),
     )?;
     Ok(result
-        .rows
+        .rows()
         .iter()
         .filter_map(|row| match row.first() {
             Some(DbValue::Int64(attempt)) => Some(*attempt),
@@ -263,7 +263,7 @@ fn failure_count(store: &Store, job_id: &str) -> Result<u32> {
         "SELECT attempt FROM work_failures WHERE job_id = $job_id",
         &HashMap::from([("job_id".to_string(), DbValue::Text(job_id.to_string()))]),
     )?;
-    Ok(result.rows.len() as u32)
+    Ok(result.rows().len() as u32)
 }
 
 // Retrieval-touch bumping is owned by `tier0::bump_touch` (the injection/query path calls it); this
@@ -276,7 +276,7 @@ fn completion_exists(store: &Store, digest_text: &str) -> Result<bool> {
         "SELECT id FROM cg_understanding_completions WHERE id = $id",
         &HashMap::from([("id".to_string(), DbValue::Text(digest_text.to_string()))]),
     )?;
-    Ok(!result.rows.is_empty())
+    Ok(!result.rows().is_empty())
 }
 
 fn chunk_text_for_digest(store: &Store, digest_text: &str) -> Result<Option<String>> {
@@ -287,7 +287,7 @@ fn chunk_text_for_digest(store: &Store, digest_text: &str) -> Result<Option<Stri
             DbValue::Text(digest_text.to_string()),
         )]),
     )?;
-    Ok(result.rows.first().and_then(|row| match row.first() {
+    Ok(result.rows().first().and_then(|row| match row.first() {
         Some(DbValue::Text(content)) => Some(content.clone()),
         _ => None,
     }))
@@ -302,7 +302,7 @@ fn touch_count_for_digest(store: &Store, digest_text: &str) -> Result<u64> {
         )]),
     )?;
     Ok(result
-        .rows
+        .rows()
         .first()
         .and_then(|row| match row.first() {
             Some(DbValue::Int64(count)) => Some((*count).max(0) as u64),

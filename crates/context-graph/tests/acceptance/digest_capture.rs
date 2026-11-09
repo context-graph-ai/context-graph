@@ -273,8 +273,8 @@ fn raw_digest_summaries(db_path: &Path) -> Vec<String> {
         &HashMap::new(),
     )
     .expect("raw digest summaries")
-    .rows
-    .into_iter()
+    .rows()
+    .iter()
     .filter_map(|row| match row.first() {
         Some(contextdb_core::Value::Text(summary)) => Some(summary.clone()),
         _ => None,

@@ -1,3 +1,7 @@
+#![allow(
+    clippy::result_large_err,
+    reason = "The engine's public error carries its refusal diagnostics inline (160+ bytes); this module passes it through unchanged."
+)]
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
@@ -755,7 +759,10 @@ fn handle_worker(args: &[String], read_memory_limit_bytes: std::num::NonZeroUsiz
     // Build the SyncClient against the hub, dialing FROM the enrolled identity. Its ordinary sync
     // behavior comes from the durable table declarations installed with this store.
     let dial_spec = worker_dial_spec(hub_endpoint, &key_path);
-    let client = SyncClient::new(store.sync_database(), &dial_spec, TenantId::from(tenant));
+    let client = match SyncClient::new(store.sync_database(), &dial_spec, TenantId::from(tenant)) {
+        Ok(client) => client,
+        Err(err) => return worker_failure(1, "SyncUnavailable", &format!("{err:?}")),
+    };
 
     // Advertise this node's understanding capability; sharing follows the fabric config.
     let mut worker_config = FabricWorkerConfig::for_node(&node_id);
@@ -2557,7 +2564,14 @@ fn handle_sync(args: &[String], read_memory_limit_bytes: std::num::NonZeroUsize)
         Err(err) => return memory_error(err, &db_path, &context_label),
     };
     let store = &stores.scoped;
-    let boundary = CliSyncBoundary::new(&stores.admin, &stores.admin, &remote_url, &tenant_id);
+    let boundary = match CliSyncBoundary::new(&stores.admin, &stores.admin, &remote_url, &tenant_id)
+    {
+        Ok(boundary) => boundary,
+        Err(err) => {
+            eprintln!("cg sync: the sync client could not be created: {err}");
+            return 1;
+        }
+    };
 
     match action {
         "status" => {
@@ -2660,16 +2674,21 @@ struct CliSyncBoundary {
 }
 
 impl CliSyncBoundary {
-    fn new(data_store: &Store, _admin_store: &Store, remote_url: &str, tenant_id: &str) -> Self {
+    fn new(
+        data_store: &Store,
+        _admin_store: &Store,
+        remote_url: &str,
+        tenant_id: &str,
+    ) -> std::result::Result<Self, contextdb_core::Error> {
         let client = SyncClient::new(
             data_store.sync_database(),
             remote_url,
             TenantId::from(tenant_id),
-        );
-        Self {
+        )?;
+        Ok(Self {
             client,
             hub_connection_opened: Mutex::new(false),
-        }
+        })
     }
 
     fn mark_connected(&self) {
@@ -3612,10 +3631,10 @@ fn existing_schema_version(
     let result = session
         .execute("SELECT version FROM cg_schema_version", &Default::default())
         .map_err(|err| MemoryCliError::Store(err.to_string()))?;
-    if result.rows.len() != 1 {
+    if result.rows().len() != 1 {
         return Ok(None);
     }
-    Ok(match result.rows[0].first() {
+    Ok(match result.rows()[0].first() {
         Some(DbValue::Int64(version)) => u32::try_from(*version).ok(),
         _ => None,
     })

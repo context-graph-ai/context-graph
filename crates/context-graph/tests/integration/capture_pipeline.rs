@@ -93,17 +93,17 @@ fn raw_vector_ids(
         )
         .expect("raw vector query");
     let id_index = result
-        .columns
+        .columns()
         .iter()
         .position(|column| column == "id")
         .expect("id column");
     let score_index = result
-        .columns
+        .columns()
         .iter()
         .position(|column| column == "score")
         .expect("score column");
     result
-        .rows
+        .rows()
         .iter()
         .filter_map(|row| {
             let id = match row.get(id_index)? {

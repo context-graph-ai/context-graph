@@ -198,30 +198,31 @@ fn receipt_fold_keeps_ordinal_hash_and_count_across_small_cursor_pages() {
     let mut cursor = session
         .open_cursor(RECEIPT_ORDER_PROBE_SQL, &params(generation_id))
         .expect("open equality-prefixed receipt order probe cursor");
-    let mut rows = receipt_rows(&cursor.first_page().columns, &cursor.first_page().rows);
-    let mut more = cursor.first_page().has_more;
+    let mut rows = receipt_rows(cursor.first_page().columns(), cursor.first_page().rows());
+    let mut more = cursor.first_page().has_more();
     while more {
         let page = cursor
             .fetch(NonZeroUsize::new(3))
             .expect("fetch bounded receipt cursor page");
-        more = page.has_more;
-        rows.extend(receipt_rows(&page.columns, &page.rows));
+        more = page.has_more();
+        rows.extend(receipt_rows(page.columns(), page.rows()));
     }
     cursor.close().expect("close receipt cursor");
 
     assert_eq!(
-        planned.trace.physical_plan, "IndexScan",
+        planned.trace().physical_plan,
+        "IndexScan",
         "{:#?}",
-        planned.trace
+        planned.trace()
     );
     assert_eq!(
-        planned.trace.index_used.as_deref(),
+        planned.trace().index_used.as_deref(),
         Some(RECEIPT_INDEX),
         "{:#?}",
-        planned.trace
+        planned.trace()
     );
-    assert!(planned.trace.sort_elided, "{:#?}", planned.trace);
-    assert_eq!(planned.rows.len(), expected.len());
+    assert!(planned.trace().sort_elided, "{:#?}", planned.trace());
+    assert_eq!(planned.rows().len(), expected.len());
     assert_eq!(rows, expected);
     assert_eq!(rows.len(), expected.len());
     assert_eq!(receipt_hash(rows), receipt_hash(expected));

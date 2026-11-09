@@ -1,3 +1,7 @@
+#![allow(
+    clippy::result_large_err,
+    reason = "The engine's public error carries its refusal diagnostics inline (160+ bytes); this module passes it through unchanged."
+)]
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::mpsc;
 use std::sync::{Arc, Barrier};
@@ -331,15 +335,15 @@ fn params(pairs: Vec<(&str, Value)>) -> HashMap<String, Value> {
 
 fn row_value<'a>(result: &'a QueryResult, row: usize, col: &str) -> &'a Value {
     let idx = result
-        .columns
+        .columns()
         .iter()
         .position(|name| name == col)
         .unwrap_or_else(|| panic!("missing column {col}"));
-    &result.rows[row][idx]
+    &result.rows()[row][idx]
 }
 
 fn assert_one_row(result: &QueryResult) {
-    assert_eq!(result.rows.len(), 1, "expected exactly one row");
+    assert_eq!(result.rows().len(), 1, "expected exactly one row");
 }
 
 fn assert_error_is_fk(result: contextdb_core::Result<QueryResult>) {
@@ -1278,13 +1282,13 @@ fn test_edges_table_all_relationship_types() {
     }
 
     let result = db.execute("SELECT * FROM edges", &HashMap::new()).unwrap();
-    assert_eq!(result.rows.len(), 15);
+    assert_eq!(result.rows().len(), 15);
     for edge_type in expected_types {
-        assert!(result.rows.iter().any(|row| {
+        assert!(result.rows().iter().any(|row| {
             row_value(
                 &result,
                 result
-                    .rows
+                    .rows()
                     .iter()
                     .position(|candidate| candidate == row)
                     .unwrap(),
@@ -2012,7 +2016,7 @@ fn test_non_cites_edge_allows_bidirectional() {
             &params(vec![("edge_type", Value::Text("RELATES_TO".into()))]),
         )
         .unwrap();
-    assert_eq!(result.rows.len(), 2);
+    assert_eq!(result.rows().len(), 2);
 }
 
 // edges carry a UNIQUE constraint on (source_id, target_id, edge_type); a duplicate raw insert is refused loudly, and add_relationship absorbs that refusal to stay idempotent.
@@ -2055,7 +2059,7 @@ fn test_edge_duplicate_insert_refused() {
         ]),
     )
     .unwrap();
-    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.rows().len(), 1);
 }
 
 // entities.context_id column supports engine-side equality filtering so list_entities scoped to one context cannot bleed rows from another.
@@ -2076,7 +2080,7 @@ fn test_entities_filter_by_context_id() {
             &params(vec![("context_id", Value::Uuid(ctx_b))]),
         )
         .unwrap();
-    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.rows().len(), 1);
     assert_eq!(row_value(&result, 0, "context_id"), &Value::Uuid(ctx_b));
 }
 
@@ -2128,7 +2132,7 @@ fn test_edges_filter_by_context_id() {
             &params(vec![("context_id", Value::Uuid(ctx_b))]),
         )
         .unwrap();
-    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.rows().len(), 1);
     assert_eq!(row_value(&result, 0, "source_id"), &Value::Uuid(entity_b));
 }
 
@@ -2549,7 +2553,7 @@ fn test_unique_context_name_noop() {
             &params(vec![("name", Value::Text("project-alpha".into()))]),
         )
         .unwrap();
-    assert_eq!(rows.rows.len(), 1);
+    assert_eq!(rows.rows().len(), 1);
 }
 
 // digests.vector_text is a fixed-dimension vector column (DIGEST_VECTOR_DIMENSION); the engine must round-trip a full-dimension embedding without truncation or dimension drift.
@@ -2608,7 +2612,7 @@ fn test_digest_vector_cosine_distance_query() {
             ]),
         )
         .unwrap();
-    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.rows().len(), 1);
     assert_eq!(
         row_value(&result, 0, "id"),
         &Value::Uuid(farther_right_context)
@@ -2978,10 +2982,10 @@ fn combination_evidence_availability_log_concurrent_appends_persist_distinct_row
             &params(vec![("id", Value::Uuid(evidence_id))]),
         )
         .expect("select log");
-    assert_eq!(rows.rows.len(), 2);
+    assert_eq!(rows.rows().len(), 2);
     let latest_txid = txids.iter().next_back().copied().expect("latest txid");
     assert!(
-        rows.rows
+        rows.rows()
             .iter()
             .any(|row| row.contains(&Value::TxId(latest_txid)))
     );
@@ -3005,7 +3009,7 @@ fn combination_decision_status_state_machine_active_to_invalidated_accepted() {
             ]),
         )
         .expect("active to invalidated");
-    assert_eq!(result.rows_affected, 1);
+    assert_eq!(result.rows_affected(), 1);
 }
 
 #[test]
@@ -3641,7 +3645,7 @@ fn combination_observation_with_evidence_atomic_insert_under_fk_violation_rolls_
             &params(vec![("id", Value::Uuid(observation_id))]),
         )
         .expect("select observation");
-    assert!(observation_rows.rows.is_empty());
+    assert!(observation_rows.rows().is_empty());
     let evidence_rows = db
         .execute(
             "SELECT id FROM evidence WHERE id = $id OR id = $invalid_id",
@@ -3651,7 +3655,7 @@ fn combination_observation_with_evidence_atomic_insert_under_fk_violation_rolls_
             ]),
         )
         .expect("select evidence");
-    assert!(evidence_rows.rows.is_empty());
+    assert!(evidence_rows.rows().is_empty());
 }
 
 #[test]

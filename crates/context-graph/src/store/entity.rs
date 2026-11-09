@@ -154,9 +154,9 @@ impl Store {
             trace.push_str("name_contains;");
         }
         self.set_trace(trace);
-        let mut out = Vec::with_capacity(result.rows.len());
-        for row in &result.rows {
-            let entity = decode_entity(&result.columns, row)?;
+        let mut out = Vec::with_capacity(result.rows().len());
+        for row in result.rows() {
+            let entity = decode_entity(result.columns(), row)?;
             if let Some(et) = filter.entity_type
                 && entity.entity_type != et
             {
@@ -208,19 +208,19 @@ impl Store {
             "SELECT snapshot_id FROM entity_current_snapshots WHERE entity_id = $entity_id",
             &HashMap::from([("entity_id".to_string(), Value::Uuid(id.as_uuid()))]),
         )?;
-        let Some(row) = result.rows.first() else {
+        let Some(row) = result.rows().first() else {
             return Ok(None);
         };
-        let snapshot_id = EntitySnapshotId::from(get_uuid(row, &result.columns, "snapshot_id")?);
+        let snapshot_id = EntitySnapshotId::from(get_uuid(row, result.columns(), "snapshot_id")?);
         let params = HashMap::from([("id".to_string(), Value::Uuid(snapshot_id.as_uuid()))]);
         let snapshot = self.read_query(
             "SELECT id, entity_id, data, valid_from, valid_to FROM entity_snapshots WHERE id = $id",
             &params,
         )?;
         let snapshot = snapshot
-            .rows
+            .rows()
             .first()
-            .map(|row| decode_snapshot(&snapshot.columns, row))
+            .map(|row| decode_snapshot(snapshot.columns(), row))
             .transpose()?;
         snapshot
             .map(|snapshot| self.hydrate_snapshot_observations(snapshot))
@@ -325,11 +325,11 @@ impl Store {
                 "SELECT id, entity_id, data, valid_from, valid_to FROM entity_snapshots WHERE entity_id = $entity_id",
                 &params,
             )?;
-        let mut snapshots = Vec::with_capacity(result.rows.len());
+        let mut snapshots = Vec::with_capacity(result.rows().len());
         let mut archived_heads = BTreeSet::new();
-        for row in &result.rows {
-            let snapshot = decode_snapshot(&result.columns, row)?;
-            if snapshot_is_archive(row, &result.columns)? {
+        for row in result.rows() {
+            let snapshot = decode_snapshot(result.columns(), row)?;
+            if snapshot_is_archive(row, result.columns())? {
                 archived_heads.insert(snapshot.id);
             }
             snapshots.push(self.hydrate_snapshot_observations(snapshot)?);
@@ -340,24 +340,24 @@ impl Store {
                 "SELECT predecessor_snapshot_id, successor_snapshot_id, created_at FROM entity_snapshot_links WHERE entity_id = $entity_id",
                 &params,
             )?;
-        let mut links = Vec::with_capacity(links_result.rows.len());
+        let mut links = Vec::with_capacity(links_result.rows().len());
         let mut predecessors = BTreeSet::new();
-        for row in &links_result.rows {
+        for row in links_result.rows() {
             let predecessor_snapshot_id = EntitySnapshotId::from(get_uuid(
                 row,
-                &links_result.columns,
+                links_result.columns(),
                 "predecessor_snapshot_id",
             )?);
             let successor_snapshot_id = EntitySnapshotId::from(get_uuid(
                 row,
-                &links_result.columns,
+                links_result.columns(),
                 "successor_snapshot_id",
             )?);
             predecessors.insert(predecessor_snapshot_id);
             links.push(EntitySnapshotLink {
                 predecessor_snapshot_id,
                 successor_snapshot_id,
-                created_at: get_txid(row, &links_result.columns, "created_at")?,
+                created_at: get_txid(row, links_result.columns(), "created_at")?,
             });
         }
         links.sort_by_key(|link| {
@@ -537,9 +537,9 @@ impl Store {
                 "SELECT id, entity_id, data, valid_from, valid_to FROM entity_snapshots WHERE entity_id = $entity_id",
                 &params,
             )?;
-        let mut snaps: Vec<EntitySnapshot> = Vec::with_capacity(result.rows.len());
-        for row in &result.rows {
-            let snapshot = decode_snapshot(&result.columns, row)?;
+        let mut snaps: Vec<EntitySnapshot> = Vec::with_capacity(result.rows().len());
+        for row in result.rows() {
+            let snapshot = decode_snapshot(result.columns(), row)?;
             snaps.push(self.hydrate_snapshot_observations(snapshot)?);
         }
         snaps.sort_by_key(|s| s.valid_from.0);
@@ -680,9 +680,9 @@ impl Store {
             )
             .map_err(map_engine_err)?;
         result
-            .rows
+            .rows()
             .first()
-            .map(|row| decode_entity(&result.columns, row))
+            .map(|row| decode_entity(result.columns(), row))
             .transpose()
     }
 
@@ -704,9 +704,9 @@ impl Store {
             )
             .map_err(map_engine_err)?;
         result
-            .rows
+            .rows()
             .first()
-            .map(|row| get_uuid(row, &result.columns, "snapshot_id").map(EntitySnapshotId::from))
+            .map(|row| get_uuid(row, result.columns(), "snapshot_id").map(EntitySnapshotId::from))
             .transpose()
     }
 
@@ -764,7 +764,7 @@ impl Store {
                 &update_params,
             )
             .map_err(map_engine_err)?
-            .rows_affected;
+            .rows_affected();
         if updated == 1 {
             return Ok(());
         }
@@ -908,8 +908,8 @@ impl Store {
             "SELECT source_id, target_id FROM edges WHERE context_id = $context_id AND (({source_clause}) OR ({target_clause}))"
         );
         let result = self.read_query(&sql, &params)?;
-        let mut out = Vec::with_capacity(result.rows.len());
-        for row in &result.rows {
+        let mut out = Vec::with_capacity(result.rows().len());
+        for row in result.rows() {
             let source = match row.first() {
                 Some(Value::Uuid(u)) => *u,
                 _ => continue,
@@ -946,7 +946,7 @@ impl Store {
         let result = self.read_query(&sql, &params)?;
         let mut seen = HashSet::new();
         let mut out = Vec::new();
-        for row in &result.rows {
+        for row in result.rows() {
             if let Some(Value::Uuid(u)) = row.first() {
                 let decision_id = DecisionId::from(*u);
                 if seen.insert(decision_id)
@@ -1032,8 +1032,8 @@ impl Store {
                 &params,
             )?;
         let mut snaps = Vec::new();
-        for row in &result.rows {
-            let snap = decode_snapshot(&result.columns, row)?;
+        for row in result.rows() {
+            let snap = decode_snapshot(result.columns(), row)?;
             let snap = self.hydrate_snapshot_observations(snap)?;
             let created_in_window = snap.valid_from.0 > start && snap.valid_from.0 <= end;
             let archived_in_window = snap
@@ -1102,7 +1102,7 @@ impl Store {
                 snapshot,
             )
             .map_err(map_engine_err)?;
-        ordered_observation_ids(&result.columns, &result.rows)
+        ordered_observation_ids(result.columns(), result.rows())
     }
 
     fn hydrate_snapshot_observations(
@@ -1125,7 +1125,7 @@ impl Store {
                     ("snapshot_id".to_string(), Value::Uuid(snapshot_id.as_uuid())),
                 ]),
             )?;
-        ordered_observation_ids(&result.columns, &result.rows)
+        ordered_observation_ids(result.columns(), result.rows())
     }
 }
 
@@ -1210,10 +1210,10 @@ pub(crate) fn get_entity(rows: &dyn GraphRows, id: EntityId) -> Result<Option<En
         "SELECT id, entity_type, name, properties, tags, context_id, status, created_at FROM entities WHERE id = $id",
         &params,
     )?;
-    if result.rows.is_empty() {
+    if result.rows().is_empty() {
         return Ok(None);
     }
-    Ok(Some(decode_entity(&result.columns, &result.rows[0])?))
+    Ok(Some(decode_entity(result.columns(), &result.rows()[0])?))
 }
 
 fn decode_entity(columns: &[String], row: &[Value]) -> Result<Entity> {

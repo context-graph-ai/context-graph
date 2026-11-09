@@ -496,14 +496,12 @@ impl OwnerRequestHandler for ControlNamespaceHandler {
         _cancel: &OwnerReadCancellation,
     ) -> contextdb_core::Result<Vec<u8>> {
         if namespace != CONTROL_NAMESPACE {
-            return Err(DbError::Other(format!(
-                "`{namespace}` is not a context-graph owner request namespace"
-            )));
+            return Err(DbError::Other(
+                format!("`{namespace}` is not a context-graph owner request namespace").into(),
+            ));
         }
         let frame = std::str::from_utf8(request).map_err(|error| {
-            DbError::Other(format!(
-                "a context-graph control frame must be text: {error}"
-            ))
+            DbError::Other(format!("a context-graph control frame must be text: {error}").into())
         })?;
         Ok((self.handler)(frame.to_string()).into_bytes())
     }
@@ -538,7 +536,7 @@ fn classify(store_path: &Path, error: DbError) -> OwnerControlError {
         // store nobody built by hand always carries the inspection name here.
         ReadFailureKind::OwnerRouteUnsupported => {
             let inspection = match failure.detail() {
-                ReadFailureDetail::OwnerRouteUnsupported(detail) => detail.inspection.clone(),
+                ReadFailureDetail::OwnerRouteUnsupported(detail) => detail.inspection.to_string(),
                 _ => String::new(),
             };
             OwnerControlError::OwnerRouteUnsupported {
@@ -580,7 +578,7 @@ mod tests {
     fn owner_route_unsupported_classifies_to_a_typed_variant_naming_the_inspection() {
         let store_path = PathBuf::from("/tmp/some-store");
         let failure = contextdb_core::read_contract::ReadFailure::owner_route_unsupported(
-            "custom_namespace".to_string(),
+            "custom_namespace".into(),
         );
 
         let classified = classify(&store_path, DbError::from(failure));
@@ -611,7 +609,7 @@ mod tests {
         .expect("owner-not-serving pairs with no specialized detail");
         let route_unsupported_failure =
             contextdb_core::read_contract::ReadFailure::owner_route_unsupported(
-                "custom_namespace".to_string(),
+                "custom_namespace".into(),
             );
 
         let not_serving = classify(&store_path, DbError::from(not_serving_failure));

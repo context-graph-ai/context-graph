@@ -48,7 +48,7 @@ fn whitespace_only_import_is_forgotten(selector: &str) {
                     &HashMap::new(),
                 )
                 .expect("count source state");
-            match answer.rows.first().and_then(|row| row.first()) {
+            match answer.rows().first().and_then(|row| row.first()) {
                 Some(Value::Int64(count)) => *count,
                 other => panic!("invalid {table} count: {other:?}"),
             }
