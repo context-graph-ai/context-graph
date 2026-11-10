@@ -598,15 +598,15 @@ class Box:
             self.cancelled, self.cause = True, 'timeout'
             log.write_text('job timeout reached before this step\n')
             return False
-        self.unit = f'cilocal-{r.run_id}-{seq:04d}.service'
-        argv = [sys.executable, str(Path(__file__).resolve()), '_box', '--unit', self.unit, '--runtime', str(remaining),
+        unit = f'cilocal-{r.run_id}-{seq:04d}.service'
+        argv = [sys.executable, str(Path(__file__).resolve()), '_box', '--unit', unit, '--runtime', str(remaining),
                 '--cwd', str(cwd), '--cpu-model', r.a.cpu_model, '--cpu-pool', str(r.work_root / 'cpu-pool.json'),
                 '--env-file', str(files['env']), '--stamp', str(files['start']), '--stop-file', str(r.stop_file),
                 str(files['sh'])]
         compile_step = not NO_COMPILE.search(run)
         if compile_step and r.launcher:
             argv = [r.launcher] + argv
-        r.wait_for_step_headroom(self)   # admission, not box time: the box clock starts with the step
+        r.wait_for_step_headroom(self, unit)   # admission, not box time: the box clock starts with the step
         oom_before = r.slice_oom()
         r.say(f'[run ] {tag}')
         t0 = time.time()
@@ -1192,19 +1192,26 @@ class LocalRun:
             return 0
         return int(m.group(1)) if m else 0
 
-    def wait_for_step_headroom(self, box):
+    def wait_for_step_headroom(self, box, unit):
         """Start a step only while the boxes' shared memory has STEP_HEADROOM free. A parent slice
         squeezed to its cap reclaims page cache from every box and stalls their I/O, which no hosted
-        runner experiences; a wait here keeps that contention out of every job's timings."""
+        runner experiences; a wait here keeps that contention out of every job's timings. A box takes
+        its unit only when admitted, so boxes still waiting never count as running steps and two
+        waiting boxes cannot hold each other back once every running step has finished."""
         while not self.interrupted:
-            others = [b for b in self.boxes_running() if b is not box and b.unit]
-            if not others or self.slice_cap - self.slice_anon() >= STEP_HEADROOM:
-                return
+            with self.lock:
+                others = [b for b in self.boxes_running() if b is not box and b.unit]
+                if not others or self.slice_cap - self.slice_anon() >= STEP_HEADROOM:
+                    box.unit = unit
+                    return
             time.sleep(5)
+        box.unit = unit
 
     def wait_for_headroom(self, box):
+        # Only boxes running a step hold memory; a box also waiting here to rerun does not, so two
+        # reruns never wait on each other.
         while not self.interrupted:
-            others = [b for b in self.boxes_running() if b is not box]
+            others = [b for b in self.boxes_running() if b is not box and b.unit]
             if not others or self.slice_cap - self.slice_anon() >= BOX_MEMORY:
                 return
             time.sleep(10)
