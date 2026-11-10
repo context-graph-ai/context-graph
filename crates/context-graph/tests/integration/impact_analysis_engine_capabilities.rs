@@ -208,6 +208,14 @@ fn engine_serializes_concurrent_record_observation_with_typed_error_on_refusal()
                 Err(CgError::Engine(message))
                     if message.contains("transaction control is not allowed from another thread")
                         || message.contains("trigger callback is active")
+            ) || matches!(
+                // Both commits can reach the same pending invalidation key; the loser is
+                // refused as that key's unique violation, a typed refusal like the others.
+                result,
+                Err(CgError::UniqueViolation {
+                    entity: "invalidation",
+                    id: None,
+                })
             )
         })
         .count();

@@ -573,7 +573,13 @@ fn concurrent_record_observation_two_root_serializes_with_typed_error_on_refusal
                 "unexpected committed invalidation count: {}",
                 result.invalidations.len()
             ),
+            // The losing writer is refused either as a conflict or, when both commits reach the
+            // same pending invalidation key, as that key's unique violation; both are typed.
             Err(CgError::Engine(_)) => {}
+            Err(CgError::UniqueViolation {
+                entity: "invalidation",
+                id: None,
+            }) => {}
             Err(other) => panic!("unexpected error: {other:?}"),
         }
     }
